@@ -2369,11 +2369,21 @@ def _run_eval_rollout(
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
+    predict_horizon_s = args["eval"]["predict_horizon_s"] if replay_output_dir is not None else 0.0
+    predict_steps = int(round(predict_horizon_s / args["env"]["dt"]))
+    mppi_samples = args["eval"]["mppi_samples"]
+    mppi_steps = int(round(args["eval"]["mppi_horizon_s"] / args["env"]["dt"])) if mppi_samples else 0
+    if mppi_samples and mppi_steps == 0:
+        raise pufferlib.APIUsageError("eval.mppi_horizon_s must cover at least one env step")
+    rollout_steps = max(predict_steps, mppi_steps)
+    if rollout_steps and args["train"].get("use_rnn", False):
+        raise pufferlib.APIUsageError("eval.predict_horizon_s and eval.mppi_samples do not support recurrent policies")
     vecenv = pufferlib.vector.make(
         [make_env] * num_workers,
         env_args=[[]] * num_workers,
         env_kwargs=worker_env_kwargs,
-        backend="Multiprocessing",
+        # Prediction rollouts snapshot and step the worker envs directly, so they must live in this process.
+        backend="Serial" if rollout_steps else "Multiprocessing",
         num_envs=num_workers,
         num_workers=num_workers,
         batch_size=num_workers,
@@ -2423,6 +2433,8 @@ def _run_eval_rollout(
         uncompiled_policy = base_policy(policy)
         env_continuous = isinstance(vecenv.single_action_space, pufferlib.spaces.Box)
         discrete_policy_on_continuous_env = env_continuous and not uncompiled_policy.is_continuous
+        if mppi_samples and not env_continuous:
+            raise pufferlib.APIUsageError("eval.mppi_samples requires a continuous action env")
         device = torch_device(args["train"]["device"])
         use_bfloat16 = args["train"]["precision"] == "bfloat16" and is_cuda_device(device)
         if use_bfloat16 and not torch.cuda.is_bf16_supported():
@@ -2467,11 +2479,10 @@ def _run_eval_rollout(
                 episode_id_offset,
             )
 
-        episode_summaries = []
-        scenario_progress = tqdm(total=expected_episodes, desc=desc, unit="scenario")
-        for _ in range(total_steps):
+        def infer(step_obs):
+            nonlocal policy_obs_tensor
             with torch.no_grad(), eval_amp_context:
-                environment_obs_tensor = torch.as_tensor(obs, device=device)
+                environment_obs_tensor = torch.as_tensor(step_obs, device=device)
                 if padding_agent_count:
                     policy_obs_tensor[:agents_per_batch].copy_(environment_obs_tensor)
                 else:
@@ -2498,6 +2509,100 @@ def _run_eval_rollout(
             if env_continuous:
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
             _require_finite_eval_batch(action, "policy actions", num_workers, worker_env_kwargs)
+            return raw_action, action, logits, value, logprob, entropy
+
+        agent_ranges = []
+        if rollout_steps:
+            agent_start = 0
+            for worker_env in vecenv.envs:
+                agent_ranges.append((worker_env, agent_start, agent_start + worker_env.num_agents))
+                agent_start += worker_env.num_agents
+
+        def rollout_policy():
+            """Roll the policy agents ahead against constant-speed/steering actors, then restore.
+
+            Returns the drawn prediction (None without predict_steps) and the policy's plan for MPPI.
+            """
+            predicted_xy = np.zeros((agents_per_batch, predict_steps, 2), dtype=np.float32)
+            nominal_actions = np.zeros((agents_per_batch, mppi_steps, 2), dtype=np.float32)
+            step_xy = np.zeros((agents_per_batch, 2), dtype=np.float32)
+            for worker_env in vecenv.envs:
+                worker_env.predict_begin()
+            try:
+                for rollout_step in range(rollout_steps):
+                    _, rollout_action, *_ = infer(vecenv.observations)
+                    if rollout_step < mppi_steps:
+                        nominal_actions[:, rollout_step] = rollout_action
+                    for worker_env, start, end in agent_ranges:
+                        worker_env.predict_step(rollout_action[start:end])
+                        if rollout_step < mppi_steps:
+                            worker_env.predict_record_obstacles()
+                        if rollout_step < predict_steps:
+                            worker_env.get_active_agent_xy(step_xy[start:end])
+                    if rollout_step < predict_steps:
+                        predicted_xy[:, rollout_step] = step_xy
+            finally:
+                for worker_env in vecenv.envs:
+                    worker_env.predict_end()
+            return (predicted_xy if predict_steps else None), nominal_actions
+
+        mppi_rng = np.random.default_rng(rollout_seed)
+        mppi_noise_std = np.array(
+            [args["eval"]["mppi_jerk_noise_std"], args["eval"]["mppi_steer_noise_std"]], dtype=np.float32
+        )
+        mppi_cost_params = (
+            args["eval"]["mppi_cbf_decay_rate"],
+            args["eval"]["mppi_obstacle_margin_m"],
+            args["eval"]["mppi_boundary_margin_m"],
+            args["eval"]["mppi_cbf_weight"],
+            args["eval"]["mppi_collision_weight"],
+            args["eval"]["mppi_control_zone_weight"],
+            args["eval"]["mppi_stop_approach_weight"],
+        )
+
+        def score_action_sequences(sample_actions):
+            costs = np.zeros(sample_actions.shape[:2], dtype=np.float32)
+            sample_xy = np.zeros_like(sample_actions)
+            for worker_env, start, end in agent_ranges:
+                worker_env.mppi_rollout_costs(
+                    sample_actions[start:end], costs[start:end], sample_xy[start:end], mppi_cost_params
+                )
+            return costs, sample_xy
+
+        def mppi_plan(nominal_actions):
+            """Perturb the policy plan's jerk/steer, weight each sample by its CBF cost; returns action and plan xy."""
+            action_low = vecenv.single_action_space.low
+            action_high = vecenv.single_action_space.high
+            for worker_env, start, end in agent_ranges:
+                worker_env.mppi_prepare(nominal_actions[start:end])
+            noise = mppi_rng.standard_normal((agents_per_batch, mppi_samples, mppi_steps, 2), dtype=np.float32)
+            sample_actions = np.clip(nominal_actions[:, None] + noise * mppi_noise_std, action_low, action_high)
+            sample_actions[:, 0] = nominal_actions
+            # Braking family: follow the policy for k steps then brake fully with its steering, so stopping at any
+            # point along the plan (an emergency stop at k=0, a stop line further ahead) is always a candidate.
+            braking_count = min(mppi_samples - 1, mppi_steps)
+            for brake_step in range(braking_count):
+                sample_actions[:, 1 + brake_step] = nominal_actions
+                sample_actions[:, 1 + brake_step, brake_step:, 0] = action_low[0]
+            costs, sample_xy = score_action_sequences(sample_actions)
+            # Standing still keeps every barrier constant, so without a progress term it always scores zero.
+            path_length = np.linalg.norm(np.diff(sample_xy, axis=2), axis=-1).sum(axis=2)
+            costs += args["eval"]["mppi_progress_weight"] * np.maximum(path_length[:, :1] - path_length, 0.0)
+            weights = np.exp(-(costs - costs.min(axis=1, keepdims=True)) / args["eval"]["mppi_temperature"])
+            weights /= weights.sum(axis=1, keepdims=True)
+            plan = np.einsum("as,asdc->adc", weights, sample_actions).astype(np.float32)
+            _, plan_xy = score_action_sequences(np.ascontiguousarray(plan[:, None]))
+            return plan[:, 0], plan_xy[:, 0]
+
+        episode_summaries = []
+        scenario_progress = tqdm(total=expected_episodes, desc=desc, unit="scenario")
+        for _ in range(total_steps):
+            predicted_xy, mppi_xy = None, None
+            if rollout_steps:
+                predicted_xy, nominal_actions = rollout_policy()
+            raw_action, action, logits, value, logprob, entropy = infer(obs)
+            if mppi_samples:
+                action, mppi_xy = mppi_plan(nominal_actions)
 
             if replay_capture is not None:
                 replay_capture.capture_frame(
@@ -2509,6 +2614,8 @@ def _run_eval_rollout(
                     value,
                     logprob,
                     entropy,
+                    predicted_xy,
+                    mppi_xy,
                 )
 
             obs, _, terminals, truncations, infos = vecenv.step(action)

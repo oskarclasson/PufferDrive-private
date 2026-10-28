@@ -28,6 +28,12 @@ static PyObject *map_cache_live_count_py(
 
 static PyObject *map_cache_preload_py(PyObject *self __attribute__((unused)), PyObject *args, PyObject *kwargs);
 static PyObject *map_cache_release_py(PyObject *self __attribute__((unused)), PyObject *args, PyObject *kwargs);
+static PyObject *vec_predict_begin_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_predict_end_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_get_active_agent_xy_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_predict_record_obstacles_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_mppi_rollout_costs_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyObject *args);
 
 // clang-format off
 #define MY_METHODS \
@@ -36,7 +42,18 @@ static PyObject *map_cache_release_py(PyObject *self __attribute__((unused)), Py
     {"map_cache_preload", (PyCFunction) map_cache_preload_py, METH_VARARGS | METH_KEYWORDS, \
      "Build and retain configured map geometry for forked workers."}, \
     {"map_cache_release", (PyCFunction) map_cache_release_py, METH_VARARGS | METH_KEYWORDS, \
-     "Release map geometry retained for forked workers."}
+     "Release map geometry retained for forked workers."}, \
+    {"vec_predict_begin", vec_predict_begin_py, METH_VARARGS, \
+     "Snapshot every env and start a prediction rollout (non-policy actors hold speed and steering)."}, \
+    {"vec_predict_end", vec_predict_end_py, METH_VARARGS, "Restore every env to its pre-prediction snapshot."}, \
+    {"vec_get_active_agent_xy", vec_get_active_agent_xy_py, METH_VARARGS, \
+     "Fill an (active agents, 2) float32 array with active-agent sim positions."}, \
+    {"vec_predict_record_obstacles", vec_predict_record_obstacles_py, METH_VARARGS, \
+     "Record every collision candidate's pose as the next step of the running prediction rollout."}, \
+    {"vec_mppi_rollout_costs", vec_mppi_rollout_costs_py, METH_VARARGS, \
+     "Roll sampled action sequences per active agent and score them with CBF obstacle/road-edge costs."}, \
+    {"vec_mppi_prepare", vec_mppi_prepare_py, METH_VARARGS, \
+     "Set each active agent's forward_only flag and stop-sign clearance from its nominal (steps, 2) plan."}
 // clang-format on
 
 #include "../env_binding.h"
@@ -1991,6 +2008,218 @@ static PyObject *map_cache_release_py(
     if (released != 0) {
         PyErr_SetString(PyExc_RuntimeError, "map_cache_release failed: preload configuration drifted");
         return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_predict_begin_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    for (int i = 0; i < vec->num_envs; i++) {
+        if (c_predict_begin((Drive *) vec->envs[i]) != 0) {
+            for (int j = 0; j < i; j++) {
+                c_predict_end((Drive *) vec->envs[j]);
+            }
+            PyErr_SetString(PyExc_MemoryError, "vec_predict_begin failed to allocate the env snapshot");
+            return NULL;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_predict_end_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    for (int i = 0; i < vec->num_envs; i++) {
+        c_predict_end((Drive *) vec->envs[i]);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_active_agent_xy_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    if (PyTuple_Size(args) != 2) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_active_agent_xy requires 2 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    PyObject *out_obj = PyTuple_GetItem(args, 1);
+    if (!PyArray_Check(out_obj) || PyArray_TYPE((PyArrayObject *) out_obj) != NPY_FLOAT32
+        || !PyArray_IS_C_CONTIGUOUS((PyArrayObject *) out_obj)) {
+        PyErr_SetString(PyExc_TypeError, "out must be a C-contiguous float32 NumPy array");
+        return NULL;
+    }
+    int total_active = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total_active += ((Drive *) vec->envs[i])->active_agent_count;
+    }
+    if ((int) PyArray_SIZE((PyArrayObject *) out_obj) < total_active * 2) {
+        PyErr_SetString(PyExc_ValueError, "out is smaller than (active agents, 2)");
+        return NULL;
+    }
+    float *out = (float *) PyArray_DATA((PyArrayObject *) out_obj);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        for (int j = 0; j < drive->active_agent_count; j++) {
+            Agent *agent = &drive->agents[drive->active_agent_indices[j]];
+            out[row * 2] = agent->sim_x;
+            out[row * 2 + 1] = agent->sim_y;
+            row++;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_predict_record_obstacles_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        if (!drive->predict_mode) {
+            PyErr_SetString(PyExc_RuntimeError, "vec_predict_record_obstacles requires a running prediction rollout");
+            return NULL;
+        }
+        if (c_predict_record_obstacles(drive) != 0) {
+            PyErr_SetString(PyExc_MemoryError, "vec_predict_record_obstacles failed to grow the pose buffer");
+            return NULL;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyArrayObject *require_float32_array(PyObject *obj, int ndim, const char *name) {
+    if (!PyArray_Check(obj) || PyArray_TYPE((PyArrayObject *) obj) != NPY_FLOAT32
+        || !PyArray_IS_C_CONTIGUOUS((PyArrayObject *) obj) || PyArray_NDIM((PyArrayObject *) obj) != ndim) {
+        PyErr_Format(PyExc_TypeError, "%s must be a C-contiguous %d-D float32 NumPy array", name, ndim);
+        return NULL;
+    }
+    return (PyArrayObject *) obj;
+}
+
+static PyObject *vec_mppi_rollout_costs_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *env_obj, *actions_obj, *costs_obj, *xy_obj;
+    MppiCostParams params;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOfffffff",
+            &env_obj,
+            &actions_obj,
+            &costs_obj,
+            &xy_obj,
+            &params.cbf_decay_rate,
+            &params.obstacle_margin_m,
+            &params.boundary_margin_m,
+            &params.cbf_weight,
+            &params.collision_weight,
+            &params.control_zone_weight,
+            &params.stop_approach_weight)) {
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    PyArrayObject *actions = require_float32_array(actions_obj, 4, "sample_actions");
+    PyArrayObject *costs = actions ? require_float32_array(costs_obj, 2, "costs") : NULL;
+    PyArrayObject *sample_xy = costs ? require_float32_array(xy_obj, 4, "sample_xy") : NULL;
+    if (!sample_xy) {
+        return NULL;
+    }
+    int total_active = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total_active += ((Drive *) vec->envs[i])->active_agent_count;
+    }
+    npy_intp sample_count = PyArray_DIM(actions, 1);
+    npy_intp horizon_steps = PyArray_DIM(actions, 2);
+    // Rows past the active agents are the padded agent slots of the Python batch and are left untouched.
+    if (PyArray_DIM(actions, 0) < total_active || PyArray_DIM(actions, 3) != 2 || sample_count <= 0
+        || horizon_steps <= 0 || !PyArray_SAMESHAPE(actions, sample_xy) || PyArray_DIM(costs, 0) != PyArray_DIM(actions, 0)
+        || PyArray_DIM(costs, 1) != sample_count) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "expected sample_actions/sample_xy (>= active agents, samples, steps, 2) and matching costs (rows, samples)");
+        return NULL;
+    }
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        if (drive->action_type != ACTION_TYPE_CONTINUOUS) {
+            PyErr_SetString(PyExc_ValueError, "MPPI requires a continuous action env");
+            return NULL;
+        }
+        if (drive->predict_mode || drive->predict_state == NULL
+            || horizon_steps >= drive->predict_state->recorded_step_count) {
+            PyErr_SetString(
+                PyExc_RuntimeError, "MPPI needs a finished prediction rollout recording at least horizon_steps steps");
+            return NULL;
+        }
+    }
+    const float *action_data = (const float *) PyArray_DATA(actions);
+    float *cost_data = (float *) PyArray_DATA(costs);
+    float *xy_data = (float *) PyArray_DATA(sample_xy);
+    size_t agent_floats = (size_t) sample_count * horizon_steps * 2;
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        for (int j = 0; j < drive->active_agent_count; j++) {
+            c_mppi_rollout_costs(
+                drive,
+                j,
+                &action_data[row * agent_floats],
+                (int) sample_count,
+                (int) horizon_steps,
+                &params,
+                &cost_data[row * sample_count],
+                &xy_data[row * agent_floats]);
+            row++;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    if (PyTuple_Size(args) != 2) {
+        PyErr_SetString(PyExc_TypeError, "vec_mppi_prepare requires 2 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    PyArrayObject *nominal = require_float32_array(PyTuple_GetItem(args, 1), 3, "nominal_actions");
+    if (!nominal) {
+        return NULL;
+    }
+    int total_active = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        if (drive->action_type != ACTION_TYPE_CONTINUOUS || drive->predict_mode) {
+            PyErr_SetString(PyExc_RuntimeError, "MPPI requires a continuous action env outside a prediction rollout");
+            return NULL;
+        }
+        total_active += drive->active_agent_count;
+    }
+    npy_intp horizon_steps = PyArray_DIM(nominal, 1);
+    if (PyArray_DIM(nominal, 0) < total_active || horizon_steps <= 0 || PyArray_DIM(nominal, 2) != 2) {
+        PyErr_SetString(PyExc_ValueError, "expected nominal_actions (>= active agents, steps, 2)");
+        return NULL;
+    }
+    const float *nominal_data = (const float *) PyArray_DATA(nominal);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        for (int j = 0; j < drive->active_agent_count; j++) {
+            c_mppi_prepare_agent(drive, j, &nominal_data[(size_t) row * horizon_steps * 2], (int) horizon_steps);
+            row++;
+        }
     }
     Py_RETURN_NONE;
 }

@@ -78,6 +78,11 @@ struct Agent {
     int *route;
     int route_gt_len;      // Number of leading route lanes supported by GT before extension
     int current_route_idx; // Tracks progress through route array
+    int scripted_goal_count; // authored goals replace route-sampled goals when > 0
+    float *scripted_goal_x;
+    float *scripted_goal_y;
+    float *scripted_goal_z;
+    int scripted_goals_reached;
 
     // Metrics and status tracking (size must match NUM_METRICS in drive.h)
     float metrics_array[NUM_METRICS]; // [collision, offroad, red_light, stop_sign, reached_goal, lane_dist, lane_angle,
@@ -121,6 +126,8 @@ struct Agent {
     int stop_sign_stop_completed;    // 0/1 -> stood still inside the target's trigger box
     int stop_sign_last_failed_idx;   // element run without stopping, not re-targeted until 20 m away
     int stop_sign_standstill_idx;    // element whose trigger box the agent last stood still in, -1 if none
+    int forward_only;                // 0/1 -> speed floored at 0, set by the MPPI filter while the policy drives forward
+    int mppi_cleared_sign_idx;       // stop/yield element the agent came to rest at, its MPPI zone lifted; -1 if none
 
     // Jerk dynamics
     float accel_long;
@@ -206,6 +213,9 @@ void free_agent(struct Agent *agent) {
     free(agent->log_height);
     free(agent->log_valid);
     free(agent->route);
+    free(agent->scripted_goal_x);
+    free(agent->scripted_goal_y);
+    free(agent->scripted_goal_z);
 }
 
 void free_road_element(struct RoadMapElement *element) {

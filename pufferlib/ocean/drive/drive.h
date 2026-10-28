@@ -26,6 +26,7 @@ typedef struct RoadMapElement RoadMapElement;
 typedef struct TrafficControlElement TrafficControlElement;
 typedef struct GridMapEntity GridMapEntity;
 typedef struct GridMap GridMap;
+typedef struct PredictState PredictState;
 
 struct Log {
     float n;
@@ -350,6 +351,30 @@ struct Drive {
     uint64_t init_seed;
     uint64_t episode_seed;
     uint64_t log_episode_seed;
+    // Prediction rollout (eval visualization): c_predict_begin snapshots the env, c_step then runs the
+    // policy agents forward while every other actor holds its speed and steering, c_predict_end restores.
+    int predict_mode;
+    PredictState *predict_state;
+};
+
+struct PredictState {
+    Drive saved_env;
+    Agent *saved_agents; // routes are deep copies, handed back to the env on restore
+    int agent_capacity;
+    Log *saved_logs;
+    int log_capacity;
+    float *saved_observations;
+    int observation_capacity;
+    float *saved_rewards;
+    unsigned char *saved_terminals;
+    unsigned char *saved_truncations;
+    unsigned char *saved_masks;
+    int buffer_capacity;
+    float *speed;    // per agent: signed speed held for the whole rollout
+    float *steering; // per agent: steering angle held for the whole rollout
+    float *obstacle_poses; // [rollout step][collision-order agent][OBSTACLE_POSE_FIELD_COUNT], step 0 = now
+    int obstacle_pose_capacity;
+    int recorded_step_count;
 };
 
 typedef struct {
@@ -536,6 +561,9 @@ static void reset_agent_state(Agent *agent) {
     agent->stop_sign_stop_completed = 0;
     agent->stop_sign_last_failed_idx = -1;
     agent->stop_sign_standstill_idx = -1;
+    agent->forward_only = 0;
+    agent->mppi_cleared_sign_idx = -1;
+    agent->scripted_goals_reached = 0;
     agent->current_lane_idx = -1;
     agent->previous_lane_idx = -1;
     agent->current_route_idx = 0;
@@ -1248,10 +1276,51 @@ static void generate_new_goals_from_log(Drive *env, Agent *agent) {
     agent->current_goal_z = agent->list_goal_z[0];
 }
 
+static bool generate_scripted_goals(Drive *env, Agent *agent) {
+    int remaining_goal_count = agent->scripted_goal_count - agent->scripted_goals_reached;
+    if (remaining_goal_count <= 0) {
+        invalidate_agent(agent);
+        agent->removed = 1;
+        return false;
+    }
+    int window_goal_count = remaining_goal_count < env->num_goals ? remaining_goal_count : env->num_goals;
+    float goal_x[MAX_GOALS], goal_y[MAX_GOALS], goal_z[MAX_GOALS];
+    int goal_lane[MAX_GOALS];
+    float previous_x = agent->sim_x;
+    float previous_y = agent->sim_y;
+    if (agent->scripted_goals_reached > 0) {
+        previous_x = agent->scripted_goal_x[agent->scripted_goals_reached - 1];
+        previous_y = agent->scripted_goal_y[agent->scripted_goals_reached - 1];
+    }
+    for (int window_idx = 0; window_idx < window_goal_count; window_idx++) {
+        int scripted_idx = agent->scripted_goals_reached + window_idx;
+        goal_x[window_idx] = agent->scripted_goal_x[scripted_idx];
+        goal_y[window_idx] = agent->scripted_goal_y[scripted_idx];
+        goal_z[window_idx] = agent->scripted_goal_z[scripted_idx];
+        float snap_x, snap_y; // scripted goals keep their authored position, only the lane idx is used
+        goal_lane[window_idx] = find_goal_lane(
+            env,
+            goal_x[window_idx],
+            goal_y[window_idx],
+            goal_x[window_idx] - previous_x,
+            goal_y[window_idx] - previous_y,
+            &snap_x,
+            &snap_y);
+        previous_x = goal_x[window_idx];
+        previous_y = goal_y[window_idx];
+    }
+    commit_goals(
+        env, agent, goal_x, goal_y, goal_z, goal_lane, window_goal_count, env->num_goals - window_goal_count);
+    return true;
+}
+
 static bool generate_new_goals_from_route(Drive *env, Agent *agent) {
     // Places num_goals goals along the agent's route by native lane arc-length.
     // Replay follows the loaded route to its end; gigaflow route source random-walks a fresh route
     // when the current one runs out.
+    if (agent->scripted_goal_count > 0) {
+        return generate_scripted_goals(env, agent);
+    }
     if (agent->route == NULL || agent->route_length <= 0) {
         invalidate_agent(agent);
         agent->removed = 1;
@@ -3735,7 +3804,27 @@ void init(Drive *env) {
     }
 }
 
+static void free_predict_state(Drive *env) {
+    PredictState *ps = env->predict_state;
+    if (ps == NULL) {
+        return;
+    }
+    free(ps->saved_agents);
+    free(ps->saved_logs);
+    free(ps->saved_observations);
+    free(ps->saved_rewards);
+    free(ps->saved_terminals);
+    free(ps->saved_truncations);
+    free(ps->saved_masks);
+    free(ps->speed);
+    free(ps->steering);
+    free(ps->obstacle_poses);
+    free(ps);
+    env->predict_state = NULL;
+}
+
 void c_close(Drive *env) {
+    free_predict_state(env);
     free(env->active_agent_indices);
     free(env->logs);
     free(env->lane_speed_limit_mps);
@@ -5365,6 +5454,9 @@ static void move_dynamics(Drive *env, int action_idx, int agent_idx) {
             }
         }
         speed = clip(speed, MAX_BACKWARD_SPEED, env->base_max_speed_mps * agent->reward_coefs[REWARD_COEF_SPEED]);
+        if (agent->forward_only) {
+            speed = fmaxf(speed, 0.0f);
+        }
         // Compute yaw rate
         float beta = atanf(REAR_AXLE_RATIO * tanf(steering));
         // New heading
@@ -5479,6 +5571,10 @@ static void move_dynamics(Drive *env, int action_idx, int agent_idx) {
             }
         } else {
             v_new = clip(v_new, MAX_BACKWARD_SPEED, env->base_max_speed_mps * agent->reward_coefs[REWARD_COEF_SPEED]);
+        }
+        if (agent->forward_only && v_new < 0.0f) {
+            v_new = 0.0f;
+            a_long_new = 0.0f;
         }
 
         // If phantom braking is active, prevent speed from going negative
@@ -5720,6 +5816,28 @@ static void record_short_early_reset(Drive *env) {
         (unsigned long long) env->episode_seed);
 }
 
+// Prediction rollout: advance a non-policy actor one dt with the signed speed and steering angle
+// captured by c_predict_begin (kinematic bicycle, so constant steering means constant yaw rate).
+static void move_predicted_actor(Drive *env, int agent_idx) {
+    Agent *agent = &env->agents[agent_idx];
+    if (!agent->sim_valid || agent->sim_x == INVALID_POSITION) {
+        return;
+    }
+    copy_pose_to_prev(agent);
+    float speed = env->predict_state->speed[agent_idx];
+    float yaw_rate = speed * tanf(env->predict_state->steering[agent_idx]) / fmaxf(agent->wheelbase, 0.1f);
+    float mid_heading = agent->sim_heading + 0.5f * yaw_rate * env->dt;
+    agent->sim_x += speed * cosf(mid_heading) * env->dt;
+    agent->sim_y += speed * sinf(mid_heading) * env->dt;
+    agent->sim_heading = normalize_heading(agent->sim_heading + yaw_rate * env->dt);
+    agent->cos_heading = cosf(agent->sim_heading);
+    agent->sin_heading = sinf(agent->sim_heading);
+    agent->sim_vx = speed * agent->cos_heading;
+    agent->sim_vy = speed * agent->sin_heading;
+    agent->yaw_rate = yaw_rate;
+    update_agent_speed(agent);
+}
+
 void c_step(Drive *env) {
     // In eval, a scenario is evaluated once: hold the env after its episode
     // ended, so a short episode does not replay and re-emit within the window.
@@ -5733,18 +5851,26 @@ void c_step(Drive *env) {
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
     if (env->autoreset_pending) {
-        c_reset(env);
+        if (!env->predict_mode) {
+            c_reset(env);
+        }
         return;
     }
 
-    env->timestep++;
+    // A prediction rollout holds the clock: traffic lights keep their current state and the
+    // episode cannot end mid-rollout.
+    if (!env->predict_mode) {
+        env->timestep++;
+    }
 
     // -> 1. Apply actions and move agents
     // Move static experts
     for (int i = 0; i < env->expert_static_agent_count; i++) {
         int background_idx = env->expert_static_agent_indices[i];
         Agent *agent = &env->agents[background_idx];
-        if (agent->controller == CONTROLLER_IDM) {
+        if (env->predict_mode) {
+            move_predicted_actor(env, background_idx);
+        } else if (agent->controller == CONTROLLER_IDM) {
             move_idm(env, background_idx);
         } else if (agent->controller == CONTROLLER_REPLAY && env->simulation_mode == SIMULATION_MODE_REPLAY) {
             move_expert(env, background_idx);
@@ -5762,6 +5888,8 @@ void c_step(Drive *env) {
                 && (!env->eval_mode || env->eval_training_render)) {
                 apply_pose_noise(env, agent);
             }
+        } else if (env->predict_mode) {
+            move_predicted_actor(env, agent_idx);
         } else if (agent->controller == CONTROLLER_IDM) {
             move_idm(env, agent_idx);
         } else if (agent->controller == CONTROLLER_REPLAY && env->simulation_mode == SIMULATION_MODE_REPLAY) {
@@ -5828,7 +5956,7 @@ void c_step(Drive *env) {
         }
     }
 
-    if (env->timestep == env->episode_end_timestep || early_reset) {
+    if (!env->predict_mode && (env->timestep == env->episode_end_timestep || early_reset)) {
         if (early_reset && env->timestep <= EARLY_RESET_SHORT_TIMESTEPS) {
             record_short_early_reset(env);
         }
@@ -5863,7 +5991,10 @@ void c_step(Drive *env) {
         // Rolling slides the window forward by one goal; finite advances the alias to the next goal in the set.
         // Both fall back to a full regen: rolling on dead-end, finite when exhausted.
         bool regen;
-        if (env->goal_regen_mode == GOAL_REGEN_ROLLING) {
+        if (agent->scripted_goal_count > 0) {
+            agent->scripted_goals_reached++;
+            regen = true;
+        } else if (env->goal_regen_mode == GOAL_REGEN_ROLLING) {
             regen = !roll_goals(env, agent);
         } else if (agent->current_goal_idx == agent->goal_count) {
             regen = true;
@@ -5890,4 +6021,510 @@ void c_step(Drive *env) {
 
     // -> 5. Observations must describe the goals used by the next action.
     compute_observations(env);
+}
+
+// ── Prediction rollout ───────────────────────────────────────────────────────
+// Snapshot every piece of state c_step mutates, then switch the env into predict_mode: the caller keeps
+// feeding policy actions through c_step, non-policy actors hold their current speed and steering, and
+// c_predict_end puts the env back exactly as it was. Returns 0 on success, -1 on allocation failure.
+static int ensure_predict_capacity(void **buffer, int *capacity, int count, size_t item_size) {
+    if (count <= *capacity) {
+        return 0;
+    }
+    void *grown = realloc(*buffer, (size_t) count * item_size);
+    if (grown == NULL) {
+        return -1;
+    }
+    *buffer = grown;
+    *capacity = count;
+    return 0;
+}
+
+static int collision_order_agent_idx(Drive *env, int order_idx) {
+    return (order_idx < env->active_agent_count) ? env->active_agent_indices[order_idx]
+                                                 : env->static_agent_indices[order_idx - env->active_agent_count];
+}
+
+static void write_obstacle_poses(Drive *env, float *poses) {
+    for (int order_idx = 0; order_idx < env->num_agents; order_idx++) {
+        Agent *agent = &env->agents[collision_order_agent_idx(env, order_idx)];
+        float *pose = &poses[order_idx * OBSTACLE_POSE_FIELD_COUNT];
+        pose[0] = agent->sim_x;
+        pose[1] = agent->sim_y;
+        pose[2] = agent->cos_heading;
+        pose[3] = agent->sin_heading;
+        pose[4] = (agent->sim_x != INVALID_POSITION && !agent->removed && agent->sim_valid == 1) ? 1.0f : 0.0f;
+    }
+}
+
+int c_predict_begin(Drive *env) {
+    if (env->predict_state == NULL) {
+        env->predict_state = (PredictState *) calloc(1, sizeof(PredictState));
+        if (env->predict_state == NULL) {
+            return -1;
+        }
+    }
+    PredictState *ps = env->predict_state;
+    int agent_count = env->num_total_agents;
+    int observation_count = env->active_agent_count * compute_observation_size(env);
+    int agent_capacity = ps->agent_capacity, speed_capacity = ps->agent_capacity;
+    int steering_capacity = ps->agent_capacity, buffer_capacity = ps->buffer_capacity;
+    int terminal_capacity = ps->buffer_capacity, truncation_capacity = ps->buffer_capacity;
+    int mask_capacity = ps->buffer_capacity;
+    if (ensure_predict_capacity((void **) &ps->saved_agents, &agent_capacity, agent_count, sizeof(Agent))
+        || ensure_predict_capacity((void **) &ps->speed, &speed_capacity, agent_count, sizeof(float))
+        || ensure_predict_capacity((void **) &ps->steering, &steering_capacity, agent_count, sizeof(float))
+        || ensure_predict_capacity((void **) &ps->saved_logs, &ps->log_capacity, env->logs_capacity, sizeof(Log))
+        || ensure_predict_capacity(
+            (void **) &ps->saved_observations, &ps->observation_capacity, observation_count, sizeof(float))
+        || ensure_predict_capacity(
+            (void **) &ps->saved_rewards, &buffer_capacity, env->active_agent_count, sizeof(float))
+        || ensure_predict_capacity(
+            (void **) &ps->saved_terminals, &terminal_capacity, env->active_agent_count, sizeof(unsigned char))
+        || ensure_predict_capacity(
+            (void **) &ps->saved_truncations, &truncation_capacity, env->active_agent_count, sizeof(unsigned char))
+        || ensure_predict_capacity(
+            (void **) &ps->saved_masks, &mask_capacity, env->active_agent_count, sizeof(unsigned char))
+        || ensure_predict_capacity(
+            (void **) &ps->obstacle_poses,
+            &ps->obstacle_pose_capacity,
+            env->num_agents * OBSTACLE_POSE_FIELD_COUNT,
+            sizeof(float))) {
+        return -1;
+    }
+    ps->agent_capacity = agent_capacity;
+    ps->buffer_capacity = buffer_capacity;
+
+    ps->saved_env = *env;
+    memcpy(ps->saved_agents, env->agents, agent_count * sizeof(Agent));
+    for (int i = 0; i < agent_count; i++) {
+        Agent *saved = &ps->saved_agents[i];
+        if (saved->route == NULL || saved->route_length <= 0) {
+            continue;
+        }
+        // Goal regeneration frees and reallocates routes mid-rollout, so the snapshot owns its own copy.
+        int *route_copy = (int *) malloc(saved->route_length * sizeof(int));
+        if (route_copy == NULL) {
+            for (int j = 0; j < i; j++) {
+                if (ps->saved_agents[j].route != env->agents[j].route) {
+                    free(ps->saved_agents[j].route);
+                }
+            }
+            return -1;
+        }
+        memcpy(route_copy, saved->route, saved->route_length * sizeof(int));
+        saved->route = route_copy;
+    }
+    if (env->logs_capacity > 0) {
+        memcpy(ps->saved_logs, env->logs, env->logs_capacity * sizeof(Log));
+    }
+    memcpy(ps->saved_observations, env->observations, observation_count * sizeof(float));
+    memcpy(ps->saved_rewards, env->rewards, env->active_agent_count * sizeof(float));
+    memcpy(ps->saved_terminals, env->terminals, env->active_agent_count * sizeof(unsigned char));
+    memcpy(ps->saved_truncations, env->truncations, env->active_agent_count * sizeof(unsigned char));
+    memcpy(ps->saved_masks, env->masks, env->active_agent_count * sizeof(unsigned char));
+
+    // Speed and steering from the current and previous pose only, so the prediction never reads the log ahead.
+    for (int i = 0; i < agent_count; i++) {
+        Agent *agent = &env->agents[i];
+        float speed = agent->sim_speed_signed;
+        float yaw_rate = 0.0f;
+        if (agent->prev_cos_heading != 0.0f || agent->prev_sin_heading != 0.0f) {
+            float prev_heading = atan2f(agent->prev_sin_heading, agent->prev_cos_heading);
+            yaw_rate = normalize_heading(agent->sim_heading - prev_heading) / env->dt;
+        }
+        float steering = 0.0f;
+        if (fabsf(speed) > AGENT_STOPPED_SPEED_THRESHOLD) {
+            steering = atanf(yaw_rate * fmaxf(agent->wheelbase, 0.1f) / speed);
+        }
+        ps->speed[i] = speed;
+        ps->steering[i] = clip(steering, -STEERING_LIMIT, STEERING_LIMIT);
+    }
+    write_obstacle_poses(env, ps->obstacle_poses);
+    ps->recorded_step_count = 1;
+    env->predict_mode = 1;
+    return 0;
+}
+
+// Appends the current poses of every collision candidate as the next rollout step. Returns -1 on allocation failure.
+int c_predict_record_obstacles(Drive *env) {
+    PredictState *ps = env->predict_state;
+    int step_floats = env->num_agents * OBSTACLE_POSE_FIELD_COUNT;
+    if (ensure_predict_capacity(
+            (void **) &ps->obstacle_poses,
+            &ps->obstacle_pose_capacity,
+            (ps->recorded_step_count + 1) * step_floats,
+            sizeof(float))) {
+        return -1;
+    }
+    write_obstacle_poses(env, &ps->obstacle_poses[ps->recorded_step_count * step_floats]);
+    ps->recorded_step_count++;
+    return 0;
+}
+
+void c_predict_end(Drive *env) {
+    PredictState *ps = env->predict_state;
+    if (ps == NULL || !env->predict_mode) {
+        return;
+    }
+    int agent_count = ps->saved_env.num_total_agents;
+    for (int i = 0; i < agent_count; i++) {
+        free(env->agents[i].route);
+    }
+    memcpy(env->agents, ps->saved_agents, agent_count * sizeof(Agent));
+    if (ps->saved_env.logs_capacity > 0) {
+        memcpy(env->logs, ps->saved_logs, ps->saved_env.logs_capacity * sizeof(Log));
+    }
+    int active_count = ps->saved_env.active_agent_count;
+    memcpy(env->observations, ps->saved_observations, active_count * compute_observation_size(env) * sizeof(float));
+    memcpy(env->rewards, ps->saved_rewards, active_count * sizeof(float));
+    memcpy(env->terminals, ps->saved_terminals, active_count * sizeof(unsigned char));
+    memcpy(env->truncations, ps->saved_truncations, active_count * sizeof(unsigned char));
+    memcpy(env->masks, ps->saved_masks, active_count * sizeof(unsigned char));
+    *env = ps->saved_env; // scalars, rng streams, episode log and clock; predict_mode was 0 when saved
+}
+
+// ── MPPI safety cost ─────────────────────────────────────────────────────────
+typedef struct {
+    float cbf_decay_rate; // 1/s: a safe step keeps h(t+1) >= (1 - cbf_decay_rate * dt) * h(t)
+    float obstacle_margin_m;
+    float boundary_margin_m;
+    float cbf_weight;
+    float collision_weight;
+    float control_zone_weight;
+    float stop_approach_weight;
+} MppiCostParams;
+
+// Box just past a stop line, pose as x, y, cos, sin with cos/sin along the controlled travel direction.
+typedef struct {
+    float pose[4];
+    float length;
+    float width;
+    float stop_line[4]; // x1, y1, x2, y2
+} MppiControlZone;
+
+// Negative inside the box.
+static float compute_point_to_box_signed_distance(float px, float py, const float *pose, float length, float width) {
+    float dx = px - pose[0];
+    float dy = py - pose[1];
+    float excess_long = fabsf(dx * pose[2] + dy * pose[3]) - 0.5f * length;
+    float excess_lat = fabsf(-dx * pose[3] + dy * pose[2]) - 0.5f * width;
+    if (excess_long <= 0.0f && excess_lat <= 0.0f) {
+        return fmaxf(excess_long, excess_lat);
+    }
+    float outside_long = fmaxf(excess_long, 0.0f);
+    float outside_lat = fmaxf(excess_lat, 0.0f);
+    return sqrtf(outside_long * outside_long + outside_lat * outside_lat);
+}
+
+// Circles evenly spaced along the heading that together cover the footprint; returns their shared radius.
+static float compute_footprint_circles(Agent *agent, float *centers) {
+    float spacing = agent->sim_length / MPPI_FOOTPRINT_CIRCLE_COUNT;
+    for (int circle_idx = 0; circle_idx < MPPI_FOOTPRINT_CIRCLE_COUNT; circle_idx++) {
+        float offset = (circle_idx - 0.5f * (MPPI_FOOTPRINT_CIRCLE_COUNT - 1)) * spacing;
+        centers[2 * circle_idx] = agent->sim_x + offset * agent->cos_heading;
+        centers[2 * circle_idx + 1] = agent->sim_y + offset * agent->sin_heading;
+    }
+    float half_spacing = 0.5f * spacing;
+    float half_width = 0.5f * agent->sim_width;
+    return sqrtf(half_spacing * half_spacing + half_width * half_width);
+}
+
+static float compute_obstacle_clearance(
+    Drive *env, Agent *agent, int agent_idx, const float *centers, float radius, const float *poses) {
+    float clearance = MPPI_BARRIER_RANGE_M;
+    for (int order_idx = 0; order_idx < env->num_agents; order_idx++) {
+        int other_idx = collision_order_agent_idx(env, order_idx);
+        const float *pose = &poses[order_idx * OBSTACLE_POSE_FIELD_COUNT];
+        if (other_idx == agent_idx || pose[4] == 0.0f) {
+            continue;
+        }
+        Agent *other = &env->agents[other_idx];
+        float reach = MPPI_BARRIER_RANGE_M + agent->radius + other->radius;
+        float dx = pose[0] - agent->sim_x;
+        float dy = pose[1] - agent->sim_y;
+        if (dx * dx + dy * dy > reach * reach) {
+            continue;
+        }
+        for (int circle_idx = 0; circle_idx < MPPI_FOOTPRINT_CIRCLE_COUNT; circle_idx++) {
+            float distance = compute_point_to_box_signed_distance(
+                centers[2 * circle_idx], centers[2 * circle_idx + 1], pose, other->sim_length, other->sim_width);
+            clearance = fminf(clearance, distance - radius);
+        }
+    }
+    return clearance;
+}
+
+static float compute_boundary_clearance(Drive *env, Agent *agent, const float *centers, float radius) {
+    if (get_grid_index(env, agent->sim_x, agent->sim_y) == -1) {
+        return -radius; // off the map grid counts as off-road, as in compute_metrics
+    }
+    GridMapEntity entity_list[ROAD_QUERY_ENTITY_COUNT];
+    int list_size = get_neighbors_entities(
+        env, agent->sim_x, agent->sim_y, entity_list, ROAD_QUERY_ENTITY_COUNT, ROAD_OFFSETS, 25);
+    float clearance = MPPI_BARRIER_RANGE_M;
+    for (int i = 0; i < list_size; i++) {
+        if (entity_list[i].entity_idx == -1) {
+            continue;
+        }
+        RoadMapElement *element = &env->road_elements[entity_list[i].entity_idx];
+        int geometry_idx = entity_list[i].geometry_idx;
+        if (!is_road_edge(element->type) || fabsf(element->z[geometry_idx] - agent->sim_z) > Z_BUFFER) {
+            continue;
+        }
+        for (int circle_idx = 0; circle_idx < MPPI_FOOTPRINT_CIRCLE_COUNT; circle_idx++) {
+            float distance = compute_point_to_segment_distance(
+                centers[2 * circle_idx],
+                centers[2 * circle_idx + 1],
+                element->x[geometry_idx],
+                element->y[geometry_idx],
+                element->x[geometry_idx + 1],
+                element->y[geometry_idx + 1]);
+            clearance = fminf(clearance, distance - radius);
+        }
+    }
+    return clearance;
+}
+
+// Controls the agent drives toward: same travel direction, same level, and the agent center not yet past the line.
+static bool is_control_ahead(Agent *agent, TrafficControlElement *tc, StopLineFrame *frame) {
+    if (!compute_stop_line_frame(tc, frame)
+        || fabsf(compute_heading_diff(agent->sim_heading, tc->heading)) >= RED_LIGHT_ENTER_HEADING_THRESHOLD
+        || fabsf(0.5f * (tc->stop_line[2] + tc->stop_line[5]) - agent->sim_z) > Z_BUFFER) {
+        return false;
+    }
+    float dx = agent->sim_x - frame->mid_x;
+    float dy = agent->sim_y - frame->mid_y;
+    return dx * frame->along_x + dy * frame->along_y < 0.0f
+           && dx * dx + dy * dy <= MPPI_CONTROL_RANGE_M * MPPI_CONTROL_RANGE_M;
+}
+
+// Red lights ahead become blocking obstacles; stop/yield signs ahead, until the agent rests at their line, become
+// zones of uncertainty. Light states hold at the current timestep for the whole horizon.
+static void collect_control_zones(
+    Drive *env,
+    Agent *agent,
+    MppiControlZone *blocking_zones,
+    int *blocking_count,
+    MppiControlZone *uncertain_zones,
+    int *uncertain_count) {
+    *blocking_count = 0;
+    *uncertain_count = 0;
+    for (int tc_idx = 0; tc_idx < env->num_traffic_elements; tc_idx++) {
+        TrafficControlElement *tc = &env->traffic_elements[tc_idx];
+        bool is_red_light = tc->type == TRAFFIC_CONTROL_TYPE_TRAFFIC_LIGHT && env->timestep < tc->state_size
+                            && tc->states[env->timestep] == TRAFFIC_CONTROL_STATE_RED;
+        bool is_open_sign
+            = (tc->type == TRAFFIC_CONTROL_TYPE_STOP_SIGN || tc->type == TRAFFIC_CONTROL_TYPE_YIELD_SIGN)
+              && tc_idx != agent->mppi_cleared_sign_idx;
+        if (!is_red_light && !is_open_sign) {
+            continue;
+        }
+        StopLineFrame frame;
+        if (!is_control_ahead(agent, tc, &frame)) {
+            continue;
+        }
+        MppiControlZone *zone = is_red_light ? &blocking_zones[*blocking_count] : &uncertain_zones[*uncertain_count];
+        int *zone_count = is_red_light ? blocking_count : uncertain_count;
+        if (*zone_count == MPPI_MAX_CONTROL_ZONES) {
+            continue;
+        }
+        zone->pose[0] = frame.mid_x + 0.5f * MPPI_CONTROL_ZONE_DEPTH_M * frame.along_x;
+        zone->pose[1] = frame.mid_y + 0.5f * MPPI_CONTROL_ZONE_DEPTH_M * frame.along_y;
+        zone->pose[2] = frame.along_x;
+        zone->pose[3] = frame.along_y;
+        zone->length = MPPI_CONTROL_ZONE_DEPTH_M;
+        zone->width = 2.0f * frame.half_len;
+        zone->stop_line[0] = tc->stop_line[0];
+        zone->stop_line[1] = tc->stop_line[1];
+        zone->stop_line[2] = tc->stop_line[3];
+        zone->stop_line[3] = tc->stop_line[4];
+        (*zone_count)++;
+    }
+}
+
+static float compute_zone_clearance(const MppiControlZone *zones, int zone_count, const float *centers, float radius) {
+    float clearance = MPPI_BARRIER_RANGE_M;
+    for (int zone_idx = 0; zone_idx < zone_count; zone_idx++) {
+        for (int circle_idx = 0; circle_idx < MPPI_FOOTPRINT_CIRCLE_COUNT; circle_idx++) {
+            float distance = compute_point_to_box_signed_distance(
+                centers[2 * circle_idx],
+                centers[2 * circle_idx + 1],
+                zones[zone_idx].pose,
+                zones[zone_idx].length,
+                zones[zone_idx].width);
+            clearance = fminf(clearance, distance - radius);
+        }
+    }
+    return clearance;
+}
+
+static float compute_front_to_stop_line_distance(Agent *agent, const MppiControlZone *zone) {
+    float front_x = agent->sim_x + 0.5f * agent->sim_length * agent->cos_heading;
+    float front_y = agent->sim_y + 0.5f * agent->sim_length * agent->sin_heading;
+    return compute_point_to_segment_distance(
+        front_x, front_y, zone->stop_line[0], zone->stop_line[1], zone->stop_line[2], zone->stop_line[3]);
+}
+
+// Exact footprint test (corners and edge midpoints), so resting just short of a stop line stays outside the zone.
+static bool is_footprint_in_zones(Agent *agent, const MppiControlZone *zones, int zone_count, int cleared_mask) {
+    float half_length = 0.5f * agent->sim_length;
+    float half_width = 0.5f * agent->sim_width;
+    for (int zone_idx = 0; zone_idx < zone_count; zone_idx++) {
+        if (cleared_mask & (1 << zone_idx)) {
+            continue;
+        }
+        for (int long_sign = -1; long_sign <= 1; long_sign++) {
+            for (int lat_sign = -1; lat_sign <= 1; lat_sign += 2) {
+                float along = long_sign * half_length;
+                float across = lat_sign * half_width;
+                float px = agent->sim_x + along * agent->cos_heading - across * agent->sin_heading;
+                float py = agent->sim_y + along * agent->sin_heading + across * agent->cos_heading;
+                if (compute_point_to_box_signed_distance(px, py, zones[zone_idx].pose, zones[zone_idx].length,
+                                                         zones[zone_idx].width) < 0.0f) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Per-step MPPI agent state: forward_only when the policy's own plan never reverses, and the stop/yield sign the
+// agent now rests within MPPI_STOP_LINE_CLEAR_DIST_M of. nominal_actions is [step][2]. Leaves the pose unchanged.
+void c_mppi_prepare_agent(Drive *env, int active_idx, const float *nominal_actions, int horizon_steps) {
+    int agent_idx = env->active_agent_indices[active_idx];
+    Agent *agent = &env->agents[agent_idx];
+    agent->forward_only = 0;
+    Agent saved_agent = *agent;
+    float (*env_actions)[2] = (float (*)[2]) env->actions;
+    float saved_action[2] = {env_actions[active_idx][0], env_actions[active_idx][1]};
+    float min_speed = agent->sim_speed_signed;
+    for (int step = 0; step < horizon_steps; step++) {
+        env_actions[active_idx][0] = nominal_actions[2 * step];
+        env_actions[active_idx][1] = nominal_actions[2 * step + 1];
+        move_dynamics(env, active_idx, agent_idx);
+        min_speed = fminf(min_speed, agent->sim_speed_signed);
+    }
+    *agent = saved_agent;
+    env_actions[active_idx][0] = saved_action[0];
+    env_actions[active_idx][1] = saved_action[1];
+    agent->forward_only = min_speed >= -MPPI_REVERSE_SPEED_MPS;
+
+    if (agent->sim_speed >= STOP_SIGN_STOP_SPEED_MPS) {
+        return;
+    }
+    float front_x = agent->sim_x + 0.5f * agent->sim_length * agent->cos_heading;
+    float front_y = agent->sim_y + 0.5f * agent->sim_length * agent->sin_heading;
+    for (int tc_idx = 0; tc_idx < env->num_traffic_elements; tc_idx++) {
+        TrafficControlElement *tc = &env->traffic_elements[tc_idx];
+        if (tc->type != TRAFFIC_CONTROL_TYPE_STOP_SIGN && tc->type != TRAFFIC_CONTROL_TYPE_YIELD_SIGN) {
+            continue;
+        }
+        StopLineFrame frame;
+        if (!is_control_ahead(agent, tc, &frame)) {
+            continue;
+        }
+        float line_distance = compute_point_to_segment_distance(
+            front_x, front_y, tc->stop_line[0], tc->stop_line[1], tc->stop_line[3], tc->stop_line[4]);
+        if (line_distance <= MPPI_STOP_LINE_CLEAR_DIST_M) {
+            agent->mppi_cleared_sign_idx = tc_idx;
+        }
+    }
+}
+
+// Rolls one policy agent through sample_count action sequences of horizon_steps against the obstacle poses of the
+// last prediction rollout, and scores each with discrete-time CBF violations on obstacle and road-edge clearance.
+// sample_actions is [sample][step][2]; outputs costs[sample] and sample_xy[sample][step][2]. Leaves the env unchanged.
+void c_mppi_rollout_costs(
+    Drive *env,
+    int active_idx,
+    const float *sample_actions,
+    int sample_count,
+    int horizon_steps,
+    const MppiCostParams *params,
+    float *costs,
+    float *sample_xy) {
+    PredictState *ps = env->predict_state;
+    assert(!env->predict_mode && horizon_steps < ps->recorded_step_count);
+    int agent_idx = env->active_agent_indices[active_idx];
+    Agent saved_agent = env->agents[agent_idx];
+    float (*env_actions)[2] = (float (*)[2]) env->actions;
+    float saved_action[2] = {env_actions[active_idx][0], env_actions[active_idx][1]};
+    int step_floats = env->num_agents * OBSTACLE_POSE_FIELD_COUNT;
+    float cbf_keep = fmaxf(1.0f - params->cbf_decay_rate * env->dt, 0.0f);
+
+    float centers[2 * MPPI_FOOTPRINT_CIRCLE_COUNT];
+    float radius = compute_footprint_circles(&saved_agent, centers);
+    float start_obstacle_barrier
+        = compute_obstacle_clearance(env, &saved_agent, agent_idx, centers, radius, ps->obstacle_poses)
+          - params->obstacle_margin_m;
+    float start_boundary_barrier
+        = compute_boundary_clearance(env, &saved_agent, centers, radius) - params->boundary_margin_m;
+    MppiControlZone blocking_zones[MPPI_MAX_CONTROL_ZONES], uncertain_zones[MPPI_MAX_CONTROL_ZONES];
+    int blocking_count, uncertain_count;
+    collect_control_zones(env, &saved_agent, blocking_zones, &blocking_count, uncertain_zones, &uncertain_count);
+    int approach_mask = 0; // zones whose line is close enough that stopping short of it is penalized
+    for (int zone_idx = 0; zone_idx < uncertain_count; zone_idx++) {
+        if (compute_front_to_stop_line_distance(&saved_agent, &uncertain_zones[zone_idx]) <= MPPI_STOP_APPROACH_RANGE_M) {
+            approach_mask |= 1 << zone_idx;
+        }
+    }
+    start_obstacle_barrier
+        = fminf(start_obstacle_barrier, compute_zone_clearance(blocking_zones, blocking_count, centers, radius)
+                                            - params->obstacle_margin_m);
+
+    for (int sample_idx = 0; sample_idx < sample_count; sample_idx++) {
+        env->agents[agent_idx] = saved_agent;
+        Agent *agent = &env->agents[agent_idx];
+        float prev_obstacle_barrier = start_obstacle_barrier;
+        float prev_boundary_barrier = start_boundary_barrier;
+        bool collided = false;
+        int cleared_mask = 0; // zones this sample came to rest at, lifted for the rest of its rollout
+        float cost = 0.0f;
+        for (int step = 0; step < horizon_steps; step++) {
+            size_t step_offset = ((size_t) sample_idx * horizon_steps + step) * 2;
+            env_actions[active_idx][0] = sample_actions[step_offset];
+            env_actions[active_idx][1] = sample_actions[step_offset + 1];
+            move_dynamics(env, active_idx, agent_idx);
+            sample_xy[step_offset] = agent->sim_x;
+            sample_xy[step_offset + 1] = agent->sim_y;
+
+            compute_footprint_circles(agent, centers);
+            float obstacle_clearance = fminf(
+                compute_obstacle_clearance(
+                    env, agent, agent_idx, centers, radius, &ps->obstacle_poses[(step + 1) * step_floats]),
+                compute_zone_clearance(blocking_zones, blocking_count, centers, radius));
+            float boundary_clearance = compute_boundary_clearance(env, agent, centers, radius);
+            float obstacle_barrier = obstacle_clearance - params->obstacle_margin_m;
+            float boundary_barrier = boundary_clearance - params->boundary_margin_m;
+            cost += params->cbf_weight
+                    * (fmaxf(cbf_keep * prev_obstacle_barrier - obstacle_barrier, 0.0f)
+                       + fmaxf(cbf_keep * prev_boundary_barrier - boundary_barrier, 0.0f));
+            collided = collided || obstacle_clearance < 0.0f || boundary_clearance < 0.0f;
+            if (collided) {
+                cost += params->collision_weight;
+            }
+            for (int zone_idx = 0; zone_idx < uncertain_count && agent->sim_speed < STOP_SIGN_STOP_SPEED_MPS; zone_idx++) {
+                if (compute_front_to_stop_line_distance(agent, &uncertain_zones[zone_idx]) <= MPPI_STOP_LINE_CLEAR_DIST_M) {
+                    cleared_mask |= 1 << zone_idx;
+                }
+            }
+            if (is_footprint_in_zones(agent, uncertain_zones, uncertain_count, cleared_mask)) {
+                cost += params->control_zone_weight;
+            }
+            prev_obstacle_barrier = obstacle_barrier;
+            prev_boundary_barrier = boundary_barrier;
+        }
+        for (int zone_idx = 0; zone_idx < uncertain_count; zone_idx++) {
+            if ((approach_mask & ~cleared_mask) & (1 << zone_idx)) {
+                float line_distance = compute_front_to_stop_line_distance(agent, &uncertain_zones[zone_idx]);
+                cost += params->stop_approach_weight * fmaxf(line_distance - MPPI_STOP_LINE_CLEAR_DIST_M, 0.0f);
+            }
+        }
+        costs[sample_idx] = cost;
+    }
+    env->agents[agent_idx] = saved_agent;
+    env_actions[active_idx][0] = saved_action[0];
+    env_actions[active_idx][1] = saved_action[1];
 }

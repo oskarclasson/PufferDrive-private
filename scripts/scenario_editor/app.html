@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PufferDrive Workbench</title>
+<style>
+  :root { --bg: #f3f3f1; --panel: #ffffff; --text: #1f2328; --muted: #6b7280; --border: #d9dadc; --accent: #2563eb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; font: 13px/1.4 system-ui, sans-serif; color: var(--text); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 14px; padding: 0 12px; height: 40px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  header b { font-size: 14px; }
+  nav { display: flex; gap: 4px; }
+  nav button { padding: 5px 14px; border: 1px solid var(--border); border-radius: 4px; background: #f8f8f8; font: inherit; cursor: pointer; }
+  nav button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  header .hint { color: var(--muted); font-size: 12px; margin-left: auto; }
+  main { flex: 1; position: relative; }
+  iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  iframe.hidden { visibility: hidden; }
+</style>
+</head>
+<body>
+<header>
+  <b>PufferDrive workbench</b>
+  <nav>
+    <button data-tab="map">1 · Map</button>
+    <button data-tab="scenario">2 · Scenario &amp; results</button>
+  </nav>
+  <span class="hint">Draw a road layout, then place traffic on it (or on any nuPlan map) and evaluate.</span>
+</header>
+<main>
+  <iframe id="frame-map" src="/map-editor/" title="Map editor"></iframe>
+  <iframe id="frame-scenario" src="/scenario/" title="Scenario editor"></iframe>
+</main>
+<script>
+"use strict";
+const TAB_STORAGE_KEY = "pufferdrive_workbench_tab";
+const frames = {map: document.getElementById("frame-map"), scenario: document.getElementById("frame-scenario")};
+
+function showTab(name) {
+  for (const [tab, frame] of Object.entries(frames)) frame.classList.toggle("hidden", tab !== name);
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  try { localStorage.setItem(TAB_STORAGE_KEY, name); } catch (e) { /* storage unavailable */ }
+}
+
+// editors talk through the shell: map-saved → scenario list refresh, open-map / edit-map switch tabs
+window.addEventListener("message", event => {
+  if (event.origin !== location.origin || !event.data || typeof event.data.type !== "string") return;
+  const message = event.data;
+  if (message.type === "map-saved") {
+    frames.scenario.contentWindow.postMessage(message, location.origin);
+  } else if (message.type === "open-map") {
+    frames.scenario.contentWindow.postMessage(message, location.origin);
+    showTab("scenario");
+  } else if (message.type === "edit-map") {
+    frames.map.contentWindow.postMessage(message, location.origin);
+    showTab("map");
+  }
+});
+
+document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+let initialTab = "scenario";
+try { initialTab = localStorage.getItem(TAB_STORAGE_KEY) || initialTab; } catch (e) { /* storage unavailable */ }
+showTab(frames[initialTab] ? initialTab : "scenario");
+</script>
+</body>
+</html>

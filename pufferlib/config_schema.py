@@ -501,6 +501,20 @@ class EvaluationConfig:
     observation_replay_wave_size: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
     observation_replay_writer_count: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
     action_selection: ActionSelection = MISSING
+    predict_horizon_s: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_samples: int = _constrained_field(NONNEGATIVE_INT_CONSTRAINT)
+    mppi_horizon_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    mppi_jerk_noise_std: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_steer_noise_std: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_temperature: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    mppi_cbf_decay_rate: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_cbf_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_collision_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_control_zone_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_stop_approach_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_progress_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_obstacle_margin_m: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_boundary_margin_m: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
 
 
 @dataclass

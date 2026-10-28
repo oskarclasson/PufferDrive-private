@@ -814,6 +814,34 @@ class Drive(pufferlib.PufferEnv):
                     self.terminals[:] = 0
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
 
+    def predict_begin(self):
+        """Snapshot every env; until predict_end, steps hold non-policy actors at constant speed and steering."""
+        binding.vec_predict_begin(self.c_envs)
+
+    def predict_step(self, actions):
+        """Step the policy agents inside a prediction rollout, bypassing replay capture and resampling."""
+        self.actions[:] = actions
+        binding.vec_step(self.c_envs)
+
+    def predict_end(self):
+        binding.vec_predict_end(self.c_envs)
+
+    def predict_record_obstacles(self):
+        """Record every collision candidate's pose after the latest predict_step, for mppi_rollout_costs."""
+        binding.vec_predict_record_obstacles(self.c_envs)
+
+    def mppi_prepare(self, nominal_actions):
+        """Floor speeds at 0 while the (active, steps, 2) policy plan drives forward; lift rested-at stop zones."""
+        binding.vec_mppi_prepare(self.c_envs, nominal_actions)
+
+    def mppi_rollout_costs(self, sample_actions, costs, sample_xy, cost_params):
+        """Score (active, samples, steps, 2) action sequences against the poses of the last prediction rollout."""
+        binding.vec_mppi_rollout_costs(self.c_envs, sample_actions, costs, sample_xy, *cost_params)
+
+    def get_active_agent_xy(self, out):
+        """Fill out[:num_active] with active-agent positions in the sim frame the replay viewer draws in."""
+        binding.vec_get_active_agent_xy(self.c_envs, out)
+
     def get_global_agent_state(self, include_static=False):
         """Get current global state of all active agents.
 

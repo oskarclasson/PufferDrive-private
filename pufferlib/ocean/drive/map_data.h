@@ -602,6 +602,9 @@ static inline const GridMapEntity *neighbor_cursor_next(Drive *env, NeighborCurs
 #define LANE_WIDTH_SECTION_TAG_LEN 8
 #define SPEED_ZONE_SECTION_TAG "SPDZONE1"
 #define SPEED_ZONE_SECTION_TAG_LEN 8
+#define SCRIPTED_GOAL_SECTION_TAG "AGTGOAL1"
+#define SCRIPTED_GOAL_SECTION_TAG_LEN 8
+#define MAX_SCRIPTED_GOALS_PER_AGENT 256
 
 // Optional tail section; files written before it existed end right after the metadata.
 static int load_traffic_phase_section(FILE *file, Drive *drive) {
@@ -718,9 +721,59 @@ static int load_speed_zone_section(FILE *file, Drive *drive) {
             drive->num_speed_zones = road->speed_zone_idx + 1;
         }
     }
+    return 0;
+}
+
+// Optional tail section written by the scenario editor; files without it keep route-sampled goals.
+static int load_scripted_goal_section(FILE *file, Drive *drive) {
+    char tag[SCRIPTED_GOAL_SECTION_TAG_LEN];
+    size_t tag_bytes_read = fread(tag, sizeof(char), SCRIPTED_GOAL_SECTION_TAG_LEN, file);
+    if (tag_bytes_read == 0) {
+        return 0;
+    }
+    if (tag_bytes_read != SCRIPTED_GOAL_SECTION_TAG_LEN
+        || memcmp(tag, SCRIPTED_GOAL_SECTION_TAG, SCRIPTED_GOAL_SECTION_TAG_LEN) != 0) {
+        printf(
+            "[ERROR] -> Unexpected bytes after %s section (expected EOF or %s).\n",
+            SPEED_ZONE_SECTION_TAG,
+            SCRIPTED_GOAL_SECTION_TAG);
+        return -1;
+    }
+    for (int i = 0; i < drive->num_total_agents; i++) {
+        Agent *agent = &drive->agents[i];
+        int goal_count;
+        if (fread(&goal_count, sizeof(int), 1, file) != 1) {
+            printf("[ERROR] -> Truncated %s section at agent %d.\n", SCRIPTED_GOAL_SECTION_TAG, i);
+            return -1;
+        }
+        if (goal_count < 0 || goal_count > MAX_SCRIPTED_GOALS_PER_AGENT) {
+            printf("[ERROR] -> Agent %d has invalid scripted goal count %d.\n", i, goal_count);
+            return -1;
+        }
+        agent->scripted_goal_count = goal_count;
+        if (goal_count == 0) {
+            continue;
+        }
+        agent->scripted_goal_x = (float *) malloc(goal_count * sizeof(float));
+        agent->scripted_goal_y = (float *) malloc(goal_count * sizeof(float));
+        agent->scripted_goal_z = (float *) malloc(goal_count * sizeof(float));
+        if (fread(agent->scripted_goal_x, sizeof(float), goal_count, file) != (size_t) goal_count
+            || fread(agent->scripted_goal_y, sizeof(float), goal_count, file) != (size_t) goal_count
+            || fread(agent->scripted_goal_z, sizeof(float), goal_count, file) != (size_t) goal_count) {
+            printf("[ERROR] -> Truncated %s section at agent %d.\n", SCRIPTED_GOAL_SECTION_TAG, i);
+            return -1;
+        }
+        for (int g = 0; g < goal_count; g++) {
+            if (!isfinite(agent->scripted_goal_x[g]) || !isfinite(agent->scripted_goal_y[g])
+                || !isfinite(agent->scripted_goal_z[g])) {
+                printf("[ERROR] -> Agent %d scripted goal %d is not finite.\n", i, g);
+                return -1;
+            }
+        }
+    }
     char trailing_byte;
     if (fread(&trailing_byte, sizeof(char), 1, file) == 1) {
-        printf("[ERROR] -> Trailing bytes after %s section.\n", SPEED_ZONE_SECTION_TAG);
+        printf("[ERROR] -> Trailing bytes after %s section.\n", SCRIPTED_GOAL_SECTION_TAG);
         return -1;
     }
     return 0;
@@ -1162,6 +1215,10 @@ int load_map_binary(const char *filename, Drive *drive) {
         return -1;
     }
     if (load_speed_zone_section(file, drive) != 0) {
+        fclose(file);
+        return -1;
+    }
+    if (load_scripted_goal_section(file, drive) != 0) {
         fclose(file);
         return -1;
     }

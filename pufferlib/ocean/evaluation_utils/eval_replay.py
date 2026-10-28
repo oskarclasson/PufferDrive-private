@@ -73,7 +73,19 @@ class EvalReplayCapture:
     def pending_count(self):
         return len(self.pending_replays)
 
-    def capture_frame(self, obs, policy_obs_tensor, raw_action, action, logits, value, logprob, entropy):
+    def capture_frame(
+        self,
+        obs,
+        policy_obs_tensor,
+        raw_action,
+        action,
+        logits,
+        value,
+        logprob,
+        entropy,
+        predicted_xy=None,
+        mppi_xy=None,
+    ):
         if self.policy_history_frame_count == self.capture_batch_steps:
             self.policy_history = {}
             self.policy_history_frame_count = 0
@@ -85,6 +97,10 @@ class EvalReplayCapture:
         }
         if self.capture_observations:
             replay_frame["obs"] = np.asarray(obs, dtype=np.float16)
+        if predicted_xy is not None:
+            replay_frame["predicted_xy"] = predicted_xy[: self.agents_per_batch]
+        if mppi_xy is not None:
+            replay_frame["mppi_xy"] = mppi_xy[: self.agents_per_batch]
         if isinstance(logits, torch.distributions.Normal):
             replay_frame["policy_mean"] = logits.loc[: self.agents_per_batch].detach().float().cpu().numpy()
             replay_frame["policy_std"] = logits.scale[: self.agents_per_batch].detach().float().cpu().numpy()

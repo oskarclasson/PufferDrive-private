@@ -130,6 +130,17 @@ static const float REAR_AXLE_RATIO = 0.5f;
 static const float ACCEL_LONG_LIMIT[2] = {-5.0f, 2.5f};
 static const float ACCEL_LAT_LIMIT[2] = {-4.0f, 4.0f};
 
+// MPPI safety filter
+#define OBSTACLE_POSE_FIELD_COUNT 5 // x, y, cos, sin, valid
+#define MPPI_FOOTPRINT_CIRCLE_COUNT 3
+#define MPPI_BARRIER_RANGE_M 10.0f
+#define MPPI_MAX_CONTROL_ZONES 16
+#define MPPI_CONTROL_RANGE_M 60.0f
+#define MPPI_CONTROL_ZONE_DEPTH_M 2.0f // zone extent past the stop line, along the controlled travel direction
+#define MPPI_STOP_LINE_CLEAR_DIST_M 1.0f
+#define MPPI_STOP_APPROACH_RANGE_M 10.0f // within this, samples left short of an uncleared stop line pay per meter
+#define MPPI_REVERSE_SPEED_MPS 0.2f // nominal plans slower than minus this are the policy asking to reverse
+
 #define NUM_JERK_LONG_ACTIONS 4
 #define NUM_JERK_LAT_ACTIONS 3
 static const float JERK_LONG[NUM_JERK_LONG_ACTIONS] = {-15.0f, -4.0f, 0.0f, 4.0f};
@@ -181,7 +192,7 @@ static const float STEERING_VALUES[NUM_STEERING_ACTIONS]
 // Replay self-play: logged vehicles failing these are created static instead of policy-controlled
 #define REPLAY_SPAWN_EDGE_CLEARANCE_M 0.5f                      // Car box must stay this far from the road edge
 #define REPLAY_SPAWN_LONGITUDINAL_CLEARANCE_M SPAWN_CLEARANCE_M // Gap needed to other cars in front of and behind
-#define REPLAY_MAX_CONTROLLED_LENGTH_M 6.0f                     // Longer vehicles (trucks, buses) are made static
+#define REPLAY_MAX_CONTROLLED_LENGTH_M 10.0f                     // Longer vehicles (trucks, buses) are made static
 #define REPLAY_SPAWN_MAX_LANE_DISTANCE_M 2.5f                   // Car must be this close to a lane center line
 
 // Stop line geometry (spawn overlap check and IDM braking)

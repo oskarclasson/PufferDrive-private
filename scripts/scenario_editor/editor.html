@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PufferDrive Scenario Editor</title>
+<style>
+  :root {
+    --bg: #f3f3f1; --panel: #ffffff; --text: #1f2328; --muted: #6b7280; --border: #d9dadc;
+    --accent: #2563eb; --danger: #dc2626; --ok: #16a34a; --warn: #b45309;
+    --map-bg: #eceae6; --edge: #2f3437; --lane: #b9bec7; --line-white: #9aa0a8; --line-yellow: #d4a017;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 system-ui, sans-serif; color: var(--text); background: var(--bg); display: flex; height: 100vh; overflow: hidden; }
+  #sidebar { width: 340px; min-width: 340px; background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px 14px 40px; }
+  #stage { flex: 1; position: relative; }
+  canvas { display: block; width: 100%; height: 100%; background: var(--map-bg); }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
+  label { display: block; margin: 4px 0; }
+  input[type=text], input[type=number], select { width: 100%; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; font: inherit; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  .row > * { flex: 1; }
+  button { padding: 5px 9px; border: 1px solid var(--border); border-radius: 4px; background: #f8f8f8; font: inherit; cursor: pointer; }
+  button:hover { background: #eef2ff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  .tools { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  .tools button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 0; }
+  #warnings div { color: var(--warn); font-size: 12px; margin: 2px 0; }
+  #status { white-space: pre-wrap; font: 11px/1.35 ui-monospace, monospace; background: #f6f6f6; border: 1px solid var(--border); border-radius: 4px; padding: 6px; max-height: 220px; overflow-y: auto; }
+  #metrics td { padding: 1px 6px 1px 0; }
+  #hud { position: absolute; left: 10px; bottom: 8px; background: rgba(255,255,255,.85); padding: 3px 8px; border-radius: 4px; font-size: 12px; color: var(--muted); pointer-events: none; }
+  .checkbox { display: flex; gap: 6px; align-items: center; }
+  .checkbox input { width: auto; }
+  #props .row { margin: 3px 0; }
+  #props label { margin: 0; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .tabs button { flex: 1; }
+  .tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .hidden { display: none !important; }
+  .run { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin: 5px 0; cursor: pointer; }
+  .run:hover { border-color: var(--accent); }
+  .run.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .run .top { display: flex; justify-content: space-between; gap: 6px; }
+  .run .meta { color: var(--muted); font-size: 12px; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 8px; color: #fff; white-space: nowrap; }
+  .badge.running { background: var(--accent); } .badge.done { background: var(--ok); } .badge.failed { background: var(--danger); } .badge.stopped { background: var(--muted); }
+  #resultView { position: absolute; inset: 0; background: var(--bg); display: flex; flex-direction: column; }
+  #resultHeader { padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  #resultHeader .row { justify-content: flex-start; flex-wrap: wrap; }
+  #resultHeader .row > * { flex: none; }
+  #resultBody { flex: 1; display: flex; min-height: 0; }
+  #resultFacts { width: 300px; padding: 10px 14px; overflow-y: auto; border-right: 1px solid var(--border); background: var(--panel); }
+  #resultFacts td { padding: 1px 8px 1px 0; vertical-align: top; }
+  #resultMain { flex: 1; min-width: 0; display: flex; }
+  #resultMain iframe { flex: 1; border: 0; background: #fff; }
+  #resultLog { flex: 1; margin: 0; padding: 10px; overflow: auto; font: 11px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h1>Scenario editor</h1>
+  <div class="tabs"><button id="tabEditor" class="active">Editor</button><button id="tabResults">Results</button></div>
+  <div id="resultsPane" class="hidden">
+    <div class="row"><span class="hint" id="runsSummary"></span><button id="refreshRuns" style="flex:none">Refresh</button></div>
+    <div id="runList"></div>
+  </div>
+  <div id="editorPane">
+
+  <h2>Map</h2>
+  <input type="text" id="mapFilter" placeholder="filter maps…">
+  <select id="mapSelect" size="5"></select>
+  <div class="row" style="margin-top:4px"><button id="loadMap">Load map</button><button id="importLogged">Logged cars → obstacles</button></div>
+  <button id="editRoadLayout" style="width:100%;margin-top:4px" hidden>Edit road layout in Map tab</button>
+  <div class="row" style="margin-top:4px"><select id="basemapSource" title="Real-world map under drawn maps"><option value="">World map: off</option><option value="osm">World map: OpenStreetMap</option><option value="satellite">World map: satellite</option></select><input type="range" id="basemapOpacity" min="0.1" max="1" step="0.05" value="0.8" title="World map opacity"></div>
+  <p class="hint" id="originInfo"></p>
+
+  <h2>Scenario</h2>
+  <label>Name <input type="text" id="scenarioName" value="my_scenario"></label>
+  <label>Duration (s) <input type="number" id="duration" value="60" min="1" max="300" step="1"></label>
+  <div class="row"><select id="savedSelect"></select><button id="loadScenario">Open</button></div>
+  <div class="row" style="margin-top:4px"><button id="saveScenario">Save</button><button id="clearScenario" class="danger">Clear all</button></div>
+
+  <h2>Tools</h2>
+  <div class="tools">
+    <button data-tool="select" class="active">Select / move (V)</button>
+    <button data-tool="actor">Add actor (A)</button>
+    <button data-tool="goal">Add goals (G)</button>
+    <button data-tool="obstacle">Add obstacle (O)</button>
+    <button data-tool="light">Traffic lights (L)</button>
+    <label class="checkbox"><input type="checkbox" id="snapLane" checked> Snap to lane</label>
+  </div>
+  <p class="hint" id="toolHint"></p>
+  <div class="row">
+    <label>New actor length m <input type="number" id="newLength" value="4.8" min="0.3" max="30" step="0.1"></label>
+    <label>New actor width m <input type="number" id="newWidth" value="2.0" min="0.3" max="30" step="0.1"></label>
+  </div>
+  <button id="applySizeAll" style="width:100%">Apply this size to all actors</button>
+
+  <h2>Selection</h2>
+  <div id="props"><p class="hint">Nothing selected.</p></div>
+
+  <h2>Light cycle (for cycling lights)</h2>
+  <div class="row">
+    <label>Green s <input type="number" id="greenS" value="15" min="0" step="1"></label>
+    <label>Yellow s <input type="number" id="yellowS" value="3" min="0" step="1"></label>
+    <label>Red s <input type="number" id="redS" value="15" min="0" step="1"></label>
+  </div>
+
+  <h2>Checks</h2>
+  <div id="warnings"><p class="hint">Load a map to start.</p></div>
+
+  <h2>Evaluate (all actors on the policy)</h2>
+  <label class="checkbox"><input type="checkbox" id="useMppi" checked> MPPI safety filter (+ light/sign rules)</label>
+  <label class="checkbox"><input type="checkbox" id="usePrediction" checked> 10 s predicted trajectory overlay</label>
+  <label class="checkbox"><input type="checkbox" id="captureObs" checked> Capture policy observations</label>
+  <label>Goal radius (m) <input type="number" id="goalRadius" value="2" min="0.5" max="20" step="0.5"></label>
+  <button id="evaluate" class="primary" style="width:100%;margin-top:6px">Save &amp; evaluate</button>
+  <p class="hint">Runs and their results are listed under the Results tab.</p>
+  <div id="status" style="display:none"></div>
+  </div>
+</div>
+<div id="stage">
+  <canvas id="canvas"></canvas><div id="hud"></div>
+  <div id="resultView" class="hidden">
+    <div id="resultHeader">
+      <div id="resultTitle"><p class="hint">Select a run on the left.</p></div>
+      <div class="row" id="resultActions"></div>
+    </div>
+    <div id="resultBody">
+      <div id="resultFacts"></div>
+      <div id="resultMain"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/map-editor/basemap.js"></script>
+<script>
+"use strict";
+const LIGHT_MODES = ["log", "red", "green", "cycle_green", "cycle_red"];
+const STATE_COLORS = {0: "#9ca3af", 1: "#dc2626", 2: "#f59e0b", 3: "#16a34a", 4: "#9ca3af"};
+const MODE_COLORS = {red: "#dc2626", green: "#16a34a", cycle_green: "#7c3aed", cycle_red: "#7c3aed"};
+const ACTOR_COLORS = ["#2563eb", "#db2777", "#0891b2", "#ea580c", "#65a30d", "#7c3aed", "#0d9488", "#c026d3", "#ca8a04", "#4f46e5"];
+const DEFAULT_CAR = {length: 4.8, width: 2.0};
+const DRAWN_BIN_PREFIX = "drawn__";
+const EMBEDDED = window.parent !== window;
+const ACTOR_SIZE_PRESETS = [["Compact", 4.2, 1.8], ["Car", 4.8, 2.0], ["SUV", 5.1, 2.1], ["Van", 5.6, 2.1], ["Box truck", 8.0, 2.5], ["Truck 10 m", 10.0, 2.5]];
+const OBSTACLE_SIZE_PRESETS = [...ACTOR_SIZE_PRESETS.slice(0, 4), ["Truck", 10.0, 2.5], ["Bus", 12.0, 2.6], ["Barrier", 3.0, 0.6], ["Cone", 0.6, 0.6]];
+const MIN_BOX_SIZE_M = 0.3;
+const MAX_BOX_SIZE_M = 30.0;
+const LANE_SNAP_MAX_M = 4.0;
+const PICK_RADIUS_PX = 10;
+const MAX_CONTROLLED_LENGTH_M = 10.0; // REPLAY_MAX_CONTROLLED_LENGTH_M in constants.h
+const SPAWN_MAX_LANE_DIST_M = 2.5;
+const SPAWN_CLEARANCE_M = 1.5;
+const BASEMAP_STORAGE_KEY = "pufferdrive_basemap";  // shared with the Map tab
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const basemap = createBasemap(() => draw());
+const $ = id => document.getElementById(id);
+
+let maps = [];
+let geometry = null;
+let lanePoints = null;
+let view = {cx: 0, cy: 0, scale: 3};
+let tool = "select";
+let scenario = emptyScenario();
+let selection = null;
+let drag = null;
+
+function emptyScenario() { return {map: null, actors: [], obstacles: [], lights: {}}; }
+
+// ---------- geometry helpers ----------
+function toScreen(x, y) {
+  return [(x - view.cx) * view.scale + canvas.width / 2, -(y - view.cy) * view.scale + canvas.height / 2];
+}
+function toWorld(sx, sy) {
+  return [(sx - canvas.width / 2) / view.scale + view.cx, -(sy - canvas.height / 2) / view.scale + view.cy];
+}
+function wrapAngle(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+function boxCorners(b, extraLength = 0) {
+  const c = Math.cos(b.heading), s = Math.sin(b.heading);
+  const hl = b.length / 2 + extraLength, hw = b.width / 2;
+  return [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]].map(([u, v]) => [b.x + u * c - v * s, b.y + u * s + v * c]);
+}
+function obbOverlap(a, b, extraLengthA = 0) {
+  const ca = boxCorners(a, extraLengthA), cb = boxCorners(b);
+  for (const poly of [ca, cb]) {
+    for (let i = 0; i < 4; i++) {
+      const [x1, y1] = poly[i], [x2, y2] = poly[(i + 1) % 4];
+      const nx = y2 - y1, ny = x1 - x2;
+      const pa = ca.map(([x, y]) => x * nx + y * ny), pb = cb.map(([x, y]) => x * nx + y * ny);
+      if (Math.max(...pa) < Math.min(...pb) || Math.max(...pb) < Math.min(...pa)) return false;
+    }
+  }
+  return true;
+}
+function pointInBox(x, y, b) {
+  const dx = x - b.x, dy = y - b.y, c = Math.cos(b.heading), s = Math.sin(b.heading);
+  return Math.abs(dx * c + dy * s) <= b.length / 2 && Math.abs(-dx * s + dy * c) <= b.width / 2;
+}
+
+function buildLaneIndex() {
+  const xs = [], ys = [], hs = [];
+  for (const lane of geometry.lanes) {
+    if (!lane.drivable) continue;
+    for (let i = 0; i < lane.x.length; i++) { xs.push(lane.x[i]); ys.push(lane.y[i]); hs.push(lane.h[i]); }
+  }
+  lanePoints = {x: Float64Array.from(xs), y: Float64Array.from(ys), h: Float64Array.from(hs)};
+}
+// nearest drivable-lane centre point, optionally only lanes within 90 deg of `heading`
+function nearestLane(x, y, heading = null) {
+  let best = -1, bestD = Infinity;
+  for (let i = 0; i < lanePoints.x.length; i++) {
+    if (heading !== null && Math.abs(wrapAngle(lanePoints.h[i] - heading)) > Math.PI / 2) continue;
+    const d = (lanePoints.x[i] - x) ** 2 + (lanePoints.y[i] - y) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  if (best < 0) return null;
+  return {x: lanePoints.x[best], y: lanePoints.y[best], h: lanePoints.h[best], dist: Math.sqrt(bestD)};
+}
+// project onto the nearest lane segment rather than the nearest vertex
+function snapToLane(x, y, heading = null) {
+  const near = nearestLane(x, y, heading);
+  if (!near || near.dist > LANE_SNAP_MAX_M * 3) return null;
+  let best = null, bestD = Infinity;
+  for (const lane of geometry.lanes) {
+    if (!lane.drivable) continue;
+    for (let i = 0; i + 1 < lane.x.length; i++) {
+      const ax = lane.x[i], ay = lane.y[i], bx = lane.x[i + 1], by = lane.y[i + 1];
+      const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+      if (len2 < 1e-6) continue;
+      const segHeading = Math.atan2(dy, dx);
+      if (heading !== null && Math.abs(wrapAngle(segHeading - heading)) > Math.PI / 2) continue;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / len2));
+      const px = ax + t * dx, py = ay + t * dy, d = (px - x) ** 2 + (py - y) ** 2;
+      if (d < bestD) { bestD = d; best = {x: px, y: py, h: segHeading, dist: Math.sqrt(d)}; }
+    }
+  }
+  return best && best.dist <= LANE_SNAP_MAX_M ? best : null;
+}
+
+// ---------- drawing ----------
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = r.width * devicePixelRatio; canvas.height = r.height * devicePixelRatio;
+  draw();
+}
+function polyline(xs, ys) {
+  ctx.beginPath();
+  for (let i = 0; i < xs.length; i++) {
+    const [sx, sy] = toScreen(xs[i], ys[i]);
+    if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  }
+  ctx.stroke();
+}
+function drawBox(b, fill, stroke, lineWidth) {
+  const pts = boxCorners(b).map(([x, y]) => toScreen(x, y));
+  ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = stroke; ctx.lineWidth = lineWidth; ctx.stroke();
+}
+function rotationHandle(b) {
+  const d = b.length / 2 + 2.5;
+  return [b.x + d * Math.cos(b.heading), b.y + d * Math.sin(b.heading)];
+}
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!geometry) return;
+  basemap.draw(ctx, geometry.origin, $("basemapSource").value, parseFloat($("basemapOpacity").value), {toScreen, toWorld, width: canvas.width, height: canvas.height, scale: view.scale});
+  const px = devicePixelRatio;
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+
+  ctx.setLineDash([4 * px, 4 * px]); ctx.lineWidth = 1 * px; ctx.strokeStyle = getCss("--lane");
+  for (const lane of geometry.lanes) if (lane.drivable) polyline(lane.x, lane.y);
+  ctx.setLineDash([]);
+  for (const line of geometry.lines) {
+    ctx.strokeStyle = line.type >= 14 ? getCss("--line-yellow") : getCss("--line-white");
+    ctx.lineWidth = 1.2 * px; polyline(line.x, line.y);
+  }
+  ctx.strokeStyle = getCss("--edge"); ctx.lineWidth = 2 * px;
+  for (const edge of geometry.edges) polyline(edge.x, edge.y);
+
+  for (const tc of geometry.traffic) {
+    const [x1, y1, x2, y2] = tc.line;
+    if (tc.type === 1) {
+      const mode = scenario.lights[tc.id] || (tc.states.length ? "log" : "cycle_green");
+      ctx.strokeStyle = mode === "log" ? STATE_COLORS[tc.state0] : MODE_COLORS[mode];
+      ctx.setLineDash(mode === "log" ? [3 * px, 3 * px] : (mode.startsWith("cycle") ? [8 * px, 3 * px] : []));
+      ctx.lineWidth = 4 * px;
+    } else {
+      ctx.strokeStyle = tc.type === 2 ? "#b91c1c" : "#a16207"; ctx.setLineDash([]); ctx.lineWidth = 3 * px;
+    }
+    polyline([x1, x2], [y1, y2]);
+    ctx.setLineDash([]);
+    if (tc.type !== 1 && view.scale > 1.5) {
+      const [sx, sy] = toScreen((x1 + x2) / 2, (y1 + y2) / 2);
+      ctx.fillStyle = ctx.strokeStyle; ctx.font = `${10 * px}px system-ui`;
+      ctx.fillText(tc.type === 2 ? "STOP" : "YIELD", sx + 4 * px, sy - 4 * px);
+    }
+  }
+
+  const goalRadius = parseFloat($("goalRadius").value) || 2;
+  scenario.obstacles.forEach((o, i) => {
+    const selected = selection && selection.kind === "obstacle" && selection.idx === i;
+    drawBox(o, "rgba(75,85,99,.55)", selected ? "#f59e0b" : "#374151", (selected ? 3 : 1.5) * px);
+  });
+  scenario.actors.forEach((a, i) => {
+    const color = ACTOR_COLORS[i % ACTOR_COLORS.length];
+    const selected = selection && selection.idx === i && (selection.kind === "actor" || selection.kind === "goal");
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5 * px; ctx.setLineDash([6 * px, 4 * px]);
+    polyline([a.x, ...a.goals.map(g => g[0])], [a.y, ...a.goals.map(g => g[1])]);
+    ctx.setLineDash([]);
+    a.goals.forEach((g, gi) => {
+      const [sx, sy] = toScreen(g[0], g[1]);
+      const goalSelected = selection && selection.kind === "goal" && selection.idx === i && selection.goalIdx === gi;
+      ctx.beginPath(); ctx.arc(sx, sy, Math.max(goalRadius * view.scale, 5 * px), 0, 2 * Math.PI);
+      ctx.fillStyle = color + "33"; ctx.fill(); ctx.strokeStyle = goalSelected ? "#f59e0b" : color;
+      ctx.lineWidth = (goalSelected ? 3 : 1.5) * px; ctx.stroke();
+      ctx.fillStyle = color; ctx.font = `bold ${11 * px}px system-ui`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(String(gi + 1), sx, sy); ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+    });
+    drawBox(a, color + "cc", selected ? "#f59e0b" : "#111827", (selected ? 3 : 1) * px);
+    const [hx, hy] = toScreen(a.x + a.length / 2 * Math.cos(a.heading), a.y + a.length / 2 * Math.sin(a.heading));
+    const [cx, cy] = toScreen(a.x, a.y);
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 * px; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.fillStyle = "#111827"; ctx.font = `${10 * px}px system-ui`; ctx.fillText(`A${i + 1}`, cx + 6 * px, cy - 8 * px);
+  });
+  const selectedBox = selectedBoxObject();
+  if (selectedBox) {
+    const [rx, ry] = toScreen(...rotationHandle(selectedBox));
+    ctx.beginPath(); ctx.arc(rx, ry, 5 * px, 0, 2 * Math.PI); ctx.fillStyle = "#f59e0b"; ctx.fill();
+    const [qx, qy] = toScreen(...resizeHandle(selectedBox));
+    ctx.fillStyle = "#fff"; ctx.strokeStyle = "#f59e0b"; ctx.lineWidth = 2 * px;
+    ctx.fillRect(qx - 4 * px, qy - 4 * px, 8 * px, 8 * px); ctx.strokeRect(qx - 4 * px, qy - 4 * px, 8 * px, 8 * px);
+  }
+}
+const cssCache = {};
+function getCss(name) { return cssCache[name] || (cssCache[name] = getComputedStyle(document.documentElement).getPropertyValue(name).trim()); }
+
+// ---------- selection & picking ----------
+function selectedBoxObject() {
+  if (!selection) return null;
+  if (selection.kind === "actor") return scenario.actors[selection.idx];
+  if (selection.kind === "obstacle") return scenario.obstacles[selection.idx];
+  return null;
+}
+function pick(sx, sy) {
+  const [wx, wy] = toWorld(sx, sy);
+  const pickWorld = PICK_RADIUS_PX * devicePixelRatio / view.scale;
+  const box = selectedBoxObject();
+  if (box) {
+    const [rx, ry] = rotationHandle(box);
+    if (Math.hypot(rx - wx, ry - wy) < pickWorld) return {...selection, rotate: true};
+    const [qx, qy] = resizeHandle(box);
+    if (Math.hypot(qx - wx, qy - wy) < pickWorld) return {...selection, resize: true};
+  }
+  const goalRadius = parseFloat($("goalRadius").value) || 2;
+  for (let i = scenario.actors.length - 1; i >= 0; i--) {
+    const goals = scenario.actors[i].goals;
+    for (let g = goals.length - 1; g >= 0; g--) {
+      if (Math.hypot(goals[g][0] - wx, goals[g][1] - wy) < Math.max(goalRadius, pickWorld)) return {kind: "goal", idx: i, goalIdx: g};
+    }
+  }
+  for (let i = scenario.actors.length - 1; i >= 0; i--) if (pointInBox(wx, wy, scenario.actors[i])) return {kind: "actor", idx: i};
+  for (let i = scenario.obstacles.length - 1; i >= 0; i--) if (pointInBox(wx, wy, scenario.obstacles[i])) return {kind: "obstacle", idx: i};
+  return null;
+}
+function pickLight(sx, sy) {
+  const [wx, wy] = toWorld(sx, sy);
+  let best = null, bestD = PICK_RADIUS_PX * devicePixelRatio / view.scale + 1.0;
+  for (const tc of geometry.traffic) {
+    if (tc.type !== 1) continue;
+    const [x1, y1, x2, y2] = tc.line, dx = x2 - x1, dy = y2 - y1, len2 = dx * dx + dy * dy || 1e-9;
+    const t = Math.max(0, Math.min(1, ((wx - x1) * dx + (wy - y1) * dy) / len2));
+    const d = Math.hypot(x1 + t * dx - wx, y1 + t * dy - wy);
+    if (d < bestD) { bestD = d; best = tc; }
+  }
+  return best;
+}
+
+// ---------- tools ----------
+const TOOL_HINTS = {
+  select: "Click to select. Drag to move. Drag the orange dot to rotate and the white square to resize. Delete removes the selection. Drag empty space to pan, wheel to zoom.",
+  actor: "Click on a lane to place a policy-driven actor (heading follows the lane). Then add its goals.",
+  goal: "Click to append goals for the selected actor, in driving order. Put a goal in a neighbouring lane to force a lane change.",
+  obstacle: "Click to place a static obstacle. Edit its size in the selection panel.",
+  light: "Click a traffic-light stop line to cycle: log → always red → always green → cycle (green first) → cycle (red first).",
+};
+function setTool(name) {
+  tool = name;
+  document.querySelectorAll("[data-tool]").forEach(b => b.classList.toggle("active", b.dataset.tool === name));
+  $("toolHint").textContent = TOOL_HINTS[name];
+}
+function placeBox(wx, wy, dims) {
+  let pose = {x: wx, y: wy, heading: 0};
+  const near = $("snapLane").checked ? snapToLane(wx, wy) : nearestLane(wx, wy);
+  if (near && (near.dist <= LANE_SNAP_MAX_M)) pose = $("snapLane").checked ? {x: near.x, y: near.y, heading: near.h} : {x: wx, y: wy, heading: near.h};
+  return {...pose, ...dims};
+}
+function addGoal(actorIdx, wx, wy) {
+  const actor = scenario.actors[actorIdx];
+  const previous = actor.goals.length ? actor.goals[actor.goals.length - 1] : [actor.x, actor.y];
+  let point = [wx, wy];
+  if ($("snapLane").checked) {
+    const travelHeading = Math.atan2(wy - previous[1], wx - previous[0]);
+    const near = snapToLane(wx, wy, travelHeading) || snapToLane(wx, wy);
+    if (near) point = [near.x, near.y];
+  }
+  actor.goals.push([round2(point[0]), round2(point[1])]);
+}
+function round2(v) { return Math.round(v * 100) / 100; }
+function clampSize(v) { return Math.min(MAX_BOX_SIZE_M, Math.max(MIN_BOX_SIZE_M, v)); }
+function newActorSize() {
+  const length = parseFloat($("newLength").value), width = parseFloat($("newWidth").value);
+  return {length: Number.isFinite(length) ? clampSize(length) : DEFAULT_CAR.length, width: Number.isFinite(width) ? clampSize(width) : DEFAULT_CAR.width};
+}
+// front-left corner of the box, dragged to resize symmetrically about the centre
+function resizeHandle(b) { return boxCorners(b)[0]; }
+
+let pointerDown = null;
+canvas.addEventListener("pointerdown", e => {
+  if (!geometry) return;
+  canvas.setPointerCapture(e.pointerId);
+  const sx = e.offsetX * devicePixelRatio, sy = e.offsetY * devicePixelRatio;
+  const [wx, wy] = toWorld(sx, sy);
+  pointerDown = {sx, sy, moved: false};
+  if (e.button === 1 || e.button === 2) { drag = {pan: true, sx, sy, cx: view.cx, cy: view.cy}; return; }
+  if (tool === "actor") {
+    scenario.actors.push({...placeBox(wx, wy, newActorSize()), speed: 8.0, goals: []});
+    selection = {kind: "actor", idx: scenario.actors.length - 1};
+    setTool("goal");
+  } else if (tool === "obstacle") {
+    scenario.obstacles.push(placeBox(wx, wy, DEFAULT_CAR));
+    selection = {kind: "obstacle", idx: scenario.obstacles.length - 1};
+  } else if (tool === "goal") {
+    const actorIdx = selection && (selection.kind === "actor" || selection.kind === "goal") ? selection.idx : -1;
+    if (actorIdx < 0) { alert("Select an actor first (Select tool), then add goals."); return; }
+    addGoal(actorIdx, wx, wy);
+  } else if (tool === "light") {
+    const tc = pickLight(sx, sy);
+    if (tc) {
+      const next = LIGHT_MODES[(LIGHT_MODES.indexOf(scenario.lights[tc.id] || "log") + 1) % LIGHT_MODES.length];
+      if (next === "log") delete scenario.lights[tc.id]; else scenario.lights[tc.id] = next;
+    }
+  } else {
+    const hit = pick(sx, sy);
+    if (hit) {
+      selection = {kind: hit.kind, idx: hit.idx, goalIdx: hit.goalIdx};
+      drag = {target: hit, wx, wy};
+    } else {
+      selection = null;
+      drag = {pan: true, sx, sy, cx: view.cx, cy: view.cy};
+    }
+  }
+  refresh();
+});
+canvas.addEventListener("pointermove", e => {
+  const sx = e.offsetX * devicePixelRatio, sy = e.offsetY * devicePixelRatio;
+  const [wx, wy] = toWorld(sx, sy);
+  $("hud").textContent = geometry ? `x ${wx.toFixed(1)}  y ${wy.toFixed(1)}   zoom ${view.scale.toFixed(2)} px/m` : "";
+  if (!drag) return;
+  if (pointerDown && Math.hypot(sx - pointerDown.sx, sy - pointerDown.sy) > 3) pointerDown.moved = true;
+  if (drag.pan) {
+    view.cx = drag.cx - (sx - drag.sx) / view.scale; view.cy = drag.cy + (sy - drag.sy) / view.scale;
+  } else if (drag.target.resize) {
+    const box = selectedBoxObject(), dx = wx - box.x, dy = wy - box.y, c = Math.cos(box.heading), s = Math.sin(box.heading);
+    box.length = Math.round(clampSize(2 * Math.abs(dx * c + dy * s)) * 10) / 10;
+    box.width = Math.round(clampSize(2 * Math.abs(-dx * s + dy * c)) * 10) / 10;
+    $("hud").textContent = `${box.length.toFixed(1)} m × ${box.width.toFixed(1)} m`;
+  } else if (drag.target.rotate) {
+    const box = selectedBoxObject();
+    box.heading = Math.atan2(wy - box.y, wx - box.x);
+  } else if (drag.target.kind === "goal") {
+    scenario.actors[drag.target.idx].goals[drag.target.goalIdx] = [round2(wx), round2(wy)];
+  } else {
+    const box = drag.target.kind === "actor" ? scenario.actors[drag.target.idx] : scenario.obstacles[drag.target.idx];
+    box.x += wx - drag.wx; box.y += wy - drag.wy; drag.wx = wx; drag.wy = wy;
+  }
+  draw();
+});
+canvas.addEventListener("pointerup", () => {
+  if (drag && !drag.pan && pointerDown && pointerDown.moved && $("snapLane").checked) {
+    const t = drag.target;
+    if (t.kind === "goal") {
+      const g = scenario.actors[t.idx].goals[t.goalIdx], near = snapToLane(g[0], g[1]);
+      if (near) scenario.actors[t.idx].goals[t.goalIdx] = [round2(near.x), round2(near.y)];
+    } else if (!t.rotate && !t.resize) {
+      const box = t.kind === "actor" ? scenario.actors[t.idx] : scenario.obstacles[t.idx];
+      const near = snapToLane(box.x, box.y, box.heading);
+      if (near) { box.x = near.x; box.y = near.y; box.heading = near.h; }
+    }
+  }
+  drag = null; pointerDown = null; refresh();
+});
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const sx = e.offsetX * devicePixelRatio, sy = e.offsetY * devicePixelRatio;
+  const [wx, wy] = toWorld(sx, sy);
+  view.scale = Math.min(60, Math.max(0.05, view.scale * Math.exp(-e.deltaY * 0.0015)));
+  const [nx, ny] = toWorld(sx, sy);
+  view.cx += wx - nx; view.cy += wy - ny;
+  draw();
+}, {passive: false});
+window.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  const keyTools = {v: "select", a: "actor", g: "goal", o: "obstacle", l: "light"};
+  if (keyTools[e.key]) { setTool(keyTools[e.key]); return; }
+  if (e.key === "Escape") { setTool("select"); return; }
+  if ((e.key === "Delete" || e.key === "Backspace") && selection) { deleteSelection(); e.preventDefault(); }
+});
+function deleteSelection() {
+  if (selection.kind === "actor") scenario.actors.splice(selection.idx, 1);
+  else if (selection.kind === "obstacle") scenario.obstacles.splice(selection.idx, 1);
+  else if (selection.kind === "goal") scenario.actors[selection.idx].goals.splice(selection.goalIdx, 1);
+  selection = null; refresh();
+}
+
+// ---------- properties panel ----------
+function numberField(label, value, onChange, step = 0.1) {
+  const wrap = document.createElement("label");
+  wrap.textContent = label;
+  const input = document.createElement("input");
+  input.type = "number"; input.step = step; input.value = value;
+  input.addEventListener("change", () => { const v = parseFloat(input.value); if (Number.isFinite(v)) { onChange(v); refresh(); } });
+  wrap.appendChild(input);
+  return wrap;
+}
+function button(text, onClick, cls = "") {
+  const b = document.createElement("button"); b.textContent = text; b.className = cls; b.addEventListener("click", onClick); return b;
+}
+function renderProps() {
+  const panel = $("props"); panel.innerHTML = "";
+  if (!selection) { panel.innerHTML = '<p class="hint">Nothing selected.</p>'; return; }
+  const isActor = selection.kind === "actor" || selection.kind === "goal";
+  const box = isActor ? scenario.actors[selection.idx] : scenario.obstacles[selection.idx];
+  const title = document.createElement("p");
+  title.innerHTML = `<b>${isActor ? "Actor A" + (selection.idx + 1) : "Obstacle " + (selection.idx + 1)}</b>`;
+  panel.appendChild(title);
+  const row1 = document.createElement("div"); row1.className = "row";
+  row1.append(numberField("x", box.x.toFixed(2), v => box.x = v), numberField("y", box.y.toFixed(2), v => box.y = v),
+    numberField("heading °", (box.heading * 180 / Math.PI).toFixed(1), v => box.heading = v * Math.PI / 180, 1));
+  const row2 = document.createElement("div"); row2.className = "row";
+  row2.append(numberField("length m", box.length, v => box.length = clampSize(v)), numberField("width m", box.width, v => box.width = clampSize(v)));
+  if (isActor) row2.append(numberField("start speed m/s", box.speed, v => box.speed = Math.max(0, v), 0.5));
+  const presetRow = document.createElement("div"); presetRow.className = "row"; presetRow.style.flexWrap = "wrap";
+  (isActor ? ACTOR_SIZE_PRESETS : OBSTACLE_SIZE_PRESETS).forEach(([name, length, width]) => {
+    const b = button(name, () => { box.length = length; box.width = width; refresh(); });
+    b.title = `${length} m × ${width} m`; b.style.flex = "none"; presetRow.appendChild(b);
+  });
+  panel.append(row1, row2, presetRow);
+  const row3 = document.createElement("div"); row3.className = "row";
+  if (isActor) {
+    const goalText = document.createElement("p"); goalText.className = "hint";
+    goalText.textContent = `${box.goals.length} goal(s). Use the Add goals tool (G) to append; select a goal and press Delete to remove it.`;
+    panel.appendChild(goalText);
+    row3.append(button("Clear goals", () => { box.goals = []; refresh(); }), button("Make obstacle", () => {
+      const {x, y, heading, length, width} = box; scenario.actors.splice(selection.idx, 1);
+      scenario.obstacles.push({x, y, heading, length, width}); selection = {kind: "obstacle", idx: scenario.obstacles.length - 1}; refresh();
+    }));
+  } else {
+    row3.append(button("Make actor", () => {
+      const {x, y, heading, length, width} = box; scenario.obstacles.splice(selection.idx, 1);
+      scenario.actors.push({x, y, heading, length, width, speed: 0, goals: []});
+      selection = {kind: "actor", idx: scenario.actors.length - 1}; setTool("goal"); refresh();
+    }));
+  }
+  row3.append(button("Delete", deleteSelection, "danger"));
+  panel.appendChild(row3);
+}
+
+// ---------- checks mirroring the sim's spawn filters ----------
+function renderWarnings() {
+  const out = [];
+  if (!geometry) return;
+  const boxes = [...scenario.actors.map((a, i) => ({b: a, name: `A${i + 1}`})), ...scenario.obstacles.map((o, i) => ({b: o, name: `obstacle ${i + 1}`}))];
+  scenario.actors.forEach((a, i) => {
+    if (!a.goals.length) out.push(`A${i + 1} has no goals (needs at least one).`);
+    if (a.length > MAX_CONTROLLED_LENGTH_M) out.push(`A${i + 1} is longer than ${MAX_CONTROLLED_LENGTH_M} m: the sim keeps it static.`);
+    const near = nearestLane(a.x, a.y, a.heading);
+    if (!near || near.dist > SPAWN_MAX_LANE_DIST_M) out.push(`A${i + 1} is over ${SPAWN_MAX_LANE_DIST_M} m from a same-direction lane centre: the sim keeps it static.`);
+    boxes.forEach(o => {
+      if (o.b === a) return;
+      if (obbOverlap(a, o.b, SPAWN_CLEARANCE_M)) out.push(`A${i + 1} has less than ${SPAWN_CLEARANCE_M} m gap to ${o.name} ahead/behind: the sim keeps it static.`);
+    });
+  });
+  for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
+    if (obbOverlap(boxes[i].b, boxes[j].b)) out.push(`${boxes[i].name} overlaps ${boxes[j].name}: the sim drops ${boxes[j].name}.`);
+  }
+  if (scenario.actors.length + scenario.obstacles.length > 300) out.push("More than 300 vehicles in total; the eval has 300 slots.");
+  $("warnings").innerHTML = out.length ? out.map(t => `<div>⚠ ${t}</div>`).join("") : '<p class="hint">No problems found.</p>';
+}
+function refresh() { renderProps(); renderWarnings(); draw(); }
+
+// ---------- server I/O ----------
+async function api(path, body) {
+  const response = await fetch(path, body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+function renderMapList() {
+  const filter = $("mapFilter").value.toLowerCase();
+  const select = $("mapSelect"); select.innerHTML = "";
+  maps.filter(m => m.toLowerCase().includes(filter)).slice(0, 500).forEach(m => {
+    const opt = document.createElement("option"); opt.value = m; opt.textContent = m.replace(/\.bin$/, ""); select.appendChild(opt);
+  });
+}
+async function loadMap(name, keepScenario = false) {
+  geometry = await api(`/api/map?name=${encodeURIComponent(name)}`);
+  buildLaneIndex();
+  $("editRoadLayout").hidden = !(EMBEDDED && name.startsWith(DRAWN_BIN_PREFIX));
+  $("originInfo").textContent = geometry.origin
+    ? `Map (0, 0) at ${geometry.origin.lat.toFixed(6)}, ${geometry.origin.lon.toFixed(6)}.`
+    : "This map has no geographic origin, so the world map is hidden (nuPlan maps are recentred; drawn maps get one from an .osm backdrop).";
+  if (keepScenario && scenario.map === name) { refresh(); return; }
+  if (!keepScenario) scenario = emptyScenario();
+  scenario.map = name;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const lane of geometry.lanes) for (let i = 0; i < lane.x.length; i++) {
+    minX = Math.min(minX, lane.x[i]); maxX = Math.max(maxX, lane.x[i]); minY = Math.min(minY, lane.y[i]); maxY = Math.max(maxY, lane.y[i]);
+  }
+  view.cx = (minX + maxX) / 2; view.cy = (minY + maxY) / 2;
+  view.scale = Math.min(canvas.width / (maxX - minX + 20), canvas.height / (maxY - minY + 20));
+  selection = null; setTool("select"); refresh();
+}
+function scenarioSpec() {
+  return {
+    name: $("scenarioName").value.trim(), map: scenario.map, duration_s: parseFloat($("duration").value),
+    actors: scenario.actors, obstacles: scenario.obstacles, lights: scenario.lights,
+    light_cycle: {green_s: parseFloat($("greenS").value), yellow_s: parseFloat($("yellowS").value), red_s: parseFloat($("redS").value)},
+  };
+}
+async function saveScenario() {
+  if (!scenario.map) throw new Error("Load a map first.");
+  const result = await api("/api/scenario", scenarioSpec());
+  await refreshSavedList();
+  return result;
+}
+async function refreshSavedList() {
+  const {scenarios} = await api("/api/scenarios");
+  const select = $("savedSelect"); select.innerHTML = "";
+  scenarios.forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; select.appendChild(o); });
+}
+function showStatus(text) { const s = $("status"); s.style.display = "block"; s.textContent = text; s.scrollTop = s.scrollHeight; }
+const METRIC_LABELS = [["active_agent_count", "actors driven by policy", 0], ["collision_rate", "collision rate", 3],
+  ["at_fault_collision_rate", "at-fault collision rate", 3], ["offroad_rate", "off-road rate", 3],
+  ["red_light_violation_rate", "red-light flag rate", 3], ["stop_sign_violation_rate", "stop-sign violation rate", 3],
+  ["num_goals_reached", "goals reached / actor", 1], ["dnf_rate", "did not finish", 3], ["avg_speed_per_agent", "avg speed m/s", 1],
+  ["total_distance_travelled", "total distance m", 0], ["multi_lane_time", "time straddling lanes s", 1],
+  ["comfort_violation_count", "comfort violations", 2], ["speed_limit_compliance", "speed-limit compliance", 3]];
+const SETTING_LABELS = [["map", "map"], ["duration_s", "duration s"], ["actor_count", "actors"], ["obstacle_count", "obstacles"],
+  ["mppi", "MPPI"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
+let runs = [];
+let selectedRun = null;
+let runsTimer = null;
+let detailTimer = null;
+let shownReplayUrl = null;
+
+function escapeHtml(text) { return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }
+function formatElapsed(seconds) { const m = Math.floor(seconds / 60), s = Math.floor(seconds % 60); return `${m}:${String(s).padStart(2, "0")}`; }
+function formatMetric(value, digits) { return value === null || value === undefined ? "–" : Number(value).toFixed(digits); }
+
+function setTab(name) {
+  const results = name === "results";
+  $("tabEditor").classList.toggle("active", !results); $("tabResults").classList.toggle("active", results);
+  $("editorPane").classList.toggle("hidden", results); $("resultsPane").classList.toggle("hidden", !results);
+  $("resultView").classList.toggle("hidden", !results);
+  if (results) loadRuns(); else draw();
+}
+async function loadRuns() {
+  clearTimeout(runsTimer);
+  try { runs = (await api("/api/runs")).runs; } catch (e) { $("runsSummary").textContent = e.message; return; }
+  const runningCount = runs.filter(r => r.status === "running").length;
+  $("tabResults").textContent = runningCount ? `Results (${runningCount} running)` : "Results";
+  $("runsSummary").textContent = `${runs.length} run(s)` + (runningCount ? `, ${runningCount} running` : "");
+  $("runList").innerHTML = runs.map(r => {
+    const m = r.metrics;
+    const facts = r.status === "running" ? `running for ${formatElapsed(r.elapsed_s)}`
+      : m ? `collisions ${formatMetric(m.collision_rate, 2)} · goals ${formatMetric(m.num_goals_reached, 1)} · red flags ${formatMetric(m.red_light_violation_rate, 2)}`
+      : "no results written";
+    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : "RL only");
+    return `<div class="run ${selectedRun === r.label ? "selected" : ""}" data-label="${escapeHtml(r.label)}">
+      <div class="top"><b>${escapeHtml(r.scenario)}</b><span class="badge ${r.status}">${r.status}</span></div>
+      <div class="meta">${escapeHtml(r.started)} ${mode ? "· " + mode : ""}</div><div class="meta">${facts}</div></div>`;
+  }).join("") || '<p class="hint">No runs yet. Use Save &amp; evaluate in the Editor tab.</p>';
+  document.querySelectorAll(".run").forEach(el => el.addEventListener("click", () => showRun(el.dataset.label)));
+  if (runningCount || !$("resultsPane").classList.contains("hidden")) runsTimer = setTimeout(loadRuns, runningCount ? 3000 : 15000);
+}
+async function showRun(label) {
+  clearTimeout(detailTimer);
+  if (selectedRun !== label) shownReplayUrl = null;
+  selectedRun = label;
+  document.querySelectorAll(".run").forEach(el => el.classList.toggle("selected", el.dataset.label === label));
+  let run;
+  try { run = await api(`/api/run?label=${encodeURIComponent(label)}`); } catch (e) { $("resultTitle").innerHTML = `<p>${escapeHtml(e.message)}</p>`; return; }
+  if (selectedRun !== label) return;
+  const statusText = run.status === "running" ? `running for ${formatElapsed(run.elapsed_s)}` : run.status;
+  $("resultTitle").innerHTML = `<b style="font-size:15px">${escapeHtml(run.scenario)}</b> <span class="badge ${run.status}">${escapeHtml(statusText)}</span>
+    <span class="hint">started ${escapeHtml(run.started)} · ${escapeHtml(run.label)}</span>`;
+  const actions = $("resultActions"); actions.innerHTML = "";
+  if (run.replay_url) actions.append(button("Open replay in new tab ↗", () => window.open(run.replay_url, "_blank", "noopener")));
+  actions.append(button("Open scenario in editor", () => openScenario(run.scenario).then(() => setTab("editor"))));
+  if (run.status === "running") actions.append(button("Stop run", async () => {
+    if (!confirm("Stop this evaluation? Nothing will be written for it.")) return;
+    try { await api("/api/run/stop", {label}); } catch (e) { alert(e.message); }
+    loadRuns(); showRun(label);
+  }, "danger"));
+
+  const metricRows = run.metrics ? METRIC_LABELS.filter(([k]) => k in run.metrics)
+    .map(([k, text, digits]) => `<tr><td>${text}</td><td><b>${formatMetric(run.metrics[k], digits)}</b></td></tr>`).join("") : "";
+  const settingRows = SETTING_LABELS.filter(([k]) => k in run.settings)
+    .map(([k, text]) => `<tr><td>${text}</td><td>${escapeHtml(typeof run.settings[k] === "boolean" ? (run.settings[k] ? "on" : "off") : run.settings[k])}</td></tr>`).join("");
+  $("resultFacts").innerHTML = (metricRows ? `<h2>Metrics (mean per scenario)</h2><table>${metricRows}</table>` : `<h2>Metrics</h2><p class="hint">${run.status === "running" ? "Written when the run finishes." : "None written."}</p>`)
+    + `<h2>Settings</h2>${settingRows ? `<table>${settingRows}</table>` : '<p class="hint">Not recorded for this run.</p>'}`;
+
+  const main = $("resultMain");
+  if (run.replay_url) {
+    if (shownReplayUrl !== run.replay_url) { main.innerHTML = `<iframe src="${run.replay_url}" title="replay"></iframe>`; shownReplayUrl = run.replay_url; }
+  } else {
+    main.innerHTML = `<pre id="resultLog">${escapeHtml(run.log || "(log empty)")}</pre>`;
+    const log = $("resultLog"); log.scrollTop = log.scrollHeight;
+  }
+  if (run.status === "running") detailTimer = setTimeout(() => showRun(label), 3000);
+}
+async function openScenario(name) {
+  const spec = await api(`/api/scenario?name=${encodeURIComponent(name)}`);
+  await loadMap(spec.map);
+  scenario = {map: spec.map, actors: spec.actors, obstacles: spec.obstacles || [], lights: spec.lights || {}};
+  $("scenarioName").value = spec.name; $("duration").value = spec.duration_s;
+  if (spec.light_cycle) { $("greenS").value = spec.light_cycle.green_s; $("yellowS").value = spec.light_cycle.yellow_s; $("redS").value = spec.light_cycle.red_s; }
+  refresh();
+}
+
+$("mapFilter").addEventListener("input", renderMapList);
+$("loadMap").addEventListener("click", () => { const n = $("mapSelect").value; if (n) loadMap(n).catch(e => alert(e.message)); });
+$("mapSelect").addEventListener("dblclick", () => $("loadMap").click());
+$("importLogged").addEventListener("click", () => {
+  if (!geometry) return;
+  geometry.logged_agents.filter(a => a.type === 1).forEach(a => scenario.obstacles.push({x: a.x, y: a.y, heading: a.heading, length: a.length, width: a.width}));
+  refresh();
+});
+$("saveScenario").addEventListener("click", () => saveScenario().then(r => showStatus(`Saved (${r.steps} steps).`)).catch(e => alert(e.message)));
+$("clearScenario").addEventListener("click", () => { if (confirm("Remove all actors, obstacles and light overrides?")) { scenario = {...emptyScenario(), map: scenario.map}; selection = null; refresh(); } });
+$("loadScenario").addEventListener("click", () => {
+  const name = $("savedSelect").value; if (name) openScenario(name).catch(e => alert(e.message));
+});
+$("evaluate").addEventListener("click", async () => {
+  try {
+    await saveScenario();
+    const {label} = await api("/api/evaluate", {
+      name: $("scenarioName").value.trim(), mppi: $("useMppi").checked, prediction: $("usePrediction").checked,
+      capture_observations: $("captureObs").checked, goal_radius: parseFloat($("goalRadius").value),
+    });
+    setTab("results"); showRun(label);
+  } catch (e) { alert(e.message); }
+});
+$("tabEditor").addEventListener("click", () => setTab("editor"));
+$("tabResults").addEventListener("click", () => setTab("results"));
+$("refreshRuns").addEventListener("click", loadRuns);
+$("goalRadius").addEventListener("change", draw);
+$("applySizeAll").addEventListener("click", () => {
+  const size = newActorSize();
+  scenario.actors.forEach(a => { a.length = size.length; a.width = size.width; });
+  refresh();
+});
+document.querySelectorAll("[data-tool]").forEach(b => b.addEventListener("click", () => setTool(b.dataset.tool)));
+window.addEventListener("resize", resize);
+function persistBasemap() {
+  try { localStorage.setItem(BASEMAP_STORAGE_KEY, JSON.stringify({source: $("basemapSource").value, opacity: $("basemapOpacity").value})); } catch (e) { /* storage unavailable */ }
+}
+$("basemapSource").addEventListener("change", () => { persistBasemap(); draw(); });
+$("basemapOpacity").addEventListener("input", () => { persistBasemap(); draw(); });
+try {
+  const savedBasemap = JSON.parse(localStorage.getItem(BASEMAP_STORAGE_KEY) || "null");
+  if (savedBasemap && savedBasemap.source in BASEMAP_SOURCES) $("basemapSource").value = savedBasemap.source;
+  if (savedBasemap && savedBasemap.opacity) $("basemapOpacity").value = savedBasemap.opacity;
+} catch (e) { /* storage unavailable */ }
+
+setTool("select");
+resize();
+function reloadMapList() { return api("/api/maps").then(d => { maps = d.maps; renderMapList(); }); }
+reloadMapList().catch(e => alert(e.message));
+$("editRoadLayout").addEventListener("click", () => window.parent.postMessage({type: "edit-map", map: scenario.map}, location.origin));
+// the Map tab saved or handed over a drawn map
+window.addEventListener("message", async event => {
+  if (event.origin !== location.origin || !event.data) return;
+  const {type, map} = event.data;
+  if (type !== "map-saved" && type !== "open-map") return;
+  try {
+    await reloadMapList();
+    if (type === "open-map") { setTab("editor"); await loadMap(map, scenario.map === map); }
+    else if (scenario.map === map) await loadMap(map, true);
+  } catch (e) { alert(e.message); }
+});
+refreshSavedList().catch(() => {});
+loadRuns();
+</script>
+</body>
+</html>

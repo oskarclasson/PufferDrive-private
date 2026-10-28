@@ -433,6 +433,29 @@ eval:
   observation_replay_writer_count: 4
   # Options: sample | mode | mean
   action_selection: mean
+  # Seconds of policy prediction drawn at every captured replay frame (0 disables): the policy agents are
+  # rolled forward while every other actor holds its current speed and steering angle.
+  predict_horizon_s: 0.0
+  # MPPI safety filter around the policy (0 samples disables): the policy rollout against constant speed/steering
+  # actors is the nominal plan, jerk/steer noise is added in normalized action units, and samples are weighted by
+  # discrete-time CBF violations on obstacle and road-edge clearance.
+  mppi_samples: 0
+  mppi_horizon_s: 3.0
+  mppi_jerk_noise_std: 0.3
+  mppi_steer_noise_std: 0.3
+  mppi_temperature: 1.0
+  mppi_cbf_decay_rate: 1.0 # 1/s
+  mppi_cbf_weight: 10.0
+  mppi_collision_weight: 1000.0
+  # Cost per step a sample's footprint spends in the zone past a stop/yield line it has not yet stopped at;
+  # red lights ahead are blocking obstacles in the CBF instead.
+  mppi_control_zone_weight: 1000.0
+  # Cost per meter a sample ends short of an uncleared stop/yield line within 10 m, so it creeps up to stop there.
+  mppi_stop_approach_weight: 1.0
+  # Cost per meter a sample travels less than the policy's own plan, so small barrier costs cannot park the ego.
+  mppi_progress_weight: 2.0
+  mppi_obstacle_margin_m: 0.5
+  mppi_boundary_margin_m: 0.3
 controlled_exp:
   train:
     # [sweep.train.learning_rate]

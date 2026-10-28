@@ -1,0 +1,1068 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PufferDrive Map Editor</title>
+<style>
+  :root {
+    --bg: #f3f3f1; --panel: #ffffff; --text: #1f2328; --muted: #6b7280; --border: #d9dadc;
+    --accent: #2563eb; --danger: #dc2626; --ok: #16a34a; --warn: #b45309;
+    --map-bg: #eceae6; --grid: rgba(0,0,0,.05); --edge: #2f3437; --lane: #2563eb; --junction: #7c3aed;
+    --select: #f59e0b; --osm-bound: #9aa0a8; --osm-center: #b9bec7; --osm-area: rgba(120,113,108,.10);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 system-ui, sans-serif; color: var(--text); background: var(--bg); display: flex; height: 100vh; overflow: hidden; }
+  #sidebar { width: 340px; min-width: 340px; background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px 14px 40px; }
+  #stage { flex: 1; position: relative; }
+  canvas { display: block; width: 100%; height: 100%; background: var(--map-bg); }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
+  label { display: block; margin: 4px 0; }
+  input[type=text], input[type=number], select { width: 100%; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; font: inherit; }
+  .row { display: flex; gap: 6px; align-items: center; margin: 3px 0; }
+  .row > * { flex: 1; }
+  button { padding: 5px 9px; border: 1px solid var(--border); border-radius: 4px; background: #f8f8f8; font: inherit; cursor: pointer; }
+  button:hover { background: #eef2ff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  .tools { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  .tools button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 0; overflow-wrap: anywhere; }
+  .checkbox { display: flex; gap: 6px; align-items: center; }
+  .checkbox input { width: auto; }
+  #warnings div { color: var(--warn); font-size: 12px; margin: 2px 0; }
+  #warnings div.ok { color: var(--ok); }
+  #saveStatus.error { color: var(--danger); }
+  #hud { position: absolute; left: 10px; bottom: 8px; background: rgba(255,255,255,.85); padding: 3px 8px; border-radius: 4px; font-size: 12px; color: var(--muted); pointer-events: none; }
+  .chip { display: inline-flex; gap: 4px; align-items: center; padding: 1px 6px; margin: 2px 4px 2px 0; border: 1px solid var(--border); border-radius: 10px; font-size: 12px; }
+  .chip button { padding: 0 4px; border: none; background: none; color: var(--danger); }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h1>Map editor</h1>
+
+  <h2>Backdrop (.osm / lanelet2)</h2>
+  <input type="file" id="osmFile" accept=".osm,.xml">
+  <p class="hint" id="osmInfo">No backdrop loaded. Drawing works without one.</p>
+  <div class="row"><button id="importLanelets" title="Each lanelet centerline becomes a lane; touching ends are linked">Lanelets → lanes</button><button id="importBounds" title="Lanelet bounds not shared with another lanelet become road edges">Outer bounds → edges</button></div>
+  <label class="checkbox"><input type="checkbox" id="showBackdrop" checked> Show backdrop</label>
+
+  <h2>World map</h2>
+  <div class="row"><select id="basemapSource"><option value="">Off</option><option value="osm">OpenStreetMap</option><option value="satellite">Satellite</option></select><input type="range" id="basemapOpacity" min="0.1" max="1" step="0.05" value="0.8" title="World map opacity"></div>
+  <div class="row"><input type="number" id="originLat" step="0.000001" placeholder="origin latitude" title="Latitude of map (0, 0)"><input type="number" id="originLon" step="0.000001" placeholder="origin longitude" title="Longitude of map (0, 0)"></div>
+  <p class="hint" id="originInfo"></p>
+
+  <h2>Map</h2>
+  <label>Name <input type="text" id="mapName" value="my_map"></label>
+  <div class="row"><select id="savedSelect"></select><button id="openMap">Open</button></div>
+  <div class="row"><button id="saveMap" class="primary">Save .bin</button><button id="downloadJson">Download JSON</button></div>
+  <div class="row"><button id="useInScenario" class="primary" hidden title="Save, then open this map in the Scenario tab">Save &amp; place traffic →</button></div>
+  <div class="row"><button id="loadJson">Load JSON</button><button id="clearMap" class="danger">Clear all</button></div>
+  <input type="file" id="jsonFile" accept=".json" hidden>
+  <p class="hint" id="saveStatus"></p>
+
+  <h2>Tools</h2>
+  <div class="tools">
+    <button data-tool="select" class="active">Select / edit (V)</button>
+    <button data-tool="lane">Draw lane (N)</button>
+    <button data-tool="edge">Draw edge (E)</button>
+    <button data-tool="connect">Link lanes (C)</button>
+    <button data-tool="split">Split lane (X)</button>
+    <button data-tool="control">Stop line (L)</button>
+  </div>
+  <div class="row">
+    <label>Lane width (m) <input type="number" id="defaultWidth" value="3.5" min="1.5" max="10" step="0.1"></label>
+    <label>Speed (km/h) <input type="number" id="defaultSpeed" value="30" min="5" max="130" step="5"></label>
+  </div>
+  <label>Stop line type <select id="controlType"><option value="light">Traffic light</option><option value="stop">Stop sign</option><option value="yield">Yield sign</option></select></label>
+  <p class="hint" id="toolHint"></p>
+
+  <h2>Generate</h2>
+  <div class="row"><button id="autoEdges" title="Offset every non-junction lane by half its width, dropping parts covered by other lanes">Auto edges from lanes</button><button id="clearEdges" class="danger">Clear edges</button></div>
+  <div class="row"><button id="autoConnect" title="Link every lane end to lane starts within 0.5 m and a similar heading">Auto-link touching lanes</button></div>
+
+  <h2>Selection</h2>
+  <div id="props"><p class="hint">Nothing selected.</p></div>
+
+  <h2>Checks</h2>
+  <div id="warnings"></div>
+</div>
+<div id="stage"><canvas id="canvas"></canvas><div id="hud"></div></div>
+
+<script src="basemap.js"></script>
+<script>
+"use strict";
+const EARTH_RADIUS_M = 6378137;
+const MPH_TO_KPH = 1.609344;
+const ORIGIN_RECENTER_DISTANCE_M = 1000;
+const MIN_WIDTH_M = 1.5, MAX_WIDTH_M = 10;
+const MIN_SPEED_KPH = 5, MAX_SPEED_KPH = 130;
+const SNAP_RADIUS_PX = 10;
+const PICK_RADIUS_PX = 8;
+const DRAG_THRESHOLD_PX = 3;
+const DUPLICATE_POINT_M = 0.05;
+const LINKED_ENDPOINT_M = 0.05;
+const JOIN_TOLERANCE_M = 0.5;
+const JOIN_MAX_HEADING_RAD = Math.PI / 3;
+const LINK_SNAP_MAX_GAP_M = 3.0;
+const SPLIT_MIN_PIECE_M = 0.5;
+const SHARP_KINK_RAD = Math.PI / 3;
+const AUTO_EDGE_SAMPLE_M = 1.0;
+const AUTO_EDGE_SHARED_TOLERANCE_M = 0.3;
+const AUTO_EDGE_MIN_LENGTH_M = 2.0;
+const ARROW_SPACING_PX = 90;
+const GRID_MIN_SPACING_PX = 40;
+const UNDO_LIMIT = 200;
+const COORD_DECIMALS = 100;
+const STORAGE_KEY = "pufferdrive_map_editor_draft";
+const BASEMAP_STORAGE_KEY = "pufferdrive_basemap";
+const DRAWN_BIN_PREFIX = "drawn__";
+const EMBEDDED = window.parent !== window;
+const CONTROL_COLORS = {light: "#16a34a", stop: "#b91c1c", yield: "#a16207"};
+const TOOL_HINTS = {
+  select: "Click to select. Drag a vertex to move it (linked lane ends follow). Double-click a selected line to insert a vertex, Alt-click a vertex to delete it. Drag empty space to pan, wheel to zoom. Del removes the selection.",
+  lane: "Click to add points in driving direction; Enter or double-click finishes, Backspace undoes a point, Esc cancels. Starting on a lane end or finishing on a lane start links them. Points snap to backdrop / map vertices (hold Shift to disable).",
+  edge: "Click to add road-edge points; Enter or double-click finishes, Esc cancels. Edges are the offroad / collision boundaries.",
+  connect: "Click the lane to come from, then the lane it continues into (toggles the link). Gaps under 3 m are closed by moving the second lane's start.",
+  split: "Click on a lane to split it in two there, e.g. to branch a turn lane from the middle of a road.",
+  control: "Click on a lane where vehicles must stop: places a stop line across it, controlling that lane.",
+};
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const basemap = createBasemap(() => draw());
+const $ = id => document.getElementById(id);
+
+let backdrop = null;
+let map = emptyMap();
+let view = {cx: 0, cy: 0, scale: 4};
+let tool = "select";
+let selection = null;
+let draft = null;
+let connectFrom = null;
+let pointer = null;
+let mouseWorld = null;
+let undoStack = [];
+
+function emptyMap() { return {version: 1, origin: null, lanes: [], edges: [], controls: [], next_id: 1}; }
+function getCss(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function laneById(id) { return map.lanes.find(l => l.id === id); }
+function round2(v) { return Math.round(v * COORD_DECIMALS) / COORD_DECIMALS; }
+function roundPoints(points) { return points.map(([x, y]) => [round2(x), round2(y)]); }
+
+// ---------- geometry ----------
+function toScreen(x, y) {
+  return [(x - view.cx) * view.scale + canvas.width / 2, -(y - view.cy) * view.scale + canvas.height / 2];
+}
+function toWorld(sx, sy) {
+  return [(sx - canvas.width / 2) / view.scale + view.cx, -(sy - canvas.height / 2) / view.scale + view.cy];
+}
+function wrapAngle(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+function dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
+function polylineLength(points) {
+  let length = 0;
+  for (let i = 0; i + 1 < points.length; i++) length += dist(points[i], points[i + 1]);
+  return length;
+}
+function segmentHeading(points, segIdx) {
+  const [ax, ay] = points[segIdx], [bx, by] = points[segIdx + 1];
+  return Math.atan2(by - ay, bx - ax);
+}
+function startHeading(points) { return segmentHeading(points, 0); }
+function endHeading(points) { return segmentHeading(points, points.length - 2); }
+// nearest point on the polyline; t in [0,1] along segment segIdx
+function projectOnPolyline(points, p) {
+  let best = {d: Infinity};
+  for (let i = 0; i + 1 < points.length; i++) {
+    const [ax, ay] = points[i], [bx, by] = points[i + 1];
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    const t = len2 < 1e-12 ? 0 : Math.max(0, Math.min(1, ((p[0] - ax) * dx + (p[1] - ay) * dy) / len2));
+    const q = [ax + t * dx, ay + t * dy], d = dist(q, p);
+    if (d < best.d) best = {d, segIdx: i, t, point: q};
+  }
+  return best;
+}
+function dedupe(points) {
+  return points.filter((p, i) => i === 0 || dist(p, points[i - 1]) > DUPLICATE_POINT_M);
+}
+function resample(points, spacing) {
+  const out = [points[0]];
+  let carry = 0;
+  for (let i = 0; i + 1 < points.length; i++) {
+    const a = points[i], b = points[i + 1], segLength = dist(a, b);
+    let s = spacing - carry;
+    for (; s < segLength; s += spacing) {
+      const t = s / segLength;
+      out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+    }
+    carry = segLength - (s - spacing);
+  }
+  if (dist(out[out.length - 1], points[points.length - 1]) > DUPLICATE_POINT_M) out.push(points[points.length - 1]);
+  return out;
+}
+// positive offset = left of driving direction
+function offsetPolyline(points, offset) {
+  return points.map((p, i) => {
+    const a = points[Math.max(0, i - 1)], b = points[Math.min(points.length - 1, i + 1)];
+    const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy) || 1;
+    return [p[0] - dy / len * offset, p[1] + dx / len * offset];
+  });
+}
+function bbox(points, pad) {
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  return [Math.min(...xs) - pad, Math.min(...ys) - pad, Math.max(...xs) + pad, Math.max(...ys) + pad];
+}
+function inBbox(box, p) { return p[0] >= box[0] && p[1] >= box[1] && p[0] <= box[2] && p[1] <= box[3]; }
+
+// ---------- OSM backdrop ----------
+function parseSpeedKph(text) {
+  if (!text) return null;
+  const value = parseFloat(text);
+  if (!isFinite(value)) return null;
+  return /mph/i.test(text) ? value * MPH_TO_KPH : value;
+}
+function tagsOf(element) {
+  const tags = {};
+  for (const tag of element.getElementsByTagName("tag")) tags[tag.getAttribute("k")] = tag.getAttribute("v");
+  return tags;
+}
+function localProjection(origin) {
+  const metresPerDegLat = EARTH_RADIUS_M * Math.PI / 180;
+  const metresPerDegLon = metresPerDegLat * Math.cos(origin.lat * Math.PI / 180);
+  return {
+    toLocal: ([lat, lon]) => [(lon - origin.lon) * metresPerDegLon, (lat - origin.lat) * metresPerDegLat],
+    toLatLon: ([x, y]) => [origin.lat + y / metresPerDegLat, origin.lon + x / metresPerDegLon],
+  };
+}
+// keeps drawn content at the same lat/lon while (0, 0) moves to newOrigin
+function moveOrigin(newOrigin) {
+  if (map.origin) {
+    const from = localProjection(map.origin), to = localProjection(newOrigin);
+    const shift = points => points.map(p => roundPoints([to.toLocal(from.toLatLon(p))])[0]);
+    for (const lane of map.lanes) lane.points = shift(lane.points);
+    for (const edge of map.edges) edge.points = shift(edge.points);
+    for (const control of map.controls) control.line = shift(control.line);
+  }
+  map.origin = newOrigin;
+}
+function parseOsm(text, fileName, adoptOrigin = false) {
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length) throw new Error("not valid XML");
+  const latLon = new Map();
+  for (const node of doc.getElementsByTagName("node")) {
+    const lat = parseFloat(node.getAttribute("lat")), lon = parseFloat(node.getAttribute("lon"));
+    if (isFinite(lat) && isFinite(lon)) latLon.set(node.getAttribute("id"), [lat, lon]);
+  }
+  if (!latLon.size) throw new Error("no nodes with lat/lon");
+  const lats = [...latLon.values()].map(v => v[0]), lons = [...latLon.values()].map(v => v[1]);
+  const center = {lat: (Math.min(...lats) + Math.max(...lats)) / 2, lon: (Math.min(...lons) + Math.max(...lons)) / 2};
+  if (!map.origin || (adoptOrigin && Math.hypot(...localProjection(map.origin).toLocal([center.lat, center.lon])) > ORIGIN_RECENTER_DISTANCE_M)) {
+    checkpoint();
+    moveOrigin(center);
+  }
+  const project = localProjection(map.origin).toLocal;
+
+  const ways = new Map();
+  for (const way of doc.getElementsByTagName("way")) {
+    const nodeIds = [...way.getElementsByTagName("nd")].map(nd => nd.getAttribute("ref")).filter(id => latLon.has(id));
+    if (nodeIds.length < 2) continue;
+    ways.set(way.getAttribute("id"), {id: way.getAttribute("id"), nodeIds, points: nodeIds.map(id => project(latLon.get(id))), role: "other", tags: tagsOf(way)});
+  }
+  const lanelets = [];
+  for (const relation of doc.getElementsByTagName("relation")) {
+    const tags = tagsOf(relation);
+    const members = {};
+    for (const member of relation.getElementsByTagName("member")) {
+      if (member.getAttribute("type") === "way" && ways.has(member.getAttribute("ref"))) {
+        (members[member.getAttribute("role")] ||= []).push(member.getAttribute("ref"));
+      }
+    }
+    if (tags.type === "lanelet" && members.left && members.right) {
+      lanelets.push({
+        id: relation.getAttribute("id"), left: members.left[0], right: members.right[0],
+        centerline: members.centerline ? members.centerline[0] : null,
+        speedKph: parseSpeedKph(tags.speed_limit), oneWay: tags.one_way !== "no",
+      });
+      ways.get(members.left[0]).role = ways.get(members.right[0]).role = "bound";
+      if (members.centerline) ways.get(members.centerline[0]).role = "centerline";
+    } else if (tags.type === "multipolygon" && members.outer) {
+      for (const wayId of members.outer) ways.get(wayId).role = "area";
+    }
+  }
+  const vertices = [];
+  for (const way of ways.values()) for (const p of way.points) vertices.push(p);
+  return {fileName, text, ways, lanelets, vertices};
+}
+function centerlineFromBounds(left, right) {
+  const sampleCount = Math.max(left.length, right.length, 10);
+  const l = resample(left, polylineLength(left) / (sampleCount - 1)), r = resample(right, polylineLength(right) / (sampleCount - 1));
+  const count = Math.min(l.length, r.length);
+  return Array.from({length: count}, (_, i) => [(l[i][0] + r[i][0]) / 2, (l[i][1] + r[i][1]) / 2]);
+}
+function boundsWidth(center, left, right) {
+  const widths = center.map(p => projectOnPolyline(left, p).d + projectOnPolyline(right, p).d).sort((a, b) => a - b);
+  return Math.min(MAX_WIDTH_M, Math.max(MIN_WIDTH_M, widths[Math.floor(widths.length / 2)]));
+}
+function importLanelets() {
+  if (!backdrop) return setStatus("Load an .osm backdrop first.", true);
+  checkpoint();
+  const imported = new Set(map.lanes.map(l => l.source));
+  let added = 0;
+  for (const lanelet of backdrop.lanelets) {
+    const source = `lanelet:${lanelet.id}`;
+    if (imported.has(source)) continue;
+    const left = backdrop.ways.get(lanelet.left).points, right = backdrop.ways.get(lanelet.right).points;
+    const center = dedupe(lanelet.centerline ? backdrop.ways.get(lanelet.centerline).points : centerlineFromBounds(left, right));
+    if (center.length < 2) continue;
+    const props = {width_m: round2(boundsWidth(center, left, right)), speed_limit_kph: lanelet.speedKph ?? defaultSpeed()};
+    addLane(roundPoints(center), props, source);
+    if (!lanelet.oneWay) addLane(roundPoints([...center].reverse()), props, `${source}:reverse`);
+    added += lanelet.oneWay ? 1 : 2;
+  }
+  const links = autoConnect();
+  changed();
+  setStatus(`Imported ${added} lanes from ${backdrop.lanelets.length} lanelets, added ${links} links.`);
+}
+function importBounds() {
+  if (!backdrop) return setStatus("Load an .osm backdrop first.", true);
+  checkpoint();
+  const useCount = new Map();
+  const keyOf = way => [...way.nodeIds].sort().join(",");
+  for (const lanelet of backdrop.lanelets) {
+    for (const wayId of [lanelet.left, lanelet.right]) {
+      const key = keyOf(backdrop.ways.get(wayId));
+      useCount.set(key, (useCount.get(key) || 0) + 1);
+    }
+  }
+  const imported = new Set(map.edges.map(e => e.source));
+  let added = 0;
+  for (const lanelet of backdrop.lanelets) {
+    for (const wayId of [lanelet.left, lanelet.right]) {
+      const way = backdrop.ways.get(wayId), source = `way:${wayId}`;
+      if (useCount.get(keyOf(way)) !== 1 || imported.has(source)) continue;
+      imported.add(source);
+      map.edges.push({id: map.next_id++, points: roundPoints(way.points), source});
+      added++;
+    }
+  }
+  changed();
+  setStatus(`Added ${added} edges from unshared lanelet bounds.`);
+}
+
+// ---------- map edits ----------
+function checkpoint() {
+  undoStack.push(JSON.stringify(map));
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+function undo() {
+  if (!undoStack.length) return;
+  const previousOrigin = JSON.stringify(map.origin);
+  map = JSON.parse(undoStack.pop());
+  if (JSON.stringify(map.origin) !== previousOrigin) reprojectBackdrop();
+  selection = null; draft = null; connectFrom = null;
+  changed();
+}
+function defaultWidth() { return parseFloat($("defaultWidth").value) || 3.5; }
+function defaultSpeed() { return parseFloat($("defaultSpeed").value) || 30; }
+function addLane(points, props = {}, source = null) {
+  const lane = {
+    id: map.next_id++, points, width_m: props.width_m ?? defaultWidth(), speed_limit_kph: props.speed_limit_kph ?? defaultSpeed(),
+    successors: [], junction: props.junction ?? false,
+  };
+  if (source) lane.source = source;
+  map.lanes.push(lane);
+  return lane;
+}
+function predecessorsOf(laneId) { return map.lanes.filter(l => l.successors.includes(laneId)); }
+function canJoin(from, to) {
+  return from !== to && dist(from.points[from.points.length - 1], to.points[0]) < JOIN_TOLERANCE_M
+    && Math.abs(wrapAngle(endHeading(from.points) - startHeading(to.points))) < JOIN_MAX_HEADING_RAD;
+}
+function autoConnect() {
+  let links = 0;
+  for (const from of map.lanes) {
+    for (const to of map.lanes) {
+      if (from.successors.includes(to.id) || !canJoin(from, to)) continue;
+      from.successors.push(to.id);
+      links++;
+    }
+  }
+  return links;
+}
+function toggleLink(from, to) {
+  checkpoint();
+  if (from.successors.includes(to.id)) {
+    from.successors = from.successors.filter(id => id !== to.id);
+    setStatus(`Unlinked ${from.id} → ${to.id}.`);
+  } else {
+    from.successors.push(to.id);
+    const gap = dist(from.points[from.points.length - 1], to.points[0]);
+    if (gap > DUPLICATE_POINT_M && gap < LINK_SNAP_MAX_GAP_M) to.points[0] = [...from.points[from.points.length - 1]];
+    setStatus(`Linked ${from.id} → ${to.id}${gap >= LINK_SNAP_MAX_GAP_M ? ` (gap ${gap.toFixed(1)} m left open)` : ""}.`);
+  }
+  changed();
+}
+function deleteSelection() {
+  if (!selection) return;
+  checkpoint();
+  if (selection.kind === "lane") {
+    map.lanes = map.lanes.filter(l => l.id !== selection.id);
+    for (const lane of map.lanes) lane.successors = lane.successors.filter(id => id !== selection.id);
+    map.controls = map.controls.filter(c => c.lane !== selection.id);
+  } else if (selection.kind === "edge") {
+    map.edges = map.edges.filter(e => e.id !== selection.id);
+  } else {
+    map.controls = map.controls.filter(c => c.id !== selection.id);
+  }
+  selection = null;
+  changed();
+}
+function splitLane(lane, p) {
+  const proj = projectOnPolyline(lane.points, p);
+  const head = [...lane.points.slice(0, proj.segIdx + 1), proj.point], tail = [proj.point, ...lane.points.slice(proj.segIdx + 1)];
+  if (polylineLength(head) < SPLIT_MIN_PIECE_M || polylineLength(tail) < SPLIT_MIN_PIECE_M) return setStatus("Too close to the lane end to split.", true);
+  checkpoint();
+  const second = addLane(roundPoints(dedupe(tail)), lane);
+  map.lanes.splice(map.lanes.indexOf(second), 1);
+  map.lanes.splice(map.lanes.indexOf(lane) + 1, 0, second);
+  second.successors = lane.successors;
+  lane.successors = [second.id];
+  lane.points = roundPoints(dedupe(head));
+  for (const control of map.controls) {
+    const mid = [(control.line[0][0] + control.line[1][0]) / 2, (control.line[0][1] + control.line[1][1]) / 2];
+    if (control.lane === lane.id && projectOnPolyline(second.points, mid).d < projectOnPolyline(lane.points, mid).d) control.lane = second.id;
+  }
+  selection = {kind: "lane", id: second.id};
+  changed();
+  setStatus(`Split lane ${lane.id} → ${lane.id} + ${second.id}.`);
+}
+function addControl(lane, p) {
+  checkpoint();
+  const proj = projectOnPolyline(lane.points, p), heading = segmentHeading(lane.points, proj.segIdx);
+  const nx = -Math.sin(heading) * lane.width_m / 2, ny = Math.cos(heading) * lane.width_m / 2;
+  const [x, y] = proj.point;
+  const control = {id: map.next_id++, type: $("controlType").value, lane: lane.id, line: roundPoints([[x + nx, y + ny], [x - nx, y - ny]])};
+  map.controls.push(control);
+  selection = {kind: "control", id: control.id};
+  changed();
+}
+function addParallel(lane, side, opposite) {
+  checkpoint();
+  let points = offsetPolyline(lane.points, side * lane.width_m);
+  if (opposite) points = points.reverse();
+  const added = addLane(roundPoints(points), lane);
+  selection = {kind: "lane", id: added.id};
+  changed();
+}
+function reverseLane(lane) {
+  checkpoint();
+  lane.points.reverse();
+  lane.successors = [];
+  for (const other of map.lanes) other.successors = other.successors.filter(id => id !== lane.id);
+  changed();
+  setStatus(`Reversed lane ${lane.id}; its links were removed.`);
+}
+function autoEdges() {
+  if (!map.lanes.length) return setStatus("Draw some lanes first.", true);
+  checkpoint();
+  const corridors = map.lanes.map(lane => ({lane, box: bbox(lane.points, lane.width_m / 2 + AUTO_EDGE_SHARED_TOLERANCE_M)}));
+  const covered = (owner, p) => corridors.some(({lane, box}) => {
+    if (lane === owner || !inBbox(box, p)) return false;
+    const proj = projectOnPolyline(lane.points, p);
+    const atLaneEnd = (proj.segIdx === 0 && proj.t === 0) || (proj.segIdx === lane.points.length - 2 && proj.t === 1);
+    return proj.d < lane.width_m / 2 - AUTO_EDGE_SHARED_TOLERANCE_M || (!atLaneEnd && proj.d < lane.width_m / 2 + AUTO_EDGE_SHARED_TOLERANCE_M);
+  });
+  let added = 0;
+  const flush = run => {
+    if (run.length >= 2 && polylineLength(run) >= AUTO_EDGE_MIN_LENGTH_M) {
+      map.edges.push({id: map.next_id++, points: roundPoints(run), source: "auto"});
+      added++;
+    }
+  };
+  for (const lane of map.lanes) {
+    if (lane.junction) continue;
+    const samples = resample(lane.points, AUTO_EDGE_SAMPLE_M);
+    for (const side of [1, -1]) {
+      let run = [];
+      for (const p of offsetPolyline(samples, side * lane.width_m / 2)) {
+        if (covered(lane, p)) { flush(run); run = []; } else run.push(p);
+      }
+      flush(run);
+    }
+  }
+  changed();
+  setStatus(`Added ${added} edges. Mark intersection connector lanes as "junction" to keep edges out of intersections.`);
+}
+
+// ---------- picking & snapping ----------
+function pickRadiusM() { return PICK_RADIUS_PX * devicePixelRatio / view.scale; }
+function pickLane(p) {
+  let best = null, bestD = Infinity;
+  for (const lane of map.lanes) {
+    const d = projectOnPolyline(lane.points, p).d;
+    if (d < Math.max(pickRadiusM(), lane.width_m / 2) && d < bestD) { best = lane; bestD = d; }
+  }
+  return best;
+}
+function pickObject(p) {
+  for (const control of map.controls) if (projectOnPolyline(control.line, p).d < pickRadiusM()) return {kind: "control", id: control.id};
+  for (const edge of map.edges) if (projectOnPolyline(edge.points, p).d < pickRadiusM()) return {kind: "edge", id: edge.id};
+  const lane = pickLane(p);
+  return lane ? {kind: "lane", id: lane.id} : null;
+}
+function selectedObject() {
+  if (!selection) return null;
+  const list = {lane: map.lanes, edge: map.edges, control: map.controls}[selection.kind];
+  return list.find(o => o.id === selection.id) || null;
+}
+function selectedPoints() {
+  const obj = selectedObject();
+  return obj ? (selection.kind === "control" ? obj.line : obj.points) : null;
+}
+// lane ends win over plain vertices so links are made deliberately
+function snap(p, shiftKey) {
+  if (shiftKey) return {point: p};
+  const radius = SNAP_RADIUS_PX * devicePixelRatio / view.scale;
+  let best = null, bestD = radius;
+  for (const lane of map.lanes) {
+    const ends = [["laneStart", lane.points[0]], ["laneEnd", lane.points[lane.points.length - 1]]];
+    for (const [kind, q] of ends) {
+      const d = dist(p, q);
+      if (d < bestD) { bestD = d; best = {point: [...q], [kind]: lane.id}; }
+    }
+  }
+  if (best) return best;
+  const candidates = [];
+  if (backdrop && $("showBackdrop").checked) candidates.push(...backdrop.vertices);
+  for (const lane of map.lanes) candidates.push(...lane.points);
+  for (const edge of map.edges) candidates.push(...edge.points);
+  for (const q of candidates) {
+    const d = dist(p, q);
+    if (d < bestD) { bestD = d; best = {point: [...q]}; }
+  }
+  return best || {point: p};
+}
+function finishDraft() {
+  if (!draft) return;
+  const points = dedupe(draft.points);
+  if (points.length < 2) { draft = null; draw(); return; }
+  checkpoint();
+  if (draft.kind === "edge") {
+    const edge = {id: map.next_id++, points: roundPoints(points)};
+    map.edges.push(edge);
+    selection = {kind: "edge", id: edge.id};
+  } else {
+    const lane = addLane(roundPoints(points));
+    if (draft.endLaneStart != null) lane.successors.push(draft.endLaneStart);
+    const predecessor = draft.startLaneEnd != null ? laneById(draft.startLaneEnd) : null;
+    if (predecessor) predecessor.successors.push(lane.id);
+    selection = {kind: "lane", id: lane.id};
+  }
+  draft = null;
+  changed();
+}
+
+// ---------- drawing ----------
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = r.width * devicePixelRatio; canvas.height = r.height * devicePixelRatio;
+  draw();
+}
+function strokePolyline(points, closed = false) {
+  ctx.beginPath();
+  points.forEach(([x, y], i) => { const [sx, sy] = toScreen(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+  if (closed) ctx.closePath();
+  ctx.stroke();
+}
+function drawArrows(points, color) {
+  const px = devicePixelRatio, size = 5 * px;
+  let carry = ARROW_SPACING_PX * px / 2;
+  ctx.fillStyle = color;
+  for (let i = 0; i + 1 < points.length; i++) {
+    const a = toScreen(...points[i]), b = toScreen(...points[i + 1]);
+    const segLength = Math.hypot(b[0] - a[0], b[1] - a[1]), angle = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    let s = carry;
+    for (; s < segLength; s += ARROW_SPACING_PX * px) {
+      const x = a[0] + (b[0] - a[0]) * s / segLength, y = a[1] + (b[1] - a[1]) * s / segLength;
+      ctx.save(); ctx.translate(x, y); ctx.rotate(angle);
+      ctx.beginPath(); ctx.moveTo(size, 0); ctx.lineTo(-size, -size * 0.8); ctx.lineTo(-size, size * 0.8); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    carry = s - segLength;
+  }
+}
+function drawGrid() {
+  const px = devicePixelRatio;
+  let step = 1;
+  for (const candidate of [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]) { step = candidate; if (candidate * view.scale >= GRID_MIN_SPACING_PX * px) break; }
+  const [x0, y1] = toWorld(0, 0), [x1, y0] = toWorld(canvas.width, canvas.height);
+  ctx.strokeStyle = getCss("--grid"); ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = Math.floor(x0 / step) * step; x <= x1; x += step) { const [sx] = toScreen(x, 0); ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height); }
+  for (let y = Math.floor(y0 / step) * step; y <= y1; y += step) { const [, sy] = toScreen(0, y); ctx.moveTo(0, sy); ctx.lineTo(canvas.width, sy); }
+  ctx.stroke();
+  return step;
+}
+function drawBackdrop() {
+  const px = devicePixelRatio;
+  for (const way of backdrop.ways.values()) {
+    if (way.role === "area") {
+      ctx.fillStyle = getCss("--osm-area");
+      ctx.beginPath(); way.points.forEach(([x, y], i) => { const [sx, sy] = toScreen(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); }); ctx.fill();
+      ctx.strokeStyle = getCss("--osm-bound"); ctx.lineWidth = 1 * px; ctx.setLineDash([2 * px, 3 * px]);
+    } else if (way.role === "centerline") {
+      ctx.strokeStyle = getCss("--osm-center"); ctx.lineWidth = 1 * px; ctx.setLineDash([6 * px, 4 * px]);
+    } else {
+      ctx.strokeStyle = getCss("--osm-bound"); ctx.lineWidth = (way.role === "bound" ? 1.5 : 1) * px; ctx.setLineDash([]);
+    }
+    strokePolyline(way.points);
+  }
+  ctx.setLineDash([]);
+}
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const px = devicePixelRatio;
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  basemap.draw(ctx, map.origin, $("basemapSource").value, parseFloat($("basemapOpacity").value), {toScreen, toWorld, width: canvas.width, height: canvas.height, scale: view.scale});
+  const gridStep = drawGrid();
+  if (backdrop && $("showBackdrop").checked) drawBackdrop();
+
+  for (const lane of map.lanes) {
+    ctx.strokeStyle = lane.junction ? "rgba(124,58,237,.10)" : "rgba(37,99,235,.10)";
+    ctx.lineWidth = lane.width_m * view.scale; ctx.lineCap = "butt";
+    strokePolyline(lane.points);
+  }
+  ctx.lineCap = "round";
+  for (const lane of map.lanes) {
+    const color = getCss(lane.junction ? "--junction" : "--lane");
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5 * px;
+    strokePolyline(lane.points);
+    drawArrows(lane.points, color);
+    for (const succId of lane.successors) {
+      const succ = laneById(succId);
+      if (!succ || dist(lane.points[lane.points.length - 1], succ.points[0]) <= JOIN_TOLERANCE_M) continue;
+      ctx.strokeStyle = getCss("--danger"); ctx.setLineDash([3 * px, 3 * px]);
+      strokePolyline([lane.points[lane.points.length - 1], succ.points[0]]);
+      ctx.setLineDash([]);
+    }
+  }
+  ctx.strokeStyle = getCss("--edge"); ctx.lineWidth = 2.5 * px;
+  for (const edge of map.edges) strokePolyline(edge.points);
+  for (const control of map.controls) {
+    ctx.strokeStyle = CONTROL_COLORS[control.type]; ctx.lineWidth = 4 * px;
+    strokePolyline(control.line);
+  }
+
+  const highlight = (points, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 3 * px; strokePolyline(points);
+    ctx.fillStyle = "#fff";
+    for (const [x, y] of points) {
+      const [sx, sy] = toScreen(x, y);
+      ctx.beginPath(); ctx.arc(sx, sy, 3.5 * px, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    }
+  };
+  const selectedPts = selectedPoints();
+  if (selectedPts) highlight(selectedPts, getCss("--select"));
+  if (selection && selection.kind === "lane") {
+    const lane = selectedObject();
+    ctx.lineWidth = 3 * px;
+    for (const succId of lane.successors) { const succ = laneById(succId); if (succ) { ctx.strokeStyle = "rgba(22,163,74,.6)"; strokePolyline(succ.points); } }
+    for (const pred of predecessorsOf(lane.id)) { ctx.strokeStyle = "rgba(219,39,119,.5)"; strokePolyline(pred.points); }
+  }
+  if (connectFrom != null && laneById(connectFrom)) highlight(laneById(connectFrom).points, getCss("--ok"));
+
+  if (mouseWorld && (tool === "lane" || tool === "edge")) {
+    const snapped = snap(mouseWorld, pointer?.shiftKey ?? false);
+    if (draft) {
+      ctx.strokeStyle = draft.kind === "lane" ? getCss("--lane") : getCss("--edge");
+      ctx.lineWidth = 2 * px; ctx.setLineDash([6 * px, 4 * px]);
+      strokePolyline([...draft.points, snapped.point]);
+      ctx.setLineDash([]);
+    }
+    if (snapped.point !== mouseWorld) {
+      const [sx, sy] = toScreen(...snapped.point);
+      ctx.strokeStyle = snapped.laneEnd != null || snapped.laneStart != null ? getCss("--ok") : getCss("--select");
+      ctx.lineWidth = 2 * px; ctx.beginPath(); ctx.arc(sx, sy, 7 * px, 0, 2 * Math.PI); ctx.stroke();
+    }
+  }
+  const cursor = mouseWorld ? `x ${mouseWorld[0].toFixed(1)}  y ${mouseWorld[1].toFixed(1)} m  ·  ` : "";
+  $("hud").textContent = `${cursor}grid ${gridStep} m  ·  ${map.lanes.length} lanes, ${map.edges.length} edges, ${map.controls.length} stop lines`;
+}
+
+// ---------- side panel ----------
+function setStatus(text, isError = false) {
+  $("saveStatus").textContent = text;
+  $("saveStatus").className = isError ? "hint error" : "hint";
+}
+function numberInput(label, value, min, max, step, onChange) {
+  const wrapper = document.createElement("label");
+  wrapper.textContent = label + " ";
+  const input = document.createElement("input");
+  Object.assign(input, {type: "number", value, min, max, step});
+  input.addEventListener("change", () => {
+    const parsed = parseFloat(input.value);
+    if (!isFinite(parsed) || parsed < min || parsed > max) { input.value = value; return; }
+    checkpoint(); onChange(parsed); changed();
+  });
+  wrapper.appendChild(input);
+  return wrapper;
+}
+function button(label, onClick, className = "") {
+  const b = document.createElement("button");
+  b.textContent = label; b.className = className; b.addEventListener("click", onClick);
+  return b;
+}
+function row(...children) {
+  const div = document.createElement("div");
+  div.className = "row"; children.forEach(c => div.appendChild(c));
+  return div;
+}
+function renderProps() {
+  const props = $("props");
+  props.innerHTML = "";
+  const obj = selectedObject();
+  if (!obj) { props.innerHTML = '<p class="hint">Nothing selected.</p>'; return; }
+  const info = document.createElement("p");
+  info.className = "hint";
+  props.appendChild(info);
+  if (selection.kind === "lane") {
+    info.textContent = `Lane ${obj.id} · ${polylineLength(obj.points).toFixed(1)} m · ${obj.points.length} points${obj.source ? " · " + obj.source : ""}`;
+    props.appendChild(row(
+      numberInput("Width (m)", obj.width_m, MIN_WIDTH_M, MAX_WIDTH_M, 0.1, v => { obj.width_m = v; }),
+      numberInput("Speed (km/h)", obj.speed_limit_kph, MIN_SPEED_KPH, MAX_SPEED_KPH, 5, v => { obj.speed_limit_kph = v; }),
+    ));
+    const junction = document.createElement("label");
+    junction.className = "checkbox";
+    junction.innerHTML = '<input type="checkbox"> Junction connector (no auto edges)';
+    junction.firstChild.checked = obj.junction;
+    junction.firstChild.addEventListener("change", e => { checkpoint(); obj.junction = e.target.checked; changed(); });
+    props.appendChild(junction);
+    const links = document.createElement("div");
+    links.innerHTML = '<span class="hint">Next: </span>';
+    for (const succId of obj.successors) {
+      const chip = document.createElement("span");
+      chip.className = "chip"; chip.textContent = succId;
+      chip.appendChild(button("×", () => toggleLink(obj, laneById(succId))));
+      links.appendChild(chip);
+    }
+    const preds = predecessorsOf(obj.id).map(l => l.id);
+    links.insertAdjacentHTML("beforeend", `<br><span class="hint">Previous: ${preds.length ? preds.join(", ") : "none"}</span>`);
+    props.appendChild(links);
+    props.appendChild(row(button("+ lane left", () => addParallel(obj, 1, false)), button("+ lane right", () => addParallel(obj, -1, false))));
+    props.appendChild(row(button("+ opposite lane (left)", () => addParallel(obj, 1, true)), button("Reverse", () => reverseLane(obj))));
+  } else if (selection.kind === "edge") {
+    info.textContent = `Edge ${obj.id} · ${polylineLength(obj.points).toFixed(1)} m · ${obj.points.length} points`;
+  } else {
+    info.textContent = `Stop line ${obj.id} on lane ${obj.lane}`;
+    const select = document.createElement("select");
+    select.innerHTML = $("controlType").innerHTML;
+    select.value = obj.type;
+    select.addEventListener("change", () => { checkpoint(); obj.type = select.value; changed(); });
+    props.appendChild(select);
+  }
+  props.appendChild(row(button("Delete (Del)", deleteSelection, "danger")));
+}
+function renderWarnings() {
+  const out = [];
+  if (!map.lanes.length) out.push("No lanes yet.");
+  if (map.lanes.length && !map.edges.length) out.push("No road edges: offroad and edge collisions never trigger.");
+  const gaps = [], kinks = [], badProps = [];
+  for (const lane of map.lanes) {
+    for (const succId of lane.successors) {
+      const succ = laneById(succId);
+      if (succ && dist(lane.points[lane.points.length - 1], succ.points[0]) > JOIN_TOLERANCE_M) gaps.push(`${lane.id}→${succId}`);
+    }
+    for (let i = 1; i + 1 < lane.points.length; i++) {
+      if (Math.abs(wrapAngle(segmentHeading(lane.points, i) - segmentHeading(lane.points, i - 1))) > SHARP_KINK_RAD) { kinks.push(lane.id); break; }
+    }
+    if (!(lane.width_m >= MIN_WIDTH_M && lane.width_m <= MAX_WIDTH_M && lane.speed_limit_kph >= MIN_SPEED_KPH && lane.speed_limit_kph <= MAX_SPEED_KPH)) badProps.push(lane.id);
+  }
+  if (gaps.length) out.push(`Linked lanes with a gap > ${JOIN_TOLERANCE_M} m: ${gaps.join(", ")}`);
+  if (kinks.length) out.push(`Lanes with a kink > 60°: ${kinks.join(", ")}`);
+  if (badProps.length) out.push(`Lanes with width/speed out of range: ${badProps.join(", ")}`);
+  const deadEnds = map.lanes.filter(l => !l.successors.length).map(l => l.id);
+  if (deadEnds.length) out.push(`Dead-end lanes (no successor): ${deadEnds.join(", ")}. Map goals are walked forward along links, so spawns near a dead end get no goal; CARLA training maps are closed networks.`);
+  const sources = map.lanes.filter(l => !predecessorsOf(l.id).length).map(l => l.id);
+  if (sources.length) out.push(`Lanes nothing leads into: ${sources.join(", ")}`);
+  $("warnings").innerHTML = out.length ? "" : '<div class="ok">No issues found.</div>';
+  for (const text of out) { const div = document.createElement("div"); div.textContent = text; $("warnings").appendChild(div); }
+}
+function persistDraft() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify({name: $("mapName").value, map})); } catch (e) { /* storage unavailable */ }
+}
+function renderOrigin() {
+  const hasOrigin = Boolean(map.origin);
+  if (document.activeElement !== $("originLat")) $("originLat").value = hasOrigin ? map.origin.lat.toFixed(7) : "";
+  if (document.activeElement !== $("originLon")) $("originLon").value = hasOrigin ? map.origin.lon.toFixed(7) : "";
+  $("originInfo").textContent = hasOrigin
+    ? "Map (0, 0) sits at this point; x east, y north. Editing it moves the drawn map, the .osm backdrop stays put."
+    : "No origin yet: load an .osm backdrop or type the latitude / longitude of map (0, 0).";
+}
+function reprojectBackdrop() {
+  if (backdrop) backdrop = parseOsm(backdrop.text, backdrop.fileName);
+}
+function applyOrigin() {
+  const lat = parseFloat($("originLat").value), lon = parseFloat($("originLon").value);
+  if (!(Math.abs(lat) <= BASEMAP_MAX_LATITUDE_DEG && Math.abs(lon) <= 180)) {
+    if ($("originLat").value || $("originLon").value) setStatus("Origin needs both a latitude within ±85° and a longitude within ±180°.", true);
+    return;
+  }
+  checkpoint();
+  map.origin = {lat, lon};
+  reprojectBackdrop();
+  changed();
+}
+function persistBasemap() {
+  try { localStorage.setItem(BASEMAP_STORAGE_KEY, JSON.stringify({source: $("basemapSource").value, opacity: $("basemapOpacity").value})); } catch (e) { /* storage unavailable */ }
+}
+function changed() {
+  if (selection && !selectedObject()) selection = null;
+  renderProps(); renderWarnings(); renderOrigin(); persistDraft(); draw();
+}
+function setTool(name) {
+  tool = name; draft = null; connectFrom = null;
+  document.querySelectorAll(".tools button").forEach(b => b.classList.toggle("active", b.dataset.tool === name));
+  $("toolHint").textContent = TOOL_HINTS[name];
+  draw();
+}
+function fitView() {
+  const points = [...map.lanes.flatMap(l => l.points), ...map.edges.flatMap(e => e.points)];
+  if (backdrop) points.push(...backdrop.vertices);
+  if (!points.length) return;
+  const [x0, y0, x1, y1] = bbox(points, 5);
+  view.cx = (x0 + x1) / 2; view.cy = (y0 + y1) / 2;
+  view.scale = Math.min(canvas.width / (x1 - x0), canvas.height / (y1 - y0)) * 0.9;
+  draw();
+}
+function loadSpec(spec, name) {
+  if (!spec || !Array.isArray(spec.lanes)) return setStatus("Not a map-editor JSON.", true);
+  checkpoint();
+  map = {...emptyMap(), ...spec};
+  if (name) $("mapName").value = name;
+  selection = null; draft = null;
+  reprojectBackdrop();
+  changed(); fitView();
+}
+
+// ---------- server ----------
+async function api(path, body) {
+  const response = await fetch(path, body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+async function refreshSaved() {
+  try {
+    const {maps, out_dir} = await api("api/maps");
+    $("savedSelect").innerHTML = maps.map(m => `<option>${m}</option>`).join("");
+    $("saveMap").title = `Writes ${out_dir}/drawn__<name>.bin`;
+  } catch (e) {
+    setStatus("Server not reachable: use Download JSON, or run scripts/map_editor/server.py.", true);
+  }
+}
+async function saveMap() {
+  const name = $("mapName").value.trim();
+  try {
+    const result = await api("api/save", {name, spec: map});
+    setStatus(`Saved ${result.bin_path}: ${result.lanes} lanes (${result.lane_points} points), ${result.edges} edges, ${result.controls} stop lines.`);
+    refreshSaved();
+    if (EMBEDDED) window.parent.postMessage({type: "map-saved", map: `${DRAWN_BIN_PREFIX}${name}.bin`}, location.origin);
+    return `${DRAWN_BIN_PREFIX}${name}.bin`;
+  } catch (e) { setStatus(`Save failed: ${e.message}`, true); return null; }
+}
+async function openMap() {
+  const name = $("savedSelect").value;
+  if (!name) return;
+  try { loadSpec(await api(`api/map?name=${encodeURIComponent(name)}`), name); } catch (e) { setStatus(`Open failed: ${e.message}`, true); }
+}
+
+// ---------- input ----------
+function eventWorld(e) {
+  const r = canvas.getBoundingClientRect();
+  return toWorld((e.clientX - r.left) * devicePixelRatio, (e.clientY - r.top) * devicePixelRatio);
+}
+function vertexUnder(points, p) {
+  let best = -1, bestD = pickRadiusM();
+  points.forEach((q, i) => { const d = dist(p, q); if (d < bestD) { bestD = d; best = i; } });
+  return best;
+}
+// lane ends sitting on the dragged vertex, so links stay closed while dragging
+function linkedEndpoints(origin) {
+  const linked = [];
+  for (const lane of map.lanes) {
+    for (const idx of [0, lane.points.length - 1]) if (dist(lane.points[idx], origin) < LINKED_ENDPOINT_M) linked.push(lane.points[idx]);
+  }
+  return linked;
+}
+canvas.addEventListener("mousedown", e => {
+  const p = eventWorld(e);
+  pointer = {startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false, shiftKey: e.shiftKey, dragVertex: null, pan: e.button !== 0};
+  const points = tool === "select" && e.button === 0 ? selectedPoints() : null;
+  if (!points) return;
+  const vertexIdx = vertexUnder(points, p);
+  if (vertexIdx < 0) return;
+  if (e.altKey) {
+    if (points.length > 2 && selection.kind !== "control") { checkpoint(); points.splice(vertexIdx, 1); changed(); }
+    pointer = null;
+    return;
+  }
+  checkpoint();
+  const vertex = points[vertexIdx];
+  pointer.dragVertex = selection.kind === "lane" ? [...new Set([vertex, ...linkedEndpoints(vertex)])] : [vertex];
+});
+window.addEventListener("mousemove", e => {
+  if (e.target === canvas) mouseWorld = eventWorld(e);
+  if (pointer) {
+    pointer.shiftKey = e.shiftKey;
+    if (Math.hypot(e.clientX - pointer.startX, e.clientY - pointer.startY) > DRAG_THRESHOLD_PX) pointer.moved = true;
+    if (pointer.moved && pointer.dragVertex) {
+      const p = eventWorld(e);
+      for (const vertex of pointer.dragVertex) { vertex[0] = round2(p[0]); vertex[1] = round2(p[1]); }
+    } else if (pointer.moved) {
+      view.cx -= (e.clientX - pointer.lastX) * devicePixelRatio / view.scale;
+      view.cy += (e.clientY - pointer.lastY) * devicePixelRatio / view.scale;
+    }
+    pointer.lastX = e.clientX; pointer.lastY = e.clientY;
+  }
+  draw();
+});
+window.addEventListener("mouseup", e => {
+  if (!pointer) return;
+  const wasClick = !pointer.moved && !pointer.pan && e.target === canvas;
+  const dragged = pointer.dragVertex && pointer.moved;
+  if (pointer.dragVertex && !pointer.moved) undoStack.pop();
+  pointer = null;
+  if (dragged) changed();
+  if (wasClick) handleClick(eventWorld(e), e);
+});
+canvas.addEventListener("dblclick", e => {
+  if (tool === "lane" || tool === "edge") return finishDraft();
+  const points = tool === "select" ? selectedPoints() : null;
+  if (!points || selection.kind === "control") return;
+  const p = eventWorld(e), proj = projectOnPolyline(points, p);
+  if (proj.d > pickRadiusM() || vertexUnder(points, p) >= 0) return;
+  checkpoint();
+  points.splice(proj.segIdx + 1, 0, roundPoints([proj.point])[0]);
+  changed();
+});
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const before = eventWorld(e);
+  view.scale = Math.min(200, Math.max(0.05, view.scale * Math.exp(-e.deltaY * 0.0015)));
+  const after = eventWorld(e);
+  view.cx += before[0] - after[0]; view.cy += before[1] - after[1];
+  draw();
+}, {passive: false});
+function handleClick(p, e) {
+  if (tool === "select") {
+    selection = pickObject(p);
+    return changed();
+  }
+  if (tool === "lane" || tool === "edge") {
+    const snapped = snap(p, e.shiftKey);
+    if (!draft) draft = {kind: tool, points: [], startLaneEnd: snapped.laneEnd ?? null, endLaneStart: null};
+    draft.points.push(snapped.point);
+    draft.endLaneStart = snapped.laneStart ?? null;
+    return draw();
+  }
+  const lane = pickLane(p);
+  if (!lane) return;
+  if (tool === "split") return splitLane(lane, p);
+  if (tool === "control") return addControl(lane, p);
+  if (connectFrom == null) { connectFrom = lane.id; return draw(); }
+  const from = laneById(connectFrom);
+  connectFrom = null;
+  if (from && from !== lane) toggleLink(from, lane); else draw();
+}
+window.addEventListener("keydown", e => {
+  if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
+  if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); return undo(); }
+  if (e.key === "Enter") return finishDraft();
+  if (e.key === "Escape") { draft = null; connectFrom = null; selection = null; return changed(); }
+  if (e.key === "Backspace" && draft) { draft.points.pop(); if (!draft.points.length) draft = null; return draw(); }
+  if (e.key === "Delete" || e.key === "Backspace") return deleteSelection();
+  if (e.key === "f") return fitView();
+  const toolKeys = {v: "select", n: "lane", e: "edge", c: "connect", x: "split", l: "control"};
+  if (toolKeys[e.key.toLowerCase()]) setTool(toolKeys[e.key.toLowerCase()]);
+});
+
+$("osmFile").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    backdrop = parseOsm(await file.text(), file.name, true);
+    $("osmInfo").textContent = `${file.name}: ${backdrop.ways.size} ways, ${backdrop.lanelets.length} lanelets. Origin ${map.origin.lat.toFixed(6)}, ${map.origin.lon.toFixed(6)} (x east, y north, metres).`;
+    changed(); fitView();
+  } catch (error) {
+    $("osmInfo").textContent = `Could not read ${file.name}: ${error.message}`;
+  }
+});
+$("showBackdrop").addEventListener("change", draw);
+$("basemapSource").addEventListener("change", () => { persistBasemap(); draw(); });
+$("basemapOpacity").addEventListener("input", () => { persistBasemap(); draw(); });
+$("originLat").addEventListener("change", applyOrigin);
+$("originLon").addEventListener("change", applyOrigin);
+$("importLanelets").addEventListener("click", importLanelets);
+$("importBounds").addEventListener("click", importBounds);
+$("autoEdges").addEventListener("click", autoEdges);
+$("clearEdges").addEventListener("click", () => { checkpoint(); map.edges = []; changed(); });
+$("autoConnect").addEventListener("click", () => { checkpoint(); const links = autoConnect(); changed(); setStatus(`Added ${links} links.`); });
+$("saveMap").addEventListener("click", saveMap);
+$("useInScenario").hidden = !EMBEDDED;
+$("useInScenario").addEventListener("click", async () => {
+  const binName = await saveMap();
+  if (binName) window.parent.postMessage({type: "open-map", map: binName}, location.origin);
+});
+// the Scenario tab asks to edit the road layout of a drawn map it has open
+window.addEventListener("message", async event => {
+  if (event.origin !== location.origin || !event.data || event.data.type !== "edit-map") return;
+  const name = String(event.data.map).replace(new RegExp(`^${DRAWN_BIN_PREFIX}`), "").replace(/\.bin$/, "");
+  try { loadSpec(await api(`api/map?name=${encodeURIComponent(name)}`), name); } catch (e) { setStatus(`Open failed: ${e.message}`, true); }
+});
+$("openMap").addEventListener("click", openMap);
+$("downloadJson").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([JSON.stringify(map)], {type: "application/json"}));
+  link.download = `${$("mapName").value || "map"}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+});
+$("loadJson").addEventListener("click", () => $("jsonFile").click());
+$("jsonFile").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try { loadSpec(JSON.parse(await file.text()), file.name.replace(/\.json$/, "")); } catch (error) { setStatus(`Could not read ${file.name}: ${error.message}`, true); }
+  e.target.value = "";
+});
+$("clearMap").addEventListener("click", () => {
+  if (!confirm("Remove all lanes, edges and stop lines?")) return;
+  checkpoint();
+  map = {...emptyMap(), origin: map.origin};
+  selection = null;
+  changed();
+});
+$("mapName").addEventListener("change", persistDraft);
+document.querySelectorAll(".tools button").forEach(b => b.addEventListener("click", () => setTool(b.dataset.tool)));
+window.addEventListener("resize", resize);
+
+try {
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+  if (saved && saved.map && Array.isArray(saved.map.lanes)) { map = {...emptyMap(), ...saved.map}; $("mapName").value = saved.name || "my_map"; }
+} catch (e) { /* storage unavailable */ }
+try {
+  const savedBasemap = JSON.parse(localStorage.getItem(BASEMAP_STORAGE_KEY) || "null");
+  if (savedBasemap && savedBasemap.source in BASEMAP_SOURCES) $("basemapSource").value = savedBasemap.source;
+  if (savedBasemap && savedBasemap.opacity) $("basemapOpacity").value = savedBasemap.opacity;
+} catch (e) { /* storage unavailable */ }
+setTool("select");
+resize();
+changed();
+fitView();
+refreshSaved();
+</script>
+</body>
+</html>

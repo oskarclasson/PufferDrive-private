@@ -30,6 +30,7 @@ from pathlib import Path
 TRAFFIC_PHASE_SECTION_TAG = b"TLPHASE1"
 LANE_WIDTH_SECTION_TAG = b"LANEWID1"
 SPEED_ZONE_SECTION_TAG = b"SPDZONE1"
+SCRIPTED_GOAL_SECTION_TAG = b"AGTGOAL1"
 
 
 def _is_lane(road_type: int) -> bool:
@@ -163,6 +164,16 @@ def read_bin(path: Path) -> dict:
             if _is_lane(r["type"]):
                 (r["speed_zone_idx"],) = _read("<i", f) if has_zone_section else (-1,)
 
+        goal_tag = f.read(len(SCRIPTED_GOAL_SECTION_TAG))
+        has_scripted_goal_section = goal_tag == SCRIPTED_GOAL_SECTION_TAG
+        assert has_scripted_goal_section or goal_tag == b"", f"unexpected bytes after zone section in {path}"
+        for a in agents:
+            (goal_count,) = _read("<i", f) if has_scripted_goal_section else (0,)
+            goal_xs = _read_f_array(f, goal_count)
+            goal_ys = _read_f_array(f, goal_count)
+            goal_zs = _read_f_array(f, goal_count)
+            a["scripted_goals"] = tuple(zip(goal_xs, goal_ys, goal_zs))
+
         trailing = f.read()
         assert not trailing, f"{len(trailing)} unparsed trailing bytes in {path}"
 
@@ -181,6 +192,7 @@ def read_bin(path: Path) -> dict:
         "has_phase_section": has_phase_section,
         "has_width_section": has_width_section,
         "has_zone_section": has_zone_section,
+        "has_scripted_goal_section": has_scripted_goal_section,
     }
 
 
@@ -195,6 +207,7 @@ def mirror(data: dict) -> dict:
         c["h"] = tuple(-v for v in c["h"])
         gx, gy, gz = a["goal"]
         a["goal"] = (gx, -gy, gz)
+        a["scripted_goals"] = tuple((x, -y, z) for x, y, z in a["scripted_goals"])
     for r in data["roads"]:
         r["y"] = tuple(-v for v in r["y"])
         r["headings"] = tuple(-v for v in r["headings"])
@@ -306,6 +319,14 @@ def write_bin(data: dict, path: Path):
             for r in roads:
                 if _is_lane(r["type"]):
                     f.write(struct.pack("<i", r["speed_zone_idx"]))
+        if data["has_scripted_goal_section"]:
+            f.write(SCRIPTED_GOAL_SECTION_TAG)
+            for a in agents:
+                goals = a["scripted_goals"]
+                f.write(struct.pack("<i", len(goals)))
+                for axis in range(3):
+                    if goals:
+                        f.write(struct.pack(f"<{len(goals)}f", *(g[axis] for g in goals)))
 
 
 def main():
