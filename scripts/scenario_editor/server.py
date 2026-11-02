@@ -212,6 +212,8 @@ class EditorState:
             raise scenario_builder.ScenarioSpecError(
                 f"inferred goal spacing must be {MIN_INFERRED_GOAL_SPACING_M:g}-{MAX_INFERRED_GOAL_SPACING_M:g} m"
             )
+        if request.get("robust_control") and request.get("mppi", True):
+            raise scenario_builder.ScenarioSpecError("the ego follows MPPI or the robust plan, not both")
         with self.lock:
             if any(run["status"] == "running" for run in self.list_runs()):
                 raise scenario_builder.ScenarioSpecError("an evaluation is already running (see Results)")
@@ -219,6 +221,8 @@ class EditorState:
             spec = json.loads(spec_path.read_text())
             # Actors are written first and in order, so an actor's index is its scenario agent id.
             ego_actor_idx = next((idx for idx, actor in enumerate(spec["actors"]) if actor.get("ego")), None)
+            if request.get("robust_control") and ego_actor_idx is None:
+                raise scenario_builder.ScenarioSpecError("mark an actor as ego for it to follow the robust plan")
             scenario_steps = int(round(float(spec["duration_s"]) / scenario_builder.SIM_DT_SECONDS))
             benchmark = yaml.safe_load(BENCHMARK_TEMPLATE_PATH.read_text())
             (entry,) = [b for b in benchmark["benchmarks"] if b["name"] == BENCHMARK_NAME]
@@ -230,8 +234,17 @@ class EditorState:
             settings = {
                 "mppi": bool(request.get("mppi", True)),
                 "ego_actor": "none" if ego_actor_idx is None else f"A{ego_actor_idx + 1}",
-                "goal_inference": bool(request.get("goal_inference", False) or request.get("joint_prediction", False)),
+                "goal_inference": bool(
+                    request.get("goal_inference", False)
+                    or request.get("joint_prediction", False)
+                    or request.get("robust_prediction", False)
+                    or request.get("robust_control", False)
+                ),
                 "joint_prediction": bool(request.get("joint_prediction", False)),
+                "robust_prediction": bool(
+                    request.get("robust_prediction", False) or request.get("robust_control", False)
+                ),
+                "robust_control": bool(request.get("robust_control", False)),
                 "prediction": bool(request.get("prediction", True)),
                 "capture_observations": bool(request.get("capture_observations", True)),
                 "goal_radius": float(goal_radius),
@@ -263,6 +276,8 @@ class EditorState:
                 f"eval.ego_agent_id={'null' if ego_actor_idx is None else ego_actor_idx}",
                 f"eval.goal_inference={str(settings['goal_inference']).lower()}",
                 f"eval.joint_prediction={str(settings['joint_prediction']).lower()}",
+                f"eval.robust_prediction={str(settings['robust_prediction']).lower()}",
+                f"eval.robust_prediction_control={str(settings['robust_control']).lower()}",
                 f"eval.output_name={run_label}",
                 "wandb=False",
             ]

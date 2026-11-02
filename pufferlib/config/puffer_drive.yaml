@@ -477,7 +477,16 @@ eval:
   joint_prediction_horizon_s: 5.0
   # The rollout's own timestep, the policy's training dt, so a horizon needs fewer policy calls than at the env's dt.
   joint_prediction_dt: 0.3
-  # Scenario agent id of the ego (null: none): the agent that keeps its own goals in the joint prediction.
+  # Robust prediction: the ego is rolled out against every likely route of each other agent at once. Each agent drives
+  # its likeliest route and a copy of it, invisible to and passing through the original, each further route with belief
+  # of at least robust_prediction_min_belief (at most robust_prediction_max_routes per agent). Shares the joint
+  # prediction's horizon and dt; needs goal_inference.
+  robust_prediction: false
+  robust_prediction_min_belief: 0.1
+  robust_prediction_max_routes: 3
+  # The ego executes the robust rollout's first action instead of its own policy action; needs ego_agent_id, not MPPI.
+  robust_prediction_control: false
+  # Scenario agent id of the ego (null: none): the agent that keeps its own goals in the joint and robust predictions.
   ego_agent_id: null
 controlled_exp:
   train:

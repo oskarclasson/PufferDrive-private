@@ -119,6 +119,8 @@
   <label class="checkbox"><input type="checkbox" id="usePrediction" checked> 10 s predicted trajectory overlay</label>
   <label class="checkbox"><input type="checkbox" id="useGoalInference"> Infer each actor's goal from its motion (goals in the vehicle's color, size and opacity by belief, B in replay)</label>
   <label class="checkbox"><input type="checkbox" id="useJointPrediction"> Joint prediction: ego on its goals, other actors on their inferred goals (J in replay)</label>
+  <label class="checkbox"><input type="checkbox" id="useRobustPrediction"> Robust prediction: ego against every likely route of each other actor at once (U in replay)</label>
+  <label class="checkbox"><input type="checkbox" id="useRobustControl"> Ego drives the robust plan's first action (instead of MPPI; needs an ego actor)</label>
   <label class="checkbox"><input type="checkbox" id="captureObs" checked> Capture policy observations</label>
   <label>Goal radius (m) <input type="number" id="goalRadius" value="2" min="0.5" max="20" step="0.5"></label>
   <label>Inferred goal spacing (m) <input type="number" id="inferredGoalSpacing" value="10" min="2" max="50" step="1"></label>
@@ -702,7 +704,7 @@ const METRIC_LABELS = [["active_agent_count", "actors driven by policy", 0], ["c
   ["total_distance_travelled", "total distance m", 0], ["multi_lane_time", "time straddling lanes s", 1],
   ["comfort_violation_count", "comfort violations", 2], ["speed_limit_compliance", "speed-limit compliance", 3]];
 const SETTING_LABELS = [["map", "map"], ["duration_s", "duration s"], ["actor_count", "actors"], ["obstacle_count", "obstacles"],
-  ["mppi", "MPPI"], ["ego_actor", "ego"], ["goal_inference", "goal inference"], ["joint_prediction", "joint prediction"], ["inferred_goal_spacing_m", "inferred goal spacing m"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
+  ["mppi", "MPPI"], ["ego_actor", "ego"], ["goal_inference", "goal inference"], ["joint_prediction", "joint prediction"], ["robust_prediction", "robust prediction"], ["robust_control", "ego follows robust plan"], ["inferred_goal_spacing_m", "inferred goal spacing m"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
 let runs = [];
 let selectedRun = null;
 let runsTimer = null;
@@ -731,7 +733,7 @@ async function loadRuns() {
     const facts = r.status === "running" ? `running for ${formatElapsed(r.elapsed_s)}`
       : m ? `collisions ${formatMetric(m.collision_rate, 2)} · goals ${formatMetric(m.num_goals_reached, 1)} · red flags ${formatMetric(m.red_light_violation_rate, 2)}`
       : "no results written";
-    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : "RL only");
+    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : r.settings.robust_control ? "RL+robust" : "RL only");
     return `<div class="run ${selectedRun === r.label ? "selected" : ""}" data-label="${escapeHtml(r.label)}">
       <div class="top"><b>${escapeHtml(r.scenario)}</b><span class="badge ${r.status}">${r.status}</span></div>
       <div class="meta">${escapeHtml(r.started)} ${mode ? "· " + mode : ""}</div><div class="meta">${facts}</div></div>`;
@@ -804,14 +806,29 @@ $("evaluate").addEventListener("click", async () => {
       name: $("scenarioName").value.trim(), mppi: $("useMppi").checked,
       prediction: $("usePrediction").checked, goal_inference: $("useGoalInference").checked,
       joint_prediction: $("useJointPrediction").checked,
+      robust_prediction: $("useRobustPrediction").checked,
+      robust_control: $("useRobustControl").checked,
       capture_observations: $("captureObs").checked, goal_radius: parseFloat($("goalRadius").value),
       inferred_goal_spacing_m: parseFloat($("inferredGoalSpacing").value),
     });
     setTab("results"); showRun(label);
   } catch (e) { alert(e.message); }
 });
-$("useJointPrediction").addEventListener("change", () => { if ($("useJointPrediction").checked) $("useGoalInference").checked = true; });
-$("useGoalInference").addEventListener("change", () => { if (!$("useGoalInference").checked) $("useJointPrediction").checked = false; });
+for (const id of ["useJointPrediction", "useRobustPrediction"]) {
+  $(id).addEventListener("change", () => { if ($(id).checked) $("useGoalInference").checked = true; });
+}
+$("useRobustControl").addEventListener("change", () => {
+  if (!$("useRobustControl").checked) return;
+  $("useRobustPrediction").checked = true; $("useGoalInference").checked = true; $("useMppi").checked = false;
+});
+$("useMppi").addEventListener("change", () => { if ($("useMppi").checked) $("useRobustControl").checked = false; });
+$("useRobustPrediction").addEventListener("change", () => {
+  if (!$("useRobustPrediction").checked) $("useRobustControl").checked = false;
+});
+$("useGoalInference").addEventListener("change", () => {
+  if ($("useGoalInference").checked) return;
+  for (const id of ["useJointPrediction", "useRobustPrediction", "useRobustControl"]) $(id).checked = false;
+});
 $("tabEditor").addEventListener("click", () => setTab("editor"));
 $("tabResults").addEventListener("click", () => setTab("results"));
 $("refreshRuns").addEventListener("click", loadRuns);

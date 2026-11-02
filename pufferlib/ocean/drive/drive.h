@@ -355,6 +355,9 @@ struct Drive {
     // policy agents forward while every other actor holds its speed and steering, c_predict_end restores.
     int predict_mode;
     PredictState *predict_state;
+    // Hypothesis scene only: agent and active-agent slots its buffers hold, its source's plus the copies'.
+    int hypothesis_agent_capacity;
+    int hypothesis_active_capacity;
 };
 
 struct PredictState {
@@ -2195,6 +2198,11 @@ static bool check_moving_obb_collision(Agent *a, Agent *b, float a_disp, float b
     return false;
 }
 
+// Copies of one agent in a hypothesis scene are alternatives, not separate vehicles.
+static inline int same_vehicle(const Agent *agent, const Agent *other) {
+    return agent->hypothesis_group != 0 && agent->hypothesis_group == other->hypothesis_group;
+}
+
 static int collision_check(Drive *env, int agent_idx) {
     Agent *agent = &env->agents[agent_idx];
 
@@ -2218,7 +2226,8 @@ static int collision_check(Drive *env, int agent_idx) {
         }
 
         Agent *other_agent = &env->agents[index];
-        if (other_agent->sim_x == INVALID_POSITION || other_agent->removed || other_agent->sim_valid != 1) {
+        if (other_agent->sim_x == INVALID_POSITION || other_agent->removed || other_agent->sim_valid != 1
+            || same_vehicle(agent, other_agent)) {
             continue;
         }
 
@@ -2415,7 +2424,7 @@ static void compute_agent_ttc(Drive *env, int agent_idx) {
         } else {
             other_idx = env->static_agent_indices[j - env->active_agent_count];
         }
-        if (other_idx == agent_idx) {
+        if (other_idx == agent_idx || same_vehicle(agent, &env->agents[other_idx])) {
             continue;
         }
         compute_pairwise_ttc(agent, &env->agents[other_idx]);
@@ -5014,7 +5023,8 @@ static int write_partner_obs(
         nearby_agents[nearby_count].dist_sq = dist_sq;
         nearby_agents[nearby_count].dz = dz;
         // branchless append: self, out-of-range and corridor-hidden candidates are overwritten by the next one
-        nearby_count += (partner_scan[j].agent_idx != ego_agent_idx) & !(dist_sq > range_sq) & partner_visible;
+        nearby_count += (partner_scan[j].agent_idx != ego_agent_idx) & !(dist_sq > range_sq) & partner_visible
+            & !same_vehicle(ego, &env->agents[partner_scan[j].agent_idx]);
     }
 
     int partners_written = 0;
@@ -6211,6 +6221,130 @@ void c_predict_end(Drive *env) {
     memcpy(env->truncations, ps->saved_truncations, active_count * sizeof(unsigned char));
     memcpy(env->masks, ps->saved_masks, active_count * sizeof(unsigned char));
     *env = ps->saved_env; // scalars, rng streams, episode log and clock; predict_mode was 0 when saved
+}
+
+// ── Hypothesis scenes ────────────────────────────────────────────────────────
+// Caller buffers hold src's active agents plus ghost_capacity copies; map and scenario data stay shared with src.
+Drive *c_hypothesis_scene_create(
+    Drive *src, int ghost_capacity, float *observations, float *actions, float *rewards, unsigned char *terminals) {
+    Drive *scene = (Drive *) calloc(1, sizeof(Drive));
+    if (scene == NULL) {
+        return NULL;
+    }
+    scene->hypothesis_agent_capacity = src->num_total_agents + ghost_capacity;
+    scene->hypothesis_active_capacity = src->active_agent_count + ghost_capacity;
+    scene->observations = observations;
+    scene->actions = actions;
+    scene->rewards = rewards;
+    scene->terminals = terminals;
+    scene->agents = (Agent *) calloc(scene->hypothesis_agent_capacity, sizeof(Agent));
+    scene->active_agent_indices = (int *) calloc(scene->hypothesis_active_capacity, sizeof(int));
+    scene->logs = (Log *) calloc(scene->hypothesis_active_capacity, sizeof(Log));
+    scene->truncations = (unsigned char *) calloc(scene->hypothesis_active_capacity, sizeof(unsigned char));
+    scene->masks = (unsigned char *) calloc(scene->hypothesis_active_capacity, sizeof(unsigned char));
+    if (scene->agents == NULL || scene->active_agent_indices == NULL || scene->logs == NULL
+        || scene->truncations == NULL || scene->masks == NULL) {
+        free(scene->agents);
+        free(scene->active_agent_indices);
+        free(scene->logs);
+        free(scene->truncations);
+        free(scene->masks);
+        free(scene);
+        return NULL;
+    }
+    return scene;
+}
+
+static void free_hypothesis_scene_routes(Drive *scene) {
+    for (int i = 0; i < scene->hypothesis_agent_capacity; i++) {
+        free(scene->agents[i].route);
+        scene->agents[i].route = NULL;
+    }
+}
+
+void c_hypothesis_scene_close(Drive *scene) {
+    c_predict_end(scene);
+    free_hypothesis_scene_routes(scene);
+    free(scene->agents);
+    free(scene->active_agent_indices);
+    free(scene->logs);
+    free(scene->truncations);
+    free(scene->masks);
+    free_predict_state(scene);
+    free(scene);
+}
+
+// src's current state plus a trailing copy of active agent ghost_sources[g] per g, then a prediction rollout; -1 on failure.
+int c_hypothesis_scene_begin(Drive *scene, Drive *src, const int *ghost_sources, int ghost_count) {
+    c_predict_end(scene);
+    if (src->num_total_agents + ghost_count > scene->hypothesis_agent_capacity
+        || src->active_agent_count + ghost_count > scene->hypothesis_active_capacity) {
+        return -1;
+    }
+    free_hypothesis_scene_routes(scene);
+    Drive owned = *scene;
+    *scene = *src;
+    scene->observations = owned.observations;
+    scene->actions = owned.actions;
+    scene->rewards = owned.rewards;
+    scene->terminals = owned.terminals;
+    scene->truncations = owned.truncations;
+    scene->masks = owned.masks;
+    scene->agents = owned.agents;
+    scene->active_agent_indices = owned.active_agent_indices;
+    scene->logs = owned.logs;
+    scene->predict_state = owned.predict_state;
+    scene->hypothesis_agent_capacity = owned.hypothesis_agent_capacity;
+    scene->hypothesis_active_capacity = owned.hypothesis_active_capacity;
+    int src_active_count = src->active_agent_count;
+    scene->num_total_agents = src->num_total_agents + ghost_count;
+    scene->active_agent_count = src_active_count + ghost_count;
+    scene->num_agents = src->num_agents + ghost_count;
+    scene->logs_capacity = scene->active_agent_count;
+
+    memcpy(scene->agents, src->agents, src->num_total_agents * sizeof(Agent));
+    memcpy(scene->active_agent_indices, src->active_agent_indices, src_active_count * sizeof(int));
+    memcpy(scene->logs, src->logs, src_active_count * sizeof(Log));
+    memcpy(scene->rewards, src->rewards, src_active_count * sizeof(float));
+    memcpy(scene->terminals, src->terminals, src_active_count * sizeof(unsigned char));
+    memcpy(scene->truncations, src->truncations, src_active_count * sizeof(unsigned char));
+    memcpy(scene->masks, src->masks, src_active_count * sizeof(unsigned char));
+    for (int ghost_idx = 0; ghost_idx < ghost_count; ghost_idx++) {
+        int source_active_idx = ghost_sources[ghost_idx];
+        int source_agent_idx = src->active_agent_indices[source_active_idx];
+        int agent_idx = src->num_total_agents + ghost_idx;
+        int active_idx = src_active_count + ghost_idx;
+        scene->agents[agent_idx] = src->agents[source_agent_idx];
+        scene->agents[agent_idx].hypothesis_group = source_agent_idx + 1;
+        scene->agents[source_agent_idx].hypothesis_group = source_agent_idx + 1;
+        scene->active_agent_indices[active_idx] = agent_idx;
+        scene->logs[active_idx] = src->logs[source_active_idx];
+        scene->rewards[active_idx] = src->rewards[source_active_idx];
+        scene->terminals[active_idx] = src->terminals[source_active_idx];
+        scene->truncations[active_idx] = src->truncations[source_active_idx];
+        scene->masks[active_idx] = src->masks[source_active_idx];
+    }
+    // Routes still point at src's; each scene agent gets its own copy, as goal regeneration frees and reallocates them.
+    int route_failed = 0;
+    for (int i = 0; i < scene->num_total_agents; i++) {
+        Agent *agent = &scene->agents[i];
+        const int *src_route = agent->route;
+        agent->route = NULL;
+        if (src_route == NULL || agent->route_length <= 0 || route_failed) {
+            continue;
+        }
+        agent->route = (int *) malloc(agent->route_length * sizeof(int));
+        if (agent->route == NULL) {
+            route_failed = 1;
+            continue;
+        }
+        memcpy(agent->route, src_route, agent->route_length * sizeof(int));
+    }
+    if (route_failed) {
+        return -1;
+    }
+    compute_observations(scene);
+    return c_predict_begin(scene);
 }
 
 // ── Goal hypotheses ──────────────────────────────────────────────────────────

@@ -1020,6 +1020,11 @@ def encode_interactive_replay(scenario, replay):
     if replay.get("joint_prediction_xy") is not None:
         chunks["joint_prediction_xy_f32"] = np.asarray(replay["joint_prediction_xy"], dtype=np.float32)
         chunks["joint_prediction_ego_u8"] = np.asarray(replay["joint_prediction_ego"], dtype=np.uint8)
+    # Robust prediction per frame: (frame, active agent, route, step, xy), route 0 the agent itself, others its copies.
+    if replay.get("robust_prediction_xy") is not None:
+        chunks["robust_prediction_xy_f32"] = np.asarray(replay["robust_prediction_xy"], dtype=np.float32)
+        chunks["robust_prediction_belief_f32"] = np.asarray(replay["robust_prediction_belief"], dtype=np.float32)
+        chunks["robust_prediction_ego_u8"] = np.asarray(replay["robust_prediction_ego"], dtype=np.uint8)
 
     metadata = {
         "map_name": scenario.get("map_name", "Unknown"),
@@ -1246,7 +1251,7 @@ __PAYLOAD_CHUNKS__
         const PARTNER_BLINDNESS_OUTLINE_COLOR = "#6d28d9";
         const PHANTOM_BRAKING_OUTLINE_COLOR = "#b45309";
         const INFRACTION_METRIC_COUNT = 4;
-        const DEFAULT_GOAL_RADIUS_METERS = 2, GOAL_MERGE_M = 1, GOAL_MIN_ALPHA = .08, GOAL_MIN_SIZE_FRACTION = .15;
+        const DEFAULT_GOAL_RADIUS_METERS = 2, GOAL_MERGE_M = 1, GOAL_MIN_ALPHA = .08, GOAL_MIN_SIZE_FRACTION = .15, ROBUST_MIN_ALPHA = .2;
         const SVG_PLAY = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M4.5 2.5v11l9-5.5z" fill="currentColor"/></svg>';
         const SVG_PAUSE = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M4 2.5h3v11H4zM9 2.5h3v11H9z" fill="currentColor"/></svg>';
         let H, C = {}, F, paths = {0:new Path2D(),1:new Path2D(),2:new Path2D()}, roadPathsById = new Map(), lastDrawn = -1;
@@ -1257,7 +1262,7 @@ __PAYLOAD_CHUNKS__
         let cam = {x:0,y:0,z:5,drag:false,lx:0,ly:0,cz:0,yaw:0,pitch:0,zx:1};
         let viewMode = '2d', rotateMode = false, dragMode = null, lastTarget = null, mapLayer = null, mapLayerKey = '', mapZMean = 0, RP = 2, roadRangesById = new Map();
         const FOV_DEG = 50, NEAR_FRACTION = 0.05, MAX_PITCH = 80 * Math.PI / 180, DEFAULT_PITCH = 55 * Math.PI / 180, ORBIT_RAD_PER_PX = 0.008, KEY_ROTATE_STEP = 5 * Math.PI / 180, AGENT_PICK_PX = 18;
-        let followedId = null, isEgoCam = false, darkMode = false, showGhost = false, ghostPaths = [], showPrediction = true, showMppi = true, showGoalBelief = true, showJointPrediction = true;
+        let followedId = null, isEgoCam = false, darkMode = false, showGhost = false, ghostPaths = [], showPrediction = true, showMppi = true, showGoalBelief = true, showJointPrediction = true, showRobustPrediction = true;
         const OBS_ZOOM_DEFAULT = 2.2, OBS_ZOOM_MIN = .45, OBS_ZOOM_MAX = 8;
         let obsZoom = OBS_ZOOM_DEFAULT, obsExpanded = false, obsMode = 2, obsShowLimits = true;
         let expertAgentIndices = new Set();
@@ -1530,23 +1535,45 @@ self.onmessage = async event => {
             if (showMppi && C.mppi_xy_f32) drawAgentPaths(f, C.mppi_xy_f32, H.chunks.mppi_xy_f32.shape, '#16a34a');
             if (showGoalBelief && C.inferred_goal_belief_f32) drawGoalBeliefs(f);
             if (showJointPrediction && C.joint_prediction_xy_f32) drawJointPredictions(f);
+            if (showRobustPrediction && C.robust_prediction_xy_f32) drawRobustPredictions(f);
+        }
+        function drawPredictedPath(a, P, base, S, unit) {
+            // Path of S points from agent a in its color with a dot at each whole second when the rollout dt is known.
+            const dt = H.joint_prediction_dt;
+            ctx.strokeStyle = a.c; ctx.fillStyle = a.c;
+            ctx.beginPath(); ctx.moveTo(a.x, a.y);
+            for (let s=0;s<S;s++) ctx.lineTo(P[base+2*s], P[base+2*s+1]);
+            ctx.stroke();
+            // Point s lies (s+1)*dt ahead; whole seconds fall between points, so interpolate.
+            for (let t=1; dt && t<=S*dt+1e-6; t++) {
+                const u = t/dt - 1, s0 = Math.min(Math.floor(u + 1e-6), S-1), s1 = Math.min(s0+1, S-1), w = Math.max(0, u - s0);
+                const x0 = s0 < 0 ? a.x : P[base+2*s0], y0 = s0 < 0 ? a.y : P[base+2*s0+1];
+                ctx.beginPath(); ctx.arc(x0 + w*(P[base+2*s1]-x0), y0 + w*(P[base+2*s1+1]-y0), .8*unit, 0, 7); ctx.fill();
+            }
         }
         function drawJointPredictions(f) {
-            // Joint rollout from this frame in each vehicle's color, the ego thicker, with a dot at each whole second when dt is known.
-            const [, N, S] = H.chunks.joint_prediction_xy_f32.shape, unit = Math.max(.3, 2.5/cam.z), dt = H.joint_prediction_dt, P = C.joint_prediction_xy_f32;
+            // Joint rollout from this frame, the ego thicker.
+            const [, N, S] = H.chunks.joint_prediction_xy_f32.shape, unit = Math.max(.3, 2.5/cam.z);
             ctx.save(); ctx.setLineDash([]); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
             for (const a of getFrameAgents(f)) {
                 if (a.slot < 0 || a.slot >= N) continue;
-                const ego = C.joint_prediction_ego_u8[f*N + a.slot] === 1, base = (f*N + a.slot)*S*2;
-                ctx.strokeStyle = a.c; ctx.fillStyle = a.c; ctx.lineWidth = ego ? 1.6*unit : unit;
-                ctx.beginPath(); ctx.moveTo(a.x, a.y);
-                for (let s=0;s<S;s++) ctx.lineTo(P[base+2*s], P[base+2*s+1]);
-                ctx.stroke();
-                // Point s lies (s+1)*dt ahead; whole seconds fall between points, so interpolate.
-                for (let t=1; dt && t<=S*dt+1e-6; t++) {
-                    const u = t/dt - 1, s0 = Math.min(Math.floor(u + 1e-6), S-1), s1 = Math.min(s0+1, S-1), w = Math.max(0, u - s0);
-                    const x0 = s0 < 0 ? a.x : P[base+2*s0], y0 = s0 < 0 ? a.y : P[base+2*s0+1];
-                    ctx.beginPath(); ctx.arc(x0 + w*(P[base+2*s1]-x0), y0 + w*(P[base+2*s1+1]-y0), .8*unit, 0, 7); ctx.fill();
+                ctx.lineWidth = C.joint_prediction_ego_u8[f*N + a.slot] === 1 ? 1.6*unit : unit;
+                drawPredictedPath(a, C.joint_prediction_xy_f32, (f*N + a.slot)*S*2, S, unit);
+            }
+            ctx.restore();
+        }
+        function drawRobustPredictions(f) {
+            // Robust rollout from this frame: every kept route of each agent, opacity by belief, the ego's plan thicker.
+            const [, N, R, S] = H.chunks.robust_prediction_xy_f32.shape, unit = Math.max(.3, 2.5/cam.z);
+            ctx.save(); ctx.setLineDash([]); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            for (const a of getFrameAgents(f)) {
+                if (a.slot < 0 || a.slot >= N) continue;
+                ctx.lineWidth = C.robust_prediction_ego_u8[f*N + a.slot] === 1 ? 1.6*unit : unit;
+                for (let r=0;r<R;r++) {
+                    const belief = C.robust_prediction_belief_f32[(f*N + a.slot)*R + r];
+                    if (belief <= 0) continue;
+                    ctx.globalAlpha = ROBUST_MIN_ALPHA + (1 - ROBUST_MIN_ALPHA) * Math.min(1, belief);
+                    drawPredictedPath(a, C.robust_prediction_xy_f32, ((f*N + a.slot)*R + r)*S*2, S, unit);
                 }
             }
             ctx.restore();
@@ -1617,7 +1644,7 @@ self.onmessage = async event => {
         function toggleObsLimits(e){ if(e) e.stopPropagation(); obsShowLimits=!obsShowLimits; document.getElementById('obsLimitBtn').classList.toggle('on', obsShowLimits); draw(true); }
         function toggleObsSize(e){ if(e) e.stopPropagation(); const p=document.getElementById('obs-container'), b=e ? e.currentTarget : null; obsExpanded=!obsExpanded; p.style.width=obsExpanded?'680px':'390px'; p.style.height=obsExpanded?'680px':'390px'; if(b) b.textContent=obsExpanded?'Collapse':'Expand'; resizeObsCanvas(); draw(true); }
         function searchAgent(){ const id=parseInt(document.getElementById('agentSearch').value); if(!isNaN(id)){ followedId=id; play=false; updateBtn(); draw(true); } }
-        document.addEventListener('keydown', e => { if(!H || e.target.tagName === 'INPUT') return; if(e.code === 'Space'){ toggle(); e.preventDefault(); } if(e.code === 'ArrowRight'){ play=false; updateBtn(); step=Math.min(step+1,frameMax()); draw(true); } if(e.code === 'ArrowLeft'){ play=false; updateBtn(); step=Math.max(step-1,0); draw(true); } if(e.code === 'Escape'){ followedId=null; isEgoCam=false; updateUI(); draw(true); } if(e.code === 'KeyG'){ showGhost=!showGhost; draw(true); } if(e.code === 'KeyP'){ showPrediction=!showPrediction; draw(true); } if(e.code === 'KeyM'){ showMppi=!showMppi; draw(true); } if(e.code === 'KeyB'){ showGoalBelief=!showGoalBelief; draw(true); } if(e.code === 'KeyJ'){ showJointPrediction=!showJointPrediction; draw(true); } if(e.code === 'KeyV'){ toggleView(); } if(e.code === 'KeyR'){ toggleRotateMode(); } if(e.code === 'KeyT'){ topView(); } if(is3D() && (e.code === 'KeyQ' || e.code === 'KeyE')){ cam.yaw += (e.code === 'KeyQ' ? -1 : 1) * KEY_ROTATE_STEP; updateViewBar(); draw(true); } if(is3D() && (e.code === 'KeyW' || e.code === 'KeyS')){ cam.pitch = Math.max(0, Math.min(MAX_PITCH, cam.pitch + (e.code === 'KeyW' ? 1 : -1) * KEY_ROTATE_STEP)); updateViewBar(); draw(true); } });
+        document.addEventListener('keydown', e => { if(!H || e.target.tagName === 'INPUT') return; if(e.code === 'Space'){ toggle(); e.preventDefault(); } if(e.code === 'ArrowRight'){ play=false; updateBtn(); step=Math.min(step+1,frameMax()); draw(true); } if(e.code === 'ArrowLeft'){ play=false; updateBtn(); step=Math.max(step-1,0); draw(true); } if(e.code === 'Escape'){ followedId=null; isEgoCam=false; updateUI(); draw(true); } if(e.code === 'KeyG'){ showGhost=!showGhost; draw(true); } if(e.code === 'KeyP'){ showPrediction=!showPrediction; draw(true); } if(e.code === 'KeyM'){ showMppi=!showMppi; draw(true); } if(e.code === 'KeyB'){ showGoalBelief=!showGoalBelief; draw(true); } if(e.code === 'KeyU'){ showRobustPrediction=!showRobustPrediction; draw(true); } if(e.code === 'KeyJ'){ showJointPrediction=!showJointPrediction; draw(true); } if(e.code === 'KeyV'){ toggleView(); } if(e.code === 'KeyR'){ toggleRotateMode(); } if(e.code === 'KeyT'){ topView(); } if(is3D() && (e.code === 'KeyQ' || e.code === 'KeyE')){ cam.yaw += (e.code === 'KeyQ' ? -1 : 1) * KEY_ROTATE_STEP; updateViewBar(); draw(true); } if(is3D() && (e.code === 'KeyW' || e.code === 'KeyS')){ cam.pitch = Math.max(0, Math.min(MAX_PITCH, cam.pitch + (e.code === 'KeyW' ? 1 : -1) * KEY_ROTATE_STEP)); updateViewBar(); draw(true); } });
         c.addEventListener('contextmenu', e => e.preventDefault());
         c.onwheel = e => { e.preventDefault(); const factor = Math.exp(-e.deltaY * .001); if (is3D()) { const r=c.getBoundingClientRect(), sx=e.clientX-r.left, sy=e.clientY-r.top; setProjection(lastTarget); const before = groundOffset(sx, sy); cam.z *= factor; const after = groundOffset(sx, sy); if (before && after && followedId === null) { cam.x += before[0]-after[0]; cam.y += before[1]-after[1]; } } else cam.z *= factor; draw(true); };
         c.onmousedown = e => { if(!H) return; const r=c.getBoundingClientRect(), sx=e.clientX-r.left, sy=e.clientY-r.top; const orbit = e.button === 1 || e.button === 2 || e.shiftKey || (rotateMode && e.button === 0); if (orbit) { e.preventDefault(); if (!is3D()) enter3D(); dragMode='orbit'; cam.drag=true; cam.lx=e.clientX; cam.ly=e.clientY; draw(true); return; } if (e.button !== 0) return; const hit = pickAgent(sx, sy); if(hit !== null){ followedId=hit; cam.drag=false; } else { followedId=null; isEgoCam=false; dragMode='pan'; cam.drag=true; cam.lx=e.clientX; cam.ly=e.clientY; if (is3D()) { setProjection(null); cam.g0 = groundOffset(sx, sy); cam.t0 = [cam.x, cam.y]; } } draw(true); };

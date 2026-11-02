@@ -474,6 +474,8 @@ class Drive(pufferlib.PufferEnv):
 
         self.num_agents = num_agents
         self.c_envs = None
+        self._hypothesis_scenes = None
+        self._hypothesis_key = None
         if config_only:
             return
 
@@ -749,6 +751,8 @@ class Drive(pufferlib.PufferEnv):
                 if self.current_num_eval_scenarios == 0:
                     self._eval_exhausted = True
                     return (self.observations, self.rewards, self.terminals, self.truncations, info)
+                # Scenes point into the closing envs' map data, and a new handle may reuse the old address.
+                self.hypothesis_scene_close()
                 binding.vec_close(self.c_envs)
                 # Pairs already replayed this sweep; slice the rest so a deferred
                 # scene resumes exactly where the previous batch stopped.
@@ -834,6 +838,70 @@ class Drive(pufferlib.PufferEnv):
     def predict_record_obstacles(self):
         """Record every collision candidate's pose after the latest predict_step, for mppi_rollout_costs."""
         binding.vec_predict_record_obstacles(self.c_envs)
+
+    def hypothesis_scene_begin(self, ghost_sources):
+        """Copy every env into a hypothesis scene with one extra copy of each active row in ghost_sources and start
+        its prediction rollout; copies of one agent neither see nor hit each other.
+
+        ghost_sources holds one array of env-local active rows per env. A scene's active agents are its env's,
+        then the copies in order; returns each one's row in scene_observations / scene_actions.
+        """
+        active_counts = np.diff(self.agent_offsets).astype(np.int64)
+        ghost_counts = np.array([len(sources) for sources in ghost_sources], dtype=np.int32)
+        ghost_capacity = max(1, int(ghost_counts.max()))
+        scene_key = (self.c_envs, tuple(active_counts))
+        if (
+            self._hypothesis_key is None
+            or self._hypothesis_key[0] != scene_key
+            or self._hypothesis_key[1] < ghost_capacity
+        ):
+            self.hypothesis_scene_close()
+            row_count = int(active_counts.sum()) + len(active_counts) * ghost_capacity
+            self.scene_observations = np.zeros((row_count, self.observations.shape[1]), dtype=np.float32)
+            self.scene_actions = np.zeros((row_count, 2), dtype=np.float32)
+            self.scene_rewards = np.zeros(row_count, dtype=np.float32)
+            self.scene_terminals = np.zeros(row_count, dtype=np.uint8)
+            self._hypothesis_scenes = binding.vec_hypothesis_scene_create(
+                self.c_envs,
+                ghost_capacity,
+                self.scene_observations,
+                self.scene_actions,
+                self.scene_rewards,
+                self.scene_terminals,
+            )
+            self._hypothesis_key = (scene_key, ghost_capacity)
+        ghost_capacity = self._hypothesis_key[1]
+        sources = np.zeros((len(active_counts), ghost_capacity), dtype=np.int32)
+        for env_idx, env_sources in enumerate(ghost_sources):
+            sources[env_idx, : len(env_sources)] = env_sources
+        binding.vec_hypothesis_scene_begin(self._hypothesis_scenes, self.c_envs, sources, ghost_counts)
+        block_starts = np.concatenate([[0], np.cumsum(active_counts + ghost_capacity)[:-1]])
+        return np.concatenate(
+            [
+                start + np.arange(count + ghosts)
+                for start, count, ghosts in zip(block_starts, active_counts, ghost_counts)
+            ]
+        )
+
+    def hypothesis_scene_set_dt(self, dt_seconds):
+        binding.vec_predict_set_dt(self._hypothesis_scenes, dt_seconds)
+
+    def hypothesis_scene_set_goals(self, goals, counts):
+        """Like predict_set_goals, over the scene's active agents in hypothesis_scene_begin's order."""
+        binding.vec_predict_set_goals(self._hypothesis_scenes, goals, counts)
+
+    def hypothesis_scene_step(self, actions, scene_rows):
+        self.scene_actions[scene_rows] = actions
+        binding.vec_step(self._hypothesis_scenes)
+
+    def get_hypothesis_scene_agent_xy(self, out):
+        binding.vec_get_active_agent_xy(self._hypothesis_scenes, out)
+
+    def hypothesis_scene_close(self):
+        if self._hypothesis_scenes is not None:
+            binding.vec_hypothesis_scene_close(self._hypothesis_scenes)
+        self._hypothesis_scenes = None
+        self._hypothesis_key = None
 
     def mppi_prepare(self, nominal_actions):
         """Floor speeds at 0 while the (active, steps, 2) policy plan drives forward; lift rested-at stop zones."""
@@ -1212,6 +1280,7 @@ class Drive(pufferlib.PufferEnv):
             self._preloaded_map_cache_kwargs = None
         if self.c_envs is None:
             return
+        self.hypothesis_scene_close()
         binding.vec_close(self.c_envs)
         self.c_envs = None
 
