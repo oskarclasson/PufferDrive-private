@@ -14,12 +14,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "data_utils"))
 from mirror_map_bin import read_bin, write_bin  # noqa: E402
 
+from pufferlib.ocean.drive.route_graph import DRIVABLE_LANE_TYPES, ROUTE_LANE_MAX_HEADING_DIFF_RAD
+
 VEHICLE_TYPE = 1
 TRAFFIC_LIGHT_TYPE = 1
 LIGHT_STATE_RED = 1
 LIGHT_STATE_YELLOW = 2
 LIGHT_STATE_GREEN = 3
-DRIVABLE_LANE_TYPES = (1, 2)
 LANE_TYPE_MAX = 9
 ROAD_LINE_TYPE_MAX = 19
 ROAD_EDGE_TYPE_MAX = 29
@@ -34,7 +35,8 @@ MAX_SPEED_MPS = 40.0
 MAX_VEHICLE_DIMENSION_M = 30.0
 MIN_VEHICLE_DIMENSION_M = 0.1
 MAX_LIGHT_PHASE_SECONDS = 300.0
-ROUTE_LANE_MAX_HEADING_DIFF_RAD = math.pi / 2
+MIN_GOAL_SPACING_M = 5.0
+MAX_GOAL_SPACING_M = 200.0
 LIGHT_MODES = ("log", "red", "green", "cycle_green", "cycle_red")
 
 
@@ -86,7 +88,12 @@ def validate_spec(spec):
                 raise ScenarioSpecError(f"actors[{actor_idx}].goals[{goal_idx}] must be [x, y]")
             name = f"actors[{actor_idx}].goals[{goal_idx}]"
             actor["goals"].append((_finite(goal[0], name), _finite(goal[1], name)))
+        if not isinstance(entry.get("ego", False), bool):
+            raise ScenarioSpecError(f"actors[{actor_idx}].ego must be true or false")
+        actor["ego"] = entry.get("ego", False)
         actors.append(actor)
+    if sum(actor["ego"] for actor in actors) > 1:
+        raise ScenarioSpecError("at most one actor can be the ego")
     obstacles = [_validate_box(entry, f"obstacles[{idx}]") for idx, entry in enumerate(obstacles_in)]
     lights_in = spec.get("lights", {})
     if not isinstance(lights_in, dict):

@@ -20,6 +20,7 @@ import random
 import shutil
 import subprocess
 import importlib
+import math
 import platform
 import shlex
 from datetime import datetime
@@ -37,6 +38,8 @@ import torch.distributed
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import pufferlib
+from pufferlib.ocean.drive import binding as drive_binding
+from pufferlib.ocean.drive import route_graph as drive_route_graph
 from pufferlib.ocean.evaluation_utils import evaluation_utils as drive_benchmark
 from pufferlib.ocean.evaluation_utils import eval_replay as drive_eval_replay
 from pufferlib.ocean.evaluation_utils import cosim_evaluator as drive_cosim_eval
@@ -100,6 +103,10 @@ PROFILE_ACK_ENV = "PUFFER_PROFILE_ACK"
 PROFILE_ACK = b"ack\n\0"
 # Sim-only profiles define a cycle as a fixed number of environment steps.
 PROFILE_SIM_STEPS_PER_CYCLE = 16_384
+GOAL_NEW_BRANCH_MIN_BELIEF = 0.1
+GOAL_CONTINUE_M = 3.0
+JOINT_PREDICTION_INVALID_M = 1e4  # magnitude of constants.h INVALID_POSITION
+JOINT_PREDICTION_MAX_SPEED_MPS = 20.0  # sizes the goal list so it lasts the whole horizon
 
 
 def torch_device(device):
@@ -2375,15 +2382,29 @@ def _run_eval_rollout(
     mppi_steps = int(round(args["eval"]["mppi_horizon_s"] / args["env"]["dt"])) if mppi_samples else 0
     if mppi_samples and mppi_steps == 0:
         raise pufferlib.APIUsageError("eval.mppi_horizon_s must cover at least one env step")
+    tts_steps = round(args["eval"]["tts_horizon_s"] / args["env"]["dt"]) if args["eval"]["tts"] else 0
+    if args["eval"]["tts"] and tts_steps == 0:
+        raise pufferlib.APIUsageError("eval.tts_horizon_s must cover at least one env step")
+    if tts_steps and mppi_samples:
+        raise pufferlib.APIUsageError("eval.tts and eval.mppi_samples are alternative action filters; enable one")
     rollout_steps = max(predict_steps, mppi_steps)
-    if rollout_steps and args["train"].get("use_rnn", False):
-        raise pufferlib.APIUsageError("eval.predict_horizon_s and eval.mppi_samples do not support recurrent policies")
+    goal_inference = args["eval"]["goal_inference"]
+    joint_prediction_steps = (
+        round(args["eval"]["joint_prediction_horizon_s"] / args["env"]["dt"]) if args["eval"]["joint_prediction"] else 0
+    )
+    if joint_prediction_steps and not goal_inference:
+        raise pufferlib.APIUsageError("eval.joint_prediction needs eval.goal_inference for the other agents' goals")
+    snapshot_access = rollout_steps or tts_steps or goal_inference
+    if snapshot_access and args["train"].get("use_rnn", False):
+        raise pufferlib.APIUsageError(
+            "eval.predict_horizon_s, eval.mppi_samples, eval.tts and eval.goal_inference do not support recurrent policies"
+        )
     vecenv = pufferlib.vector.make(
         [make_env] * num_workers,
         env_args=[[]] * num_workers,
         env_kwargs=worker_env_kwargs,
         # Prediction rollouts snapshot and step the worker envs directly, so they must live in this process.
-        backend="Serial" if rollout_steps else "Multiprocessing",
+        backend="Serial" if snapshot_access else "Multiprocessing",
         num_envs=num_workers,
         num_workers=num_workers,
         batch_size=num_workers,
@@ -2435,6 +2456,8 @@ def _run_eval_rollout(
         discrete_policy_on_continuous_env = env_continuous and not uncompiled_policy.is_continuous
         if mppi_samples and not env_continuous:
             raise pufferlib.APIUsageError("eval.mppi_samples requires a continuous action env")
+        if tts_steps and not env_continuous:
+            raise pufferlib.APIUsageError("eval.tts requires a continuous action env")
         device = torch_device(args["train"]["device"])
         use_bfloat16 = args["train"]["precision"] == "bfloat16" and is_cuda_device(device)
         if use_bfloat16 and not torch.cuda.is_bf16_supported():
@@ -2512,7 +2535,7 @@ def _run_eval_rollout(
             return raw_action, action, logits, value, logprob, entropy
 
         agent_ranges = []
-        if rollout_steps:
+        if snapshot_access:
             agent_start = 0
             for worker_env in vecenv.envs:
                 agent_ranges.append((worker_env, agent_start, agent_start + worker_env.num_agents))
@@ -2558,6 +2581,7 @@ def _run_eval_rollout(
             args["eval"]["mppi_collision_weight"],
             args["eval"]["mppi_control_zone_weight"],
             args["eval"]["mppi_stop_approach_weight"],
+            args["eval"]["mppi_speed_limit_weight"],
         )
 
         def score_action_sequences(sample_actions):
@@ -2594,20 +2618,397 @@ def _run_eval_rollout(
             _, plan_xy = score_action_sequences(np.ascontiguousarray(plan[:, None]))
             return plan[:, 0], plan_xy[:, 0]
 
+        tts_rng = np.random.default_rng(rollout_seed)
+        tts_noise_std = np.array(
+            [args["eval"]["tts_jerk_noise_std"], args["eval"]["tts_steer_noise_std"]], dtype=np.float32
+        )
+        tts_noise_steps = min(args["eval"]["tts_noise_steps"], tts_steps)
+        tts_discounts = args["train"]["gamma"] ** np.arange(tts_steps + 1, dtype=np.float32)
+
+        def infer_candidates(candidate_obs):
+            """Continuation actions and values for candidate rollouts, unpadded since replays never record them."""
+            with torch.no_grad(), eval_amp_context:
+                logits, value = policy_forward_eval(torch.as_tensor(candidate_obs, device=device))
+                *_, continuous_action = eval_sample_logits(
+                    logits, action_selection=action_selection, env_continuous=env_continuous, policy=uncompiled_policy
+                )
+            action = np.clip(
+                continuous_action.float().cpu().numpy(), vecenv.single_action_space.low, vecenv.single_action_space.high
+            )
+            return action, value.reshape(-1).float().cpu().numpy()
+
+        def tts_plan(nominal_action):
+            """Score the policy (candidate 0) against Gaussian-perturbed rollouts by discounted reward plus value.
+
+            Every (searched agent, candidate) pair rolls out in its own env clone, batched into one policy call per
+            step, with only that agent driving while every other actor holds its speed and steering. Returns the action
+            to execute and the candidates' (agents, candidates, steps, 2) paths, best candidate (-1: not searched) and
+            switch flag.
+            """
+            candidate_count = 1 + args["eval"]["tts_samples"]
+            action_low, action_high = vecenv.single_action_space.low, vecenv.single_action_space.high
+            # Noise on top of the policy's own action for the first noise steps; candidate 0 stays the policy's.
+            candidate_noise = np.zeros((agents_per_batch, candidate_count, tts_noise_steps, 2), dtype=np.float32)
+            candidate_noise[:, 1:] = (
+                tts_rng.standard_normal((agents_per_batch, candidate_count - 1, tts_noise_steps, 2), dtype=np.float32)
+                * tts_noise_std
+            )
+            candidate_actions = np.clip(nominal_action[:, None] + candidate_noise[:, :, 0], action_low, action_high)
+            candidate_returns = np.zeros((agents_per_batch, candidate_count), dtype=np.float32)
+            candidate_xy = np.zeros((agents_per_batch, candidate_count, tts_steps, 2), dtype=np.float32)
+            rollouts = []
+            searched_agent_rows = []
+            for worker_env, start, _ in agent_ranges:
+                active_count = int(worker_env.agent_offsets[-1])
+                searched = np.ones(active_count, dtype=bool)
+                if args["eval"]["ego_agent_id"] is not None:
+                    searched = worker_env.get_active_agent_ids() == args["eval"]["ego_agent_id"]
+                if not searched.any():
+                    continue
+                ego_slots = worker_env.clone_predict_begin(candidate_count, searched)
+                slot_count = int(ego_slots.max()) + 1
+                local_rows = np.flatnonzero(searched)
+                searched_agent_rows.append(start + local_rows)
+                first_action = np.empty((slot_count, candidate_count, active_count, 2), dtype=np.float32)
+                first_action[:] = candidate_actions[start : start + active_count].transpose(1, 0, 2)
+                clone_noise = np.empty(
+                    (tts_noise_steps, slot_count, candidate_count, active_count, 2), dtype=np.float32
+                )
+                clone_noise[:] = candidate_noise[start : start + active_count].transpose(2, 1, 0, 3)[:, None]
+                rollouts.append(
+                    {
+                        "env": worker_env,
+                        "rows": start + local_rows,
+                        "local_rows": local_rows,
+                        # Clone rows are (ego slot, candidate, active row); a searched row reads its own clones only.
+                        "ego_slots": ego_slots[local_rows],
+                        "shape": (slot_count, candidate_count, active_count),
+                        "action": first_action.reshape(-1, 2),
+                        "noise": clone_noise.reshape(tts_noise_steps, -1, 2),
+                        "return": np.zeros(first_action.shape[:3], dtype=np.float32).reshape(-1),
+                        "alive": np.ones(first_action.shape[:3], dtype=np.float32).reshape(-1),
+                        "xy": np.zeros((first_action.shape[0] * candidate_count * active_count, 2), dtype=np.float32),
+                    }
+                )
+            best_candidate = np.full(agents_per_batch, -1, dtype=np.int16)
+            if not rollouts:
+                return nominal_action, candidate_xy, best_candidate, np.zeros(agents_per_batch, dtype=np.uint8)
+            for rollout_step in range(tts_steps):
+                for rollout in rollouts:
+                    rollout["env"].clone_step(rollout["action"])
+                    # A terminal transition keeps its own reward; later rewards and the bootstrap are masked.
+                    rollout["return"] += rollout["alive"] * tts_discounts[rollout_step] * rollout["env"].clone_rewards
+                    rollout["alive"] *= 1.0 - rollout["env"].clone_terminals
+                    rollout["env"].get_clone_agent_xy(rollout["xy"])
+                    step_xy = rollout["xy"].reshape(*rollout["shape"], 2)
+                    candidate_xy[rollout["rows"], :, rollout_step] = step_xy[
+                        rollout["ego_slots"], :, rollout["local_rows"]
+                    ]
+                next_action, value = infer_candidates(
+                    np.concatenate([rollout["env"].clone_observations for rollout in rollouts])
+                )
+                split_points = np.cumsum([len(rollout["action"]) for rollout in rollouts])[:-1]
+                for rollout, action, rollout_value in zip(
+                    rollouts, np.split(next_action, split_points), np.split(value, split_points)
+                ):
+                    if rollout_step + 1 < tts_noise_steps:
+                        action = np.clip(action + rollout["noise"][rollout_step + 1], action_low, action_high)
+                    rollout["action"] = np.ascontiguousarray(action, dtype=np.float32)
+                    rollout["value"] = rollout_value
+            for rollout in rollouts:
+                rollout["return"] += rollout["alive"] * tts_discounts[tts_steps] * rollout["value"]
+                returns = rollout["return"].reshape(rollout["shape"])
+                candidate_returns[rollout["rows"]] = returns[rollout["ego_slots"], :, rollout["local_rows"]]
+            searched_rows = np.concatenate(searched_agent_rows)
+            best_candidate[searched_rows] = 1 + np.argmax(candidate_returns[searched_rows, 1:], axis=1)
+            switched = np.zeros(agents_per_batch, dtype=bool)
+            switched[searched_rows] = candidate_returns[searched_rows, best_candidate[searched_rows]] > (
+                candidate_returns[searched_rows, 0] + args["eval"]["tts_switch_margin"]
+            )
+            agent_rows = np.arange(agents_per_batch)
+            action = np.where(switched[:, None], candidate_actions[agent_rows, best_candidate], nominal_action)
+            return action.astype(np.float32), candidate_xy, best_candidate, switched.astype(np.uint8)
+
+        goal_hypothesis_count = args["eval"]["goal_inference_hypotheses"]
+        goal_spacing_m = args["eval"]["goal_inference_goal_spacing_m"]
+        goal_count = args["env"]["num_goals"]
+        goal_update_steps = max(1, round(args["eval"]["goal_inference_update_s"] / args["env"]["dt"]))
+        goal_beliefs = {}
+        route_graphs = {}
+
+        def route_graph(map_path):
+            if map_path not in route_graphs:
+                from data_utils import mirror_map_bin
+
+                route_graphs[map_path] = drive_route_graph.RouteGraph(mirror_map_bin.read_bin(map_path)["roads"])
+            return route_graphs[map_path]
+
+        def distance_to_path_m(point, path):
+            """Distance from a point to the polyline through path's (n, 2) points."""
+            starts, ends = path[:-1], path[1:]
+            segment = ends - starts
+            along = np.clip(
+                np.einsum("ij,ij->i", point - starts, segment)
+                / np.maximum(np.einsum("ij,ij->i", segment, segment), 1e-9),
+                0.0,
+                1.0,
+            )
+            return float(np.min(np.linalg.norm(starts + along[:, None] * segment - point, axis=1)))
+
+        def carry_belief(old_last_goals, old_belief, new_paths):
+            """Split each old hypothesis' belief over the new ones continuing it, each new one taking the old hypothesis
+            whose farthest goal its path passes closest.
+
+            A fork that came into range shares its parent's belief, but the critic has not judged its branches yet, so
+            they and branches continuing no old hypothesis start with at least GOAL_NEW_BRANCH_MIN_BELIEF.
+            """
+            if not len(old_last_goals):
+                return np.full(len(new_paths), 1.0 / len(new_paths), dtype=np.float32)
+            carried = np.zeros(len(new_paths), dtype=np.float32)
+            gap_m = np.array([[distance_to_path_m(goal, path) for goal in old_last_goals] for path in new_paths])
+            parent = np.where(gap_m.min(axis=1) < GOAL_CONTINUE_M, gap_m.argmin(axis=1), -1)
+            children = np.bincount(parent[parent >= 0], minlength=len(old_last_goals))
+            continued = parent >= 0
+            carried[continued] = old_belief[parent[continued]] / children[parent[continued]]
+            carried /= max(carried.sum(), 1e-12)
+            fork_branch = ~continued | (children[np.maximum(parent, 0)] > 1)
+            carried[fork_branch] = np.maximum(carried[fork_branch], GOAL_NEW_BRANCH_MIN_BELIEF)
+            return carried / max(carried.sum(), 1e-12)
+
+        def new_goal_belief_state(worker_env, active_count):
+            shape = (active_count, goal_hypothesis_count)
+            return {
+                "key": (worker_env.c_envs, active_count),
+                "goals": np.zeros((*shape, goal_count, 4), dtype=np.float32),
+                "goal_total": np.zeros(shape, dtype=np.int64),
+                "next_goal": np.zeros(shape, dtype=np.int64),
+                "belief": np.zeros(shape, dtype=np.float32),
+                "value": np.zeros(shape, dtype=np.float32),
+                "has_value": np.zeros(shape, dtype=bool),
+                "xy": np.zeros((active_count, 2), dtype=np.float32),
+                "steps_since_update": np.zeros(active_count, dtype=np.int64),
+                "has_xy": False,
+                "obs": np.zeros((*shape, worker_env.observations.shape[1]), dtype=np.float32),
+            }
+
+        def row_route_graphs(worker_env, rows):
+            """Each row's map route graph, world pose (x, y, heading) and world-minus-sim offset."""
+            world = worker_env.get_global_agent_state()
+            sim_xy = np.zeros((int(worker_env.agent_offsets[-1]), 2), dtype=np.float32)
+            worker_env.get_active_agent_xy(sim_xy)
+            env_of_row = np.searchsorted(worker_env.agent_offsets, rows, side="right") - 1
+            return [
+                (
+                    route_graph(worker_env.map_files[worker_env.map_ids[env_idx]]),
+                    (world["x"][row], world["y"][row], world["heading"][row]),
+                    np.array([world["x"][row], world["y"][row]]) - sim_xy[row],
+                )
+                for row, env_idx in zip(rows, env_of_row)
+            ]
+
+        def branch_hypotheses(worker_env, rows):
+            """Goals along every way ahead of each agent in rows from the map's route graph, in the sim frame."""
+            new_goals = np.zeros((len(rows), goal_hypothesis_count, goal_count, 4), dtype=np.float32)
+            new_total = np.zeros((len(rows), goal_hypothesis_count), dtype=np.int64)
+            for out_idx, (graph, pose, offset) in enumerate(row_route_graphs(worker_env, rows)):
+                try:
+                    branches = graph.branch_goals(*pose, goal_spacing_m, goal_count, goal_hypothesis_count)
+                except drive_route_graph.RouteError:
+                    continue
+                for k, goals in enumerate(branches):
+                    goals = np.asarray(goals, dtype=np.float32)
+                    goals[:, :2] -= offset
+                    new_goals[out_idx, k, : len(goals)] = goals
+                    new_total[out_idx, k] = len(goals)
+            return new_goals, new_total
+
+        def update_goal_beliefs():
+            """Advance each active agent's belief over the ways ahead of it by the critic advantage of its last move.
+
+            Hypotheses come from the map's route graph: goals spaced along every branch ahead, re-placed every update
+            period and once a reached goal leaves no full window. Like the env, reaching a goal pays the goal reward.
+            Returns the (agents, hypotheses, window goals, 2) goal windows, the (agents, hypotheses) belief, and the
+            likeliest hypothesis' (agents, window goals, 4) goal window with its (agents,) goal count.
+            """
+            belief_out = np.zeros((agents_per_batch, goal_hypothesis_count), dtype=np.float32)
+            goals_out = np.zeros((agents_per_batch, goal_hypothesis_count, goal_count, 2), dtype=np.float32)
+            likeliest_goals = np.zeros((agents_per_batch, goal_count, 4), dtype=np.float32)
+            likeliest_count = np.zeros(agents_per_batch, dtype=np.int32)
+            for worker_idx, (worker_env, start, _) in enumerate(agent_ranges):
+                active_count = int(worker_env.agent_offsets[-1])
+                state = goal_beliefs.get(worker_idx)
+                if state is None or state["key"] != (worker_env.c_envs, active_count):
+                    state = new_goal_belief_state(worker_env, active_count)
+                    goal_beliefs[worker_idx] = state
+                prev_xy = state["xy"].copy()
+                worker_env.get_active_agent_xy(state["xy"])
+                valid = state["next_goal"] < state["goal_total"]
+                # The env's reach test: the goal lies within the goal radius of the segment driven this step.
+                reward = np.zeros(valid.shape, dtype=np.float32)
+                if state["has_xy"]:
+                    rows, hypotheses = np.nonzero(valid)
+                    goal_xy = state["goals"][rows, hypotheses, state["next_goal"][rows, hypotheses], :2]
+                    segment = state["xy"][rows] - prev_xy[rows]
+                    along = np.clip(
+                        np.einsum("ij,ij->i", goal_xy - prev_xy[rows], segment)
+                        / np.maximum(np.einsum("ij,ij->i", segment, segment), 1e-9),
+                        0.0,
+                        1.0,
+                    )
+                    miss_m = np.linalg.norm(prev_xy[rows] + along[:, None] * segment - goal_xy, axis=1)
+                    reached = miss_m < worker_env.goal_radius
+                    reward[rows[reached], hypotheses[reached]] = worker_env.reward_goal
+                    state["next_goal"][rows[reached], hypotheses[reached]] += 1
+                state["has_xy"] = True
+                window_left = np.where(valid, state["goal_total"] - state["next_goal"], 0)
+                periodic = state["steps_since_update"] >= goal_update_steps
+                state["steps_since_update"] += 1
+                stale = np.flatnonzero(periodic | (window_left.max(axis=1) < goal_count))
+                if len(stale):
+                    new_goals, new_total = branch_hypotheses(worker_env, stale)
+                    # Near dead ends a reach replan reaches no further; keeping the goals keeps their evidence.
+                    replan = periodic[stale] | (new_total.max(axis=1) > window_left[stale].max(axis=1))
+                    for out_idx, row in enumerate(stale):
+                        if not replan[out_idx]:
+                            continue
+                        old = np.flatnonzero(valid[row])
+                        new = np.flatnonzero(new_total[out_idx] > 0)
+                        new_paths = [
+                            np.vstack([state["xy"][row], new_goals[out_idx, k, : new_total[out_idx, k], :2]])
+                            for k in new
+                        ]
+                        old_last_goals = state["goals"][row, old, state["goal_total"][row, old] - 1, :2]
+                        state["belief"][row] = 0.0
+                        if new_paths:
+                            state["belief"][row, new] = carry_belief(
+                                old_last_goals, state["belief"][row, old], new_paths
+                            )
+                        state["goals"][row] = new_goals[out_idx]
+                        state["goal_total"][row] = new_total[out_idx]
+                        state["next_goal"][row] = 0
+                        state["has_value"][row] = False
+                        state["steps_since_update"][row] = 0
+                valid = state["next_goal"] < state["goal_total"]
+                window_count = np.minimum(state["goal_total"] - state["next_goal"], goal_count).astype(np.int32)
+                window_count[~valid] = 0
+                window_idx = np.minimum(state["next_goal"][..., None] + np.arange(goal_count), goal_count - 1)
+                windows = np.take_along_axis(state["goals"], window_idx[..., None], axis=2)
+                windows[np.arange(goal_count) >= window_count[..., None]] = 0.0
+                windows = np.ascontiguousarray(windows, dtype=np.float32)
+                worker_env.goal_window_observations(windows, window_count, state["obs"])
+                value = np.zeros(valid.shape, dtype=np.float32)
+                if valid.any():
+                    _, value[valid] = infer_candidates(state["obs"][valid])
+                # Boltzmann-rational driver: a move is as likely under a route as it raised that route's return.
+                compared = valid & state["has_value"]
+                advantage = reward + args["train"]["gamma"] * value - state["value"]
+                forgetting = args["eval"]["goal_inference_forgetting"]
+                for row in np.flatnonzero(compared.any(axis=1)):
+                    row_advantage = np.where(compared[row], advantage[row], -np.inf)
+                    likelihood = np.exp(args["eval"]["goal_inference_beta"] * (row_advantage - row_advantage.max()))
+                    posterior = state["belief"][row] * likelihood
+                    posterior /= max(posterior.sum(), 1e-12)
+                    state["belief"][row] = (1.0 - forgetting) * posterior + forgetting * valid[row] / valid[row].sum()
+                state["value"], state["has_value"] = value, valid
+                state["belief"][~valid] = 0.0
+                state["belief"] /= np.maximum(state["belief"].sum(axis=1, keepdims=True), 1e-12)
+                belief_out[start : start + active_count] = state["belief"]
+                goals_out[start : start + active_count] = windows[..., :2]
+                rows, likeliest = np.arange(active_count), np.argmax(state["belief"], axis=1)
+                likeliest_goals[start : start + active_count] = windows[rows, likeliest]
+                likeliest_count[start : start + active_count] = window_count[rows, likeliest]
+            return goals_out, belief_out, likeliest_goals, likeliest_count
+
+        extension_goal_count = min(
+            drive_binding.MAX_GOALS - goal_count,
+            math.ceil(args["eval"]["joint_prediction_horizon_s"] * JOINT_PREDICTION_MAX_SPEED_MPS / goal_spacing_m),
+        )
+
+        def extended_goal_lists(worker_env, windows, counts):
+            """Each agent's goal window continued along the cheapest way past its last goal, so the list outlasts the
+            prediction horizon; returns the (agents, list goals, 4) lists and their (agents,) lengths."""
+            goal_list = np.zeros((len(windows), goal_count + extension_goal_count, 4), dtype=np.float32)
+            list_count = counts.astype(np.int32)
+            goal_list[:, :goal_count] = windows
+            rows = np.flatnonzero(counts > 0)
+            for row, (graph, pose, offset) in zip(rows, row_route_graphs(worker_env, rows)):
+                window = windows[row, : counts[row]]
+                previous_xy = window[-2, :2] if len(window) > 1 else np.asarray(pose[:2]) - offset
+                heading = math.atan2(window[-1, 1] - previous_xy[1], window[-1, 0] - previous_xy[0])
+                try:
+                    branches = graph.branch_goals(
+                        *(window[-1, :2] + offset), heading, goal_spacing_m, extension_goal_count, 1
+                    )
+                except drive_route_graph.RouteError:
+                    continue
+                if not branches:
+                    continue
+                extension = np.asarray(branches[0], dtype=np.float32)
+                extension[:, :2] -= offset
+                goal_list[row, counts[row] : counts[row] + len(extension)] = extension
+                list_count[row] += len(extension)
+            return goal_list, list_count
+
+        def joint_predict(likeliest_goals, likeliest_count):
+            """Roll every policy agent forward together, the ego on its own goals and the rest on their likeliest
+            inferred goals; returns the (agents, steps, 2) paths and the (agents,) ego mask."""
+            predicted_xy = np.zeros((agents_per_batch, joint_prediction_steps, 2), dtype=np.float32)
+            step_xy = np.zeros((agents_per_batch, 2), dtype=np.float32)
+            last_xy = np.zeros((agents_per_batch, 2), dtype=np.float32)
+            for worker_env, start, end in agent_ranges:
+                worker_env.get_active_agent_xy(last_xy[start:end])
+            ego = np.zeros(agents_per_batch, dtype=bool)
+            goal_lists = []
+            for worker_env, start, _ in agent_ranges:
+                active_count = int(worker_env.agent_offsets[-1])
+                if args["eval"]["ego_agent_id"] is not None:
+                    ego[start : start + active_count] = (
+                        worker_env.get_active_agent_ids() == args["eval"]["ego_agent_id"]
+                    )
+                count = np.where(ego[start : start + active_count], 0, likeliest_count[start : start + active_count])
+                goal_lists.append(extended_goal_lists(worker_env, likeliest_goals[start : start + active_count], count))
+            for worker_env in vecenv.envs:
+                worker_env.predict_begin()
+            try:
+                for (worker_env, _, _), (goal_list, list_count) in zip(agent_ranges, goal_lists):
+                    worker_env.predict_set_goals(goal_list, list_count)
+                for rollout_step in range(joint_prediction_steps):
+                    _, rollout_action, *_ = infer(vecenv.observations)
+                    for worker_env, start, end in agent_ranges:
+                        worker_env.predict_step(rollout_action[start:end])
+                        worker_env.get_active_agent_xy(step_xy[start:end])
+                    # An agent that runs out of road leaves the sim; its path ends where it last was.
+                    gone = np.abs(step_xy).max(axis=1) >= JOINT_PREDICTION_INVALID_M
+                    step_xy[gone] = last_xy[gone]
+                    predicted_xy[:, rollout_step] = last_xy[:] = step_xy
+            finally:
+                for worker_env in vecenv.envs:
+                    worker_env.predict_end()
+            return predicted_xy, ego.astype(np.uint8)
+
         episode_summaries = []
         scenario_progress = tqdm(total=expected_episodes, desc=desc, unit="scenario")
         for _ in range(total_steps):
-            predicted_xy, mppi_xy = None, None
+            predicted_xy, mppi_xy, tts_paths, goal_belief, joint_paths = None, None, None, None, None
+            if goal_inference:
+                *goal_belief, likeliest_goals, likeliest_count = update_goal_beliefs()
+            if joint_prediction_steps:
+                joint_paths = joint_predict(likeliest_goals, likeliest_count)
             if rollout_steps:
                 predicted_xy, nominal_actions = rollout_policy()
             raw_action, action, logits, value, logprob, entropy = infer(obs)
             if mppi_samples:
                 action, mppi_xy = mppi_plan(nominal_actions)
+            capture_obs_tensor = policy_obs_tensor
+            if tts_steps:
+                # The search's own inference overwrites the policy input the replay capture reads.
+                capture_obs_tensor = policy_obs_tensor.clone()
+                action, *tts_paths = tts_plan(action)
 
             if replay_capture is not None:
                 replay_capture.capture_frame(
                     obs,
-                    policy_obs_tensor,
+                    capture_obs_tensor,
                     raw_action,
                     action,
                     logits,
@@ -2616,6 +3017,9 @@ def _run_eval_rollout(
                     entropy,
                     predicted_xy,
                     mppi_xy,
+                    tts_paths,
+                    goal_belief,
+                    joint_paths,
                 )
 
             obs, _, terminals, truncations, infos = vecenv.step(action)

@@ -11,6 +11,12 @@ controlled_exp:
       - 0.003
       - 0.01
 env:
+  # Pinned to the values this checkpoint was trained with (repo defaults changed after it was trained)
+  conditioning_speed_scale: 1.5
+  obs_lane_heading_signed: false
+  obs_lane_speed_limit: false
+  obs_stride_merge_segments: false
+  stop_signs_enabled: false
   action_type: continuous
   allow_map_subset: false
   base_max_speed_mps: 20.0

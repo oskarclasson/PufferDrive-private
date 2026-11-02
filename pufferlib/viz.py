@@ -1012,6 +1012,19 @@ def encode_interactive_replay(scenario, replay):
         chunks["predicted_xy_f32"] = np.asarray(replay["predicted_xy"], dtype=np.float32)
     if replay.get("mppi_xy") is not None:
         chunks["mppi_xy_f32"] = np.asarray(replay["mppi_xy"], dtype=np.float32)
+    # Test-time search per frame: (frame, active agent, candidate, step, xy), candidate 0 the policy's own action.
+    if replay.get("tts_xy") is not None:
+        chunks["tts_xy_f32"] = np.asarray(replay["tts_xy"], dtype=np.float32)
+        chunks["tts_best_i16"] = np.asarray(replay["tts_best"], dtype=np.int16)
+        chunks["tts_switched_u8"] = np.asarray(replay["tts_switched"], dtype=np.uint8)
+    # Goal inference per frame: (frame, active agent, hypothesis, goal, xy) candidate goals and each hypothesis' belief.
+    if replay.get("inferred_goal_belief") is not None:
+        chunks["inferred_goal_xy_f32"] = np.asarray(replay["inferred_goal_xy"], dtype=np.float32)
+        chunks["inferred_goal_belief_f32"] = np.asarray(replay["inferred_goal_belief"], dtype=np.float32)
+    # Joint prediction per frame: (frame, active agent, step, xy), the ego on its own goals, others on inferred ones.
+    if replay.get("joint_prediction_xy") is not None:
+        chunks["joint_prediction_xy_f32"] = np.asarray(replay["joint_prediction_xy"], dtype=np.float32)
+        chunks["joint_prediction_ego_u8"] = np.asarray(replay["joint_prediction_ego"], dtype=np.uint8)
 
     metadata = {
         "map_name": scenario.get("map_name", "Unknown"),
@@ -1020,6 +1033,7 @@ def encode_interactive_replay(scenario, replay):
         "total_agents": int(scenario.get("num_total_agents", replay["agent_f32"].shape[1])),
         "eval_overrides": replay.get("eval_overrides") or {},
         "frames": int(replay["agent_f32"].shape[0]),
+        "dt": env_cfg.get("dt"),
         "agent_cap": int(replay["agent_f32"].shape[1]),
         "agent_goal_radius_field": int(binding.AGENT_F32_GOAL_RADIUS_IDX),
         "default_goal_radius_meters": float(env_cfg["goal_radius"]),
@@ -1237,7 +1251,7 @@ __PAYLOAD_CHUNKS__
         const PARTNER_BLINDNESS_OUTLINE_COLOR = "#6d28d9";
         const PHANTOM_BRAKING_OUTLINE_COLOR = "#b45309";
         const INFRACTION_METRIC_COUNT = 4;
-        const DEFAULT_GOAL_RADIUS_METERS = 2;
+        const DEFAULT_GOAL_RADIUS_METERS = 2, GOAL_MERGE_M = 1, GOAL_MIN_ALPHA = .08, GOAL_MIN_SIZE_FRACTION = .15;
         const SVG_PLAY = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M4.5 2.5v11l9-5.5z" fill="currentColor"/></svg>';
         const SVG_PAUSE = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M4 2.5h3v11H4zM9 2.5h3v11H9z" fill="currentColor"/></svg>';
         let H, C = {}, F, paths = {0:new Path2D(),1:new Path2D(),2:new Path2D()}, roadPathsById = new Map(), lastDrawn = -1;
@@ -1248,7 +1262,7 @@ __PAYLOAD_CHUNKS__
         let cam = {x:0,y:0,z:5,drag:false,lx:0,ly:0,cz:0,yaw:0,pitch:0,zx:1};
         let viewMode = '2d', rotateMode = false, dragMode = null, lastTarget = null, mapLayer = null, mapLayerKey = '', mapZMean = 0, RP = 2, roadRangesById = new Map();
         const FOV_DEG = 50, NEAR_FRACTION = 0.05, MAX_PITCH = 80 * Math.PI / 180, DEFAULT_PITCH = 55 * Math.PI / 180, ORBIT_RAD_PER_PX = 0.008, KEY_ROTATE_STEP = 5 * Math.PI / 180, AGENT_PICK_PX = 18;
-        let followedId = null, isEgoCam = false, darkMode = false, showGhost = false, ghostPaths = [], showPrediction = true, showMppi = true;
+        let followedId = null, isEgoCam = false, darkMode = false, showGhost = false, ghostPaths = [], showPrediction = true, showMppi = true, showTts = true, showGoalBelief = true, showJointPrediction = true;
         const OBS_ZOOM_DEFAULT = 2.2, OBS_ZOOM_MIN = .45, OBS_ZOOM_MAX = 8;
         let obsZoom = OBS_ZOOM_DEFAULT, obsExpanded = false, obsMode = 2, obsShowLimits = true;
         let expertAgentIndices = new Set();
@@ -1519,6 +1533,74 @@ self.onmessage = async event => {
             // Policy rollout from this frame while every other actor holds its speed and steering angle.
             if (showPrediction && C.predicted_xy_f32) drawAgentPaths(f, C.predicted_xy_f32, H.chunks.predicted_xy_f32.shape, '#f97316');
             if (showMppi && C.mppi_xy_f32) drawAgentPaths(f, C.mppi_xy_f32, H.chunks.mppi_xy_f32.shape, '#16a34a');
+            if (showTts && C.tts_xy_f32) drawTtsCandidates(f);
+            if (showGoalBelief && C.inferred_goal_belief_f32) drawGoalBeliefs(f);
+            if (showJointPrediction && C.joint_prediction_xy_f32) drawJointPredictions(f);
+        }
+        function drawJointPredictions(f) {
+            // Joint rollout from this frame in each vehicle's color, the ego thicker, with a dot each second when dt is known.
+            const [, N, S] = H.chunks.joint_prediction_xy_f32.shape, unit = Math.max(.3, 2.5/cam.z), dotSteps = H.dt ? Math.max(1, Math.round(1 / H.dt)) : S + 1;
+            ctx.save(); ctx.setLineDash([]); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            for (const a of getFrameAgents(f)) {
+                if (a.slot < 0 || a.slot >= N) continue;
+                const ego = C.joint_prediction_ego_u8[f*N + a.slot] === 1, base = (f*N + a.slot)*S*2;
+                ctx.strokeStyle = a.c; ctx.fillStyle = a.c; ctx.lineWidth = ego ? 1.6*unit : unit;
+                ctx.beginPath(); ctx.moveTo(a.x, a.y);
+                for (let s=0;s<S;s++) ctx.lineTo(C.joint_prediction_xy_f32[base+2*s], C.joint_prediction_xy_f32[base+2*s+1]);
+                ctx.stroke();
+                for (let s=dotSteps-1;s<S;s+=dotSteps) { ctx.beginPath(); ctx.arc(C.joint_prediction_xy_f32[base+2*s], C.joint_prediction_xy_f32[base+2*s+1], .8*unit, 0, 7); ctx.fill(); }
+            }
+            ctx.restore();
+        }
+        function drawGoalBeliefs(f) {
+            // Candidate goals in the vehicle's color, opacity and area from belief (full belief: goal radius); a goal several
+            // routes share (before they fork) is drawn once with their summed belief.
+            const [, N, K, G] = H.chunks.inferred_goal_xy_f32.shape, radius = H.default_goal_radius_meters || DEFAULT_GOAL_RADIUS_METERS;
+            ctx.save(); ctx.setLineDash([]); ctx.lineWidth = Math.max(.1, 1.2/cam.z);
+            for (const a of getFrameAgents(f)) {
+                if (a.slot < 0 || a.slot >= N) continue;
+                const merged = [];
+                for (let k=0;k<K;k++) {
+                    const belief = C.inferred_goal_belief_f32[(f*N + a.slot)*K + k];
+                    if (belief <= 0) continue;
+                    for (let g=0;g<G;g++) {
+                        const base = (((f*N + a.slot)*K + k)*G + g)*2, x = C.inferred_goal_xy_f32[base], y = C.inferred_goal_xy_f32[base+1];
+                        if (x === 0 && y === 0) break;
+                        const same = merged.find(m => Math.hypot(m.x - x, m.y - y) < GOAL_MERGE_M);
+                        if (same) same.belief += belief; else merged.push({x, y, belief});
+                    }
+                }
+                ctx.strokeStyle = a.c; ctx.fillStyle = a.c;
+                for (const m of merged) {
+                    const belief = Math.min(1, m.belief), alpha = GOAL_MIN_ALPHA + (1 - GOAL_MIN_ALPHA) * belief;
+                    ctx.beginPath(); ctx.arc(m.x, m.y, radius * Math.max(Math.sqrt(belief), GOAL_MIN_SIZE_FRACTION), 0, 7);
+                    ctx.globalAlpha = .5 * alpha; ctx.fill(); ctx.globalAlpha = alpha; ctx.stroke();
+                }
+            }
+            ctx.restore();
+        }
+        function drawTtsCandidates(f) {
+            // Sampled candidates grey, the best-scoring one green (dashed when it lost to the policy's margin), policy action orange.
+            const [, N, K, S] = H.chunks.tts_xy_f32.shape, lineWidth = Math.max(.15, 1.5/cam.z);
+            ctx.lineCap = 'round';
+            for (const a of getFrameAgents(f)) {
+                if (a.slot < 0 || a.slot >= N) continue;
+                const best = C.tts_best_i16[f*N + a.slot], switched = C.tts_switched_u8[f*N + a.slot] === 1;
+                if (best < 0) continue;
+                const order = [];
+                for (let k=1;k<K;k++) if (k !== best) order.push(k);
+                order.push(best, 0);
+                for (const k of order) {
+                    const base = ((f*N + a.slot)*K + k)*S*2;
+                    ctx.strokeStyle = k === 0 ? '#f97316' : k === best ? '#16a34a' : 'rgba(128,128,128,.35)';
+                    ctx.lineWidth = k === best ? 3*lineWidth : k === 0 ? 1.5*lineWidth : lineWidth;
+                    ctx.setLineDash(k === best && !switched ? [4*lineWidth, 3*lineWidth] : []);
+                    ctx.beginPath(); ctx.moveTo(a.x, a.y);
+                    for (let s=0;s<S;s++) ctx.lineTo(C.tts_xy_f32[base+2*s], C.tts_xy_f32[base+2*s+1]);
+                    ctx.stroke();
+                }
+            }
+            ctx.setLineDash([]); ctx.lineCap = 'butt';
         }
         function drawAgentPaths(f, paths, shape, color) {
             const N = shape[1], S = shape[2];
@@ -1559,7 +1641,7 @@ self.onmessage = async event => {
         function toggleObsLimits(e){ if(e) e.stopPropagation(); obsShowLimits=!obsShowLimits; document.getElementById('obsLimitBtn').classList.toggle('on', obsShowLimits); draw(true); }
         function toggleObsSize(e){ if(e) e.stopPropagation(); const p=document.getElementById('obs-container'), b=e ? e.currentTarget : null; obsExpanded=!obsExpanded; p.style.width=obsExpanded?'680px':'390px'; p.style.height=obsExpanded?'680px':'390px'; if(b) b.textContent=obsExpanded?'Collapse':'Expand'; resizeObsCanvas(); draw(true); }
         function searchAgent(){ const id=parseInt(document.getElementById('agentSearch').value); if(!isNaN(id)){ followedId=id; play=false; updateBtn(); draw(true); } }
-        document.addEventListener('keydown', e => { if(!H || e.target.tagName === 'INPUT') return; if(e.code === 'Space'){ toggle(); e.preventDefault(); } if(e.code === 'ArrowRight'){ play=false; updateBtn(); step=Math.min(step+1,frameMax()); draw(true); } if(e.code === 'ArrowLeft'){ play=false; updateBtn(); step=Math.max(step-1,0); draw(true); } if(e.code === 'Escape'){ followedId=null; isEgoCam=false; updateUI(); draw(true); } if(e.code === 'KeyG'){ showGhost=!showGhost; draw(true); } if(e.code === 'KeyP'){ showPrediction=!showPrediction; draw(true); } if(e.code === 'KeyM'){ showMppi=!showMppi; draw(true); } if(e.code === 'KeyV'){ toggleView(); } if(e.code === 'KeyR'){ toggleRotateMode(); } if(e.code === 'KeyT'){ topView(); } if(is3D() && (e.code === 'KeyQ' || e.code === 'KeyE')){ cam.yaw += (e.code === 'KeyQ' ? -1 : 1) * KEY_ROTATE_STEP; updateViewBar(); draw(true); } if(is3D() && (e.code === 'KeyW' || e.code === 'KeyS')){ cam.pitch = Math.max(0, Math.min(MAX_PITCH, cam.pitch + (e.code === 'KeyW' ? 1 : -1) * KEY_ROTATE_STEP)); updateViewBar(); draw(true); } });
+        document.addEventListener('keydown', e => { if(!H || e.target.tagName === 'INPUT') return; if(e.code === 'Space'){ toggle(); e.preventDefault(); } if(e.code === 'ArrowRight'){ play=false; updateBtn(); step=Math.min(step+1,frameMax()); draw(true); } if(e.code === 'ArrowLeft'){ play=false; updateBtn(); step=Math.max(step-1,0); draw(true); } if(e.code === 'Escape'){ followedId=null; isEgoCam=false; updateUI(); draw(true); } if(e.code === 'KeyG'){ showGhost=!showGhost; draw(true); } if(e.code === 'KeyP'){ showPrediction=!showPrediction; draw(true); } if(e.code === 'KeyM'){ showMppi=!showMppi; draw(true); } if(e.code === 'KeyC'){ showTts=!showTts; draw(true); } if(e.code === 'KeyB'){ showGoalBelief=!showGoalBelief; draw(true); } if(e.code === 'KeyJ'){ showJointPrediction=!showJointPrediction; draw(true); } if(e.code === 'KeyV'){ toggleView(); } if(e.code === 'KeyR'){ toggleRotateMode(); } if(e.code === 'KeyT'){ topView(); } if(is3D() && (e.code === 'KeyQ' || e.code === 'KeyE')){ cam.yaw += (e.code === 'KeyQ' ? -1 : 1) * KEY_ROTATE_STEP; updateViewBar(); draw(true); } if(is3D() && (e.code === 'KeyW' || e.code === 'KeyS')){ cam.pitch = Math.max(0, Math.min(MAX_PITCH, cam.pitch + (e.code === 'KeyW' ? 1 : -1) * KEY_ROTATE_STEP)); updateViewBar(); draw(true); } });
         c.addEventListener('contextmenu', e => e.preventDefault());
         c.onwheel = e => { e.preventDefault(); const factor = Math.exp(-e.deltaY * .001); if (is3D()) { const r=c.getBoundingClientRect(), sx=e.clientX-r.left, sy=e.clientY-r.top; setProjection(lastTarget); const before = groundOffset(sx, sy); cam.z *= factor; const after = groundOffset(sx, sy); if (before && after && followedId === null) { cam.x += before[0]-after[0]; cam.y += before[1]-after[1]; } } else cam.z *= factor; draw(true); };
         c.onmousedown = e => { if(!H) return; const r=c.getBoundingClientRect(), sx=e.clientX-r.left, sy=e.clientY-r.top; const orbit = e.button === 1 || e.button === 2 || e.shiftKey || (rotateMode && e.button === 0); if (orbit) { e.preventDefault(); if (!is3D()) enter3D(); dragMode='orbit'; cam.drag=true; cam.lx=e.clientX; cam.ly=e.clientY; draw(true); return; } if (e.button !== 0) return; const hit = pickAgent(sx, sy); if(hit !== null){ followedId=hit; cam.drag=false; } else { followedId=null; isEgoCam=false; dragMode='pan'; cam.drag=true; cam.lx=e.clientX; cam.ly=e.clientY; if (is3D()) { setProjection(null); cam.g0 = groundOffset(sx, sy); cam.t0 = [cam.x, cam.y]; } } draw(true); };

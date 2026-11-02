@@ -88,6 +88,7 @@
     <button data-tool="select" class="active">Select / move (V)</button>
     <button data-tool="actor">Add actor (A)</button>
     <button data-tool="goal">Add goals (G)</button>
+    <button data-tool="route">Route to goal (R)</button>
     <button data-tool="obstacle">Add obstacle (O)</button>
     <button data-tool="light">Traffic lights (L)</button>
     <label class="checkbox"><input type="checkbox" id="snapLane" checked> Snap to lane</label>
@@ -96,6 +97,7 @@
   <div class="row">
     <label>New actor length m <input type="number" id="newLength" value="4.8" min="0.3" max="30" step="0.1"></label>
     <label>New actor width m <input type="number" id="newWidth" value="2.0" min="0.3" max="30" step="0.1"></label>
+    <label>Route goal spacing m <input type="number" id="routeSpacing" value="30" min="5" max="200" step="5"></label>
   </div>
   <button id="applySizeAll" style="width:100%">Apply this size to all actors</button>
 
@@ -114,9 +116,13 @@
 
   <h2>Evaluate (all actors on the policy)</h2>
   <label class="checkbox"><input type="checkbox" id="useMppi" checked> MPPI safety filter (+ light/sign rules)</label>
+  <label class="checkbox"><input type="checkbox" id="useTts"> Value-guided test-time search (instead of MPPI; ego actor only, or every actor when none is marked ego)</label>
   <label class="checkbox"><input type="checkbox" id="usePrediction" checked> 10 s predicted trajectory overlay</label>
+  <label class="checkbox"><input type="checkbox" id="useGoalInference"> Infer each actor's goal from its motion (goals in the vehicle's color, size and opacity by belief, B in replay)</label>
+  <label class="checkbox"><input type="checkbox" id="useJointPrediction"> Joint prediction: ego on its goals, other actors on their inferred goals (J in replay)</label>
   <label class="checkbox"><input type="checkbox" id="captureObs" checked> Capture policy observations</label>
   <label>Goal radius (m) <input type="number" id="goalRadius" value="2" min="0.5" max="20" step="0.5"></label>
+  <label>Inferred goal spacing (m) <input type="number" id="inferredGoalSpacing" value="10" min="2" max="50" step="1"></label>
   <button id="evaluate" class="primary" style="width:100%;margin-top:6px">Save &amp; evaluate</button>
   <p class="hint">Runs and their results are listed under the Results tab.</p>
   <div id="status" style="display:none"></div>
@@ -327,7 +333,8 @@ function draw() {
     const [hx, hy] = toScreen(a.x + a.length / 2 * Math.cos(a.heading), a.y + a.length / 2 * Math.sin(a.heading));
     const [cx, cy] = toScreen(a.x, a.y);
     ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 * px; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(hx, hy); ctx.stroke();
-    ctx.fillStyle = "#111827"; ctx.font = `${10 * px}px system-ui`; ctx.fillText(`A${i + 1}`, cx + 6 * px, cy - 8 * px);
+    ctx.fillStyle = "#111827"; ctx.font = `${a.ego ? "bold " : ""}${10 * px}px system-ui`;
+    ctx.fillText(a.ego ? `A${i + 1} EGO` : `A${i + 1}`, cx + 6 * px, cy - 8 * px);
   });
   const selectedBox = selectedBoxObject();
   if (selectedBox) {
@@ -387,6 +394,7 @@ const TOOL_HINTS = {
   select: "Click to select. Drag to move. Drag the orange dot to rotate and the white square to resize. Delete removes the selection. Drag empty space to pan, wheel to zoom.",
   actor: "Click on a lane to place a policy-driven actor (heading follows the lane). Then add its goals.",
   goal: "Click to append goals for the selected actor, in driving order. Put a goal in a neighbouring lane to force a lane change.",
+  route: "Click a destination for the selected actor: its goals are replaced by goals along the shortest lane route, at most the route spacing apart. Moving the actor re-plans; editing a goal by hand keeps the goals fixed.",
   obstacle: "Click to place a static obstacle. Edit its size in the selection panel.",
   light: "Click a traffic-light stop line to cycle: log → always red → always green → cycle (green first) → cycle (red first).",
 };
@@ -411,6 +419,17 @@ function addGoal(actorIdx, wx, wy) {
     if (near) point = [near.x, near.y];
   }
   actor.goals.push([round2(point[0]), round2(point[1])]);
+  delete actor.destination;
+}
+// replace the actor's goals with goals along the shortest lane route to `destination`
+async function planRoute(actor, destination) {
+  try {
+    const spacing = parseFloat($("routeSpacing").value) || 30;
+    const route = await api("/api/route", {map: scenario.map, x: actor.x, y: actor.y, heading: actor.heading, destination, spacing_m: spacing});
+    actor.goals = route.goals; actor.destination = destination;
+    showStatus(`Route ${route.length_m} m: ${route.goals.length} goal(s).`);
+  } catch (e) { alert(`No route: ${e.message}`); }
+  refresh();
 }
 function round2(v) { return Math.round(v * 100) / 100; }
 function clampSize(v) { return Math.min(MAX_BOX_SIZE_M, Math.max(MIN_BOX_SIZE_M, v)); }
@@ -440,6 +459,10 @@ canvas.addEventListener("pointerdown", e => {
     const actorIdx = selection && (selection.kind === "actor" || selection.kind === "goal") ? selection.idx : -1;
     if (actorIdx < 0) { alert("Select an actor first (Select tool), then add goals."); return; }
     addGoal(actorIdx, wx, wy);
+  } else if (tool === "route") {
+    const actorIdx = selection && (selection.kind === "actor" || selection.kind === "goal") ? selection.idx : -1;
+    if (actorIdx < 0) { alert("Select an actor first (Select tool), then click its destination."); return; }
+    planRoute(scenario.actors[actorIdx], [round2(wx), round2(wy)]);
   } else if (tool === "light") {
     const tc = pickLight(sx, sy);
     if (tc) {
@@ -476,6 +499,7 @@ canvas.addEventListener("pointermove", e => {
     box.heading = Math.atan2(wy - box.y, wx - box.x);
   } else if (drag.target.kind === "goal") {
     scenario.actors[drag.target.idx].goals[drag.target.goalIdx] = [round2(wx), round2(wy)];
+    delete scenario.actors[drag.target.idx].destination;
   } else {
     const box = drag.target.kind === "actor" ? scenario.actors[drag.target.idx] : scenario.obstacles[drag.target.idx];
     box.x += wx - drag.wx; box.y += wy - drag.wy; drag.wx = wx; drag.wy = wy;
@@ -494,6 +518,10 @@ canvas.addEventListener("pointerup", () => {
       if (near) { box.x = near.x; box.y = near.y; box.heading = near.h; }
     }
   }
+  if (drag && !drag.pan && pointerDown && pointerDown.moved && !drag.target.resize) {
+    const t = drag.target, actor = t.kind === "actor" ? scenario.actors[t.idx] : null;
+    if (actor && actor.destination) planRoute(actor, actor.destination);
+  }
   drag = null; pointerDown = null; refresh();
 });
 canvas.addEventListener("contextmenu", e => e.preventDefault());
@@ -508,7 +536,7 @@ canvas.addEventListener("wheel", e => {
 }, {passive: false});
 window.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
-  const keyTools = {v: "select", a: "actor", g: "goal", o: "obstacle", l: "light"};
+  const keyTools = {v: "select", a: "actor", g: "goal", r: "route", o: "obstacle", l: "light"};
   if (keyTools[e.key]) { setTool(keyTools[e.key]); return; }
   if (e.key === "Escape") { setTool("select"); return; }
   if ((e.key === "Delete" || e.key === "Backspace") && selection) { deleteSelection(); e.preventDefault(); }
@@ -516,7 +544,10 @@ window.addEventListener("keydown", e => {
 function deleteSelection() {
   if (selection.kind === "actor") scenario.actors.splice(selection.idx, 1);
   else if (selection.kind === "obstacle") scenario.obstacles.splice(selection.idx, 1);
-  else if (selection.kind === "goal") scenario.actors[selection.idx].goals.splice(selection.goalIdx, 1);
+  else if (selection.kind === "goal") {
+    scenario.actors[selection.idx].goals.splice(selection.goalIdx, 1);
+    delete scenario.actors[selection.idx].destination;
+  }
   selection = null; refresh();
 }
 
@@ -553,12 +584,30 @@ function renderProps() {
     b.title = `${length} m × ${width} m`; b.style.flex = "none"; presetRow.appendChild(b);
   });
   panel.append(row1, row2, presetRow);
+  if (isActor) {
+    const egoLabel = document.createElement("label"); egoLabel.className = "checkbox";
+    const egoInput = document.createElement("input"); egoInput.type = "checkbox"; egoInput.checked = !!box.ego;
+    egoInput.addEventListener("change", () => {
+      scenario.actors.forEach(a => delete a.ego);
+      if (egoInput.checked) box.ego = true;
+      refresh();
+    });
+    egoLabel.append(egoInput, " Ego: runs test-time search and keeps its own goals in the joint prediction");
+    panel.appendChild(egoLabel);
+  }
   const row3 = document.createElement("div"); row3.className = "row";
   if (isActor) {
     const goalText = document.createElement("p"); goalText.className = "hint";
-    goalText.textContent = `${box.goals.length} goal(s). Use the Add goals tool (G) to append; select a goal and press Delete to remove it.`;
+    goalText.textContent = box.destination
+      ? `${box.goals.length} goal(s) routed to (${box.destination[0].toFixed(1)}, ${box.destination[1].toFixed(1)}); moving the actor re-plans them.`
+      : `${box.goals.length} goal(s). Use Route to goal (R) to plan them, or Add goals (G) to append; select a goal and press Delete to remove it.`;
     panel.appendChild(goalText);
-    row3.append(button("Clear goals", () => { box.goals = []; refresh(); }), button("Make obstacle", () => {
+    if (box.destination) {
+      const routeRow = document.createElement("div"); routeRow.className = "row";
+      routeRow.append(button("Re-plan route", () => planRoute(box, box.destination)));
+      panel.appendChild(routeRow);
+    }
+    row3.append(button("Clear goals", () => { box.goals = []; delete box.destination; refresh(); }), button("Make obstacle", () => {
       const {x, y, heading, length, width} = box; scenario.actors.splice(selection.idx, 1);
       scenario.obstacles.push({x, y, heading, length, width}); selection = {kind: "obstacle", idx: scenario.obstacles.length - 1}; refresh();
     }));
@@ -654,7 +703,7 @@ const METRIC_LABELS = [["active_agent_count", "actors driven by policy", 0], ["c
   ["total_distance_travelled", "total distance m", 0], ["multi_lane_time", "time straddling lanes s", 1],
   ["comfort_violation_count", "comfort violations", 2], ["speed_limit_compliance", "speed-limit compliance", 3]];
 const SETTING_LABELS = [["map", "map"], ["duration_s", "duration s"], ["actor_count", "actors"], ["obstacle_count", "obstacles"],
-  ["mppi", "MPPI"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
+  ["mppi", "MPPI"], ["tts", "test-time search"], ["ego_actor", "ego"], ["goal_inference", "goal inference"], ["joint_prediction", "joint prediction"], ["inferred_goal_spacing_m", "inferred goal spacing m"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
 let runs = [];
 let selectedRun = null;
 let runsTimer = null;
@@ -683,7 +732,7 @@ async function loadRuns() {
     const facts = r.status === "running" ? `running for ${formatElapsed(r.elapsed_s)}`
       : m ? `collisions ${formatMetric(m.collision_rate, 2)} · goals ${formatMetric(m.num_goals_reached, 1)} · red flags ${formatMetric(m.red_light_violation_rate, 2)}`
       : "no results written";
-    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : "RL only");
+    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : r.settings.tts ? "RL+TTS" : "RL only");
     return `<div class="run ${selectedRun === r.label ? "selected" : ""}" data-label="${escapeHtml(r.label)}">
       <div class="top"><b>${escapeHtml(r.scenario)}</b><span class="badge ${r.status}">${r.status}</span></div>
       <div class="meta">${escapeHtml(r.started)} ${mode ? "· " + mode : ""}</div><div class="meta">${facts}</div></div>`;
@@ -753,12 +802,19 @@ $("evaluate").addEventListener("click", async () => {
   try {
     await saveScenario();
     const {label} = await api("/api/evaluate", {
-      name: $("scenarioName").value.trim(), mppi: $("useMppi").checked, prediction: $("usePrediction").checked,
+      name: $("scenarioName").value.trim(), mppi: $("useMppi").checked, tts: $("useTts").checked,
+      prediction: $("usePrediction").checked, goal_inference: $("useGoalInference").checked,
+      joint_prediction: $("useJointPrediction").checked,
       capture_observations: $("captureObs").checked, goal_radius: parseFloat($("goalRadius").value),
+      inferred_goal_spacing_m: parseFloat($("inferredGoalSpacing").value),
     });
     setTab("results"); showRun(label);
   } catch (e) { alert(e.message); }
 });
+$("useMppi").addEventListener("change", () => { if ($("useMppi").checked) $("useTts").checked = false; });
+$("useTts").addEventListener("change", () => { if ($("useTts").checked) $("useMppi").checked = false; });
+$("useJointPrediction").addEventListener("change", () => { if ($("useJointPrediction").checked) $("useGoalInference").checked = true; });
+$("useGoalInference").addEventListener("change", () => { if (!$("useGoalInference").checked) $("useJointPrediction").checked = false; });
 $("tabEditor").addEventListener("click", () => setTab("editor"));
 $("tabResults").addEventListener("click", () => setTab("results"));
 $("refreshRuns").addEventListener("click", loadRuns);

@@ -27,6 +27,8 @@ import yaml
 
 import scenario_builder
 
+from pufferlib.ocean.drive import route_graph
+
 EDITOR_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EDITOR_DIR.parents[1]
 MAP_EDITOR_DIR = REPO_ROOT / "scripts" / "map_editor"
@@ -46,6 +48,8 @@ PREDICT_HORIZON_SECONDS = 10.0
 EVAL_AGENT_SLOTS = 300
 MIN_GOAL_RADIUS_M = 0.5
 MAX_GOAL_RADIUS_M = 20.0
+MIN_INFERRED_GOAL_SPACING_M = 2.0
+MAX_INFERRED_GOAL_SPACING_M = 50.0
 SUMMARY_METRIC_KEYS = (
     "active_agent_count",
     "collision_rate",
@@ -127,6 +131,36 @@ class EditorState:
             self.map_cache[cache_key] = geometry
         return geometry
 
+    def route_goals(self, request):
+        """Goals spaced along the shortest lane route from an actor's pose to a destination point."""
+        map_name = str(request.get("map", ""))
+        path = self.map_path(map_name)
+        number = scenario_builder._finite
+        start = [number(request.get(key), key) for key in ("x", "y", "heading")]
+        destination = request.get("destination")
+        if not isinstance(destination, list) or len(destination) != 2:
+            raise scenario_builder.ScenarioSpecError("destination must be [x, y]")
+        destination = [number(value, "destination") for value in destination]
+        spacing_m = number(
+            request.get("spacing_m"),
+            "spacing_m",
+            scenario_builder.MIN_GOAL_SPACING_M,
+            scenario_builder.MAX_GOAL_SPACING_M,
+        )
+        cache_key = ("route", map_name, path.stat().st_mtime_ns)
+        with self.lock:
+            graph = self.map_cache.get(cache_key)
+        try:
+            if graph is None:
+                graph = route_graph.RouteGraph(scenario_builder.read_bin(path)["roads"])
+                with self.lock:
+                    if len(self.map_cache) >= MAP_CACHE_SIZE:
+                        self.map_cache.pop(next(iter(self.map_cache)))
+                    self.map_cache[cache_key] = graph
+            return graph.route_goals(*start, *destination, spacing_m, scenario_builder.MAX_GOALS_PER_ACTOR)
+        except route_graph.RouteError as error:
+            raise scenario_builder.ScenarioSpecError(str(error)) from error
+
     def map_origin(self, map_name):
         """Lat/lon of (0, 0) for maps drawn over an .osm backdrop; None for maps without a geographic origin."""
         path = self.map_path(map_name)
@@ -170,11 +204,23 @@ class EditorState:
         goal_radius = request.get("goal_radius", 2.0)
         if not isinstance(goal_radius, (int, float)) or not MIN_GOAL_RADIUS_M <= goal_radius <= MAX_GOAL_RADIUS_M:
             raise scenario_builder.ScenarioSpecError("goal_radius out of range")
+        inferred_goal_spacing_m = request.get("inferred_goal_spacing_m", 10.0)
+        if (
+            not isinstance(inferred_goal_spacing_m, (int, float))
+            or not MIN_INFERRED_GOAL_SPACING_M <= inferred_goal_spacing_m <= MAX_INFERRED_GOAL_SPACING_M
+        ):
+            raise scenario_builder.ScenarioSpecError(
+                f"inferred goal spacing must be {MIN_INFERRED_GOAL_SPACING_M:g}-{MAX_INFERRED_GOAL_SPACING_M:g} m"
+            )
+        if request.get("tts") and request.get("mppi", True):
+            raise scenario_builder.ScenarioSpecError("choose MPPI or test-time search, not both")
         with self.lock:
             if any(run["status"] == "running" for run in self.list_runs()):
                 raise scenario_builder.ScenarioSpecError("an evaluation is already running (see Results)")
 
             spec = json.loads(spec_path.read_text())
+            # Actors are written first and in order, so an actor's index is its scenario agent id.
+            ego_actor_idx = next((idx for idx, actor in enumerate(spec["actors"]) if actor.get("ego")), None)
             scenario_steps = int(round(float(spec["duration_s"]) / scenario_builder.SIM_DT_SECONDS))
             benchmark = yaml.safe_load(BENCHMARK_TEMPLATE_PATH.read_text())
             (entry,) = [b for b in benchmark["benchmarks"] if b["name"] == BENCHMARK_NAME]
@@ -185,9 +231,14 @@ class EditorState:
             run_label = f"{scenario_name}_{datetime.datetime.now():{RUN_STAMP_FORMAT}}"
             settings = {
                 "mppi": bool(request.get("mppi", True)),
+                "tts": bool(request.get("tts", False)),
+                "ego_actor": "none" if ego_actor_idx is None else f"A{ego_actor_idx + 1}",
+                "goal_inference": bool(request.get("goal_inference", False) or request.get("joint_prediction", False)),
+                "joint_prediction": bool(request.get("joint_prediction", False)),
                 "prediction": bool(request.get("prediction", True)),
                 "capture_observations": bool(request.get("capture_observations", True)),
                 "goal_radius": float(goal_radius),
+                "inferred_goal_spacing_m": float(inferred_goal_spacing_m),
                 "duration_s": float(spec["duration_s"]),
                 "map": spec["map"],
                 "actor_count": len(spec["actors"]),
@@ -205,12 +256,17 @@ class EditorState:
                 f"eval.num_agents={EVAL_AGENT_SLOTS}",
                 "eval.goal_regen_mode=rolling",
                 f"eval.goal_radius={settings['goal_radius']}",
+                f"eval.goal_inference_goal_spacing_m={settings['inferred_goal_spacing_m']}",
                 "eval.disable_red_light_infractions=false",
                 "eval.disable_stop_sign_infractions=false",
                 "eval.render_scenarios=true",
                 f"eval.capture_observations={str(settings['capture_observations']).lower()}",
                 f"eval.predict_horizon_s={PREDICT_HORIZON_SECONDS if settings['prediction'] else 0.0}",
                 f"eval.mppi_samples={MPPI_SAMPLE_COUNT if settings['mppi'] else 0}",
+                f"eval.tts={str(settings['tts']).lower()}",
+                f"eval.ego_agent_id={'null' if ego_actor_idx is None else ego_actor_idx}",
+                f"eval.goal_inference={str(settings['goal_inference']).lower()}",
+                f"eval.joint_prediction={str(settings['joint_prediction']).lower()}",
                 f"eval.output_name={run_label}",
                 "wandb=False",
             ]
@@ -371,6 +427,8 @@ def make_handler(state, map_editor_state, map_spec_error):
                     return self._send(200, {"ok": True, **map_editor_state.save(body)})
                 if url.path == "/api/scenario":
                     return self._send(200, {"ok": True, "steps": state.save_scenario(body)})
+                if url.path == "/api/route" and isinstance(body, dict):
+                    return self._send(200, state.route_goals(body))
                 if url.path == "/api/evaluate":
                     return self._send(200, {"label": state.start_eval(body)})
                 if url.path == "/api/run/stop":
