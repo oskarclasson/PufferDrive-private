@@ -525,6 +525,10 @@ class EvaluationConfig:
     joint_prediction: bool = MISSING
     joint_prediction_horizon_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
     joint_prediction_dt: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    robust_prediction: bool = MISSING
+    robust_prediction_min_belief: float = _constrained_field(PROBABILITY_CONSTRAINT)
+    robust_prediction_max_routes: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
+    robust_prediction_control: bool = MISSING
     ego_agent_id: int | None = _constrained_field(NONNEGATIVE_INT_CONSTRAINT)
 
 

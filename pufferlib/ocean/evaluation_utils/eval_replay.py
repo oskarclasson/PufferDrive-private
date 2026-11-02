@@ -88,6 +88,7 @@ class EvalReplayCapture:
         mppi_xy=None,
         goal_belief=None,
         joint_paths=None,
+        robust_paths=None,
     ):
         if self.policy_history_frame_count == self.capture_batch_steps:
             self.policy_history = {}
@@ -112,6 +113,11 @@ class EvalReplayCapture:
             joint_xy, joint_ego = joint_paths
             replay_frame["joint_prediction_xy"] = joint_xy[: self.agents_per_batch]
             replay_frame["joint_prediction_ego"] = joint_ego[: self.agents_per_batch]
+        if robust_paths is not None:
+            robust_xy, robust_belief, robust_ego = robust_paths
+            replay_frame["robust_prediction_xy"] = robust_xy[: self.agents_per_batch]
+            replay_frame["robust_prediction_belief"] = robust_belief[: self.agents_per_batch]
+            replay_frame["robust_prediction_ego"] = robust_ego[: self.agents_per_batch]
         if isinstance(logits, torch.distributions.Normal):
             replay_frame["policy_mean"] = logits.loc[: self.agents_per_batch].detach().float().cpu().numpy()
             replay_frame["policy_std"] = logits.scale[: self.agents_per_batch].detach().float().cpu().numpy()

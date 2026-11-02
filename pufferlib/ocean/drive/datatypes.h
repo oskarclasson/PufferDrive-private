@@ -84,6 +84,7 @@ struct Agent {
     float *scripted_goal_z;
     int scripted_goals_reached;
     int predicted_goal_list; // prediction rollout: goals come from a fixed list that only slides, never regenerates
+    int hypothesis_group;    // hypothesis scene: 1 + index of the agent this one is a copy of (or the original); 0 = none
 
     // Metrics and status tracking (size must match NUM_METRICS in drive.h)
     float metrics_array[NUM_METRICS]; // [collision, offroad, red_light, stop_sign, reached_goal, lane_dist, lane_angle,

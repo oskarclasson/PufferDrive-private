@@ -2396,6 +2396,23 @@ def _run_eval_rollout(
         )
     if joint_prediction_steps and not goal_inference:
         raise pufferlib.APIUsageError("eval.joint_prediction needs eval.goal_inference for the other agents' goals")
+    robust_prediction = args["eval"]["robust_prediction"]
+    robust_prediction_steps = round(args["eval"]["joint_prediction_horizon_s"] / joint_prediction_dt)
+    if robust_prediction and robust_prediction_steps == 0:
+        raise pufferlib.APIUsageError(
+            "eval.joint_prediction_horizon_s must cover at least one eval.joint_prediction_dt"
+        )
+    if robust_prediction and not goal_inference:
+        raise pufferlib.APIUsageError("eval.robust_prediction needs eval.goal_inference for the other agents' routes")
+    robust_control = args["eval"]["robust_prediction_control"]
+    if robust_control and (not robust_prediction or args["eval"]["ego_agent_id"] is None):
+        raise pufferlib.APIUsageError(
+            "eval.robust_prediction_control needs eval.robust_prediction and eval.ego_agent_id"
+        )
+    if robust_control and mppi_samples:
+        raise pufferlib.APIUsageError(
+            "eval.robust_prediction_control and eval.mppi_samples both replace the ego's action; enable one"
+        )
     snapshot_access = rollout_steps or goal_inference
     if snapshot_access and args["train"].get("use_rnn", False):
         raise pufferlib.APIUsageError(
@@ -2728,13 +2745,12 @@ def _run_eval_rollout(
 
             Hypotheses come from the map's route graph: goals spaced along every branch ahead, re-placed every update
             period and once a reached goal leaves no full window. Like the env, reaching a goal pays the goal reward.
-            Returns the (agents, hypotheses, window goals, 2) goal windows, the (agents, hypotheses) belief, and the
-            likeliest hypothesis' (agents, window goals, 4) goal window with its (agents,) goal count.
+            Returns the (agents, hypotheses, window goals, 4) goal windows, their (agents, hypotheses) goal counts and
+            the (agents, hypotheses) belief.
             """
             belief_out = np.zeros((agents_per_batch, goal_hypothesis_count), dtype=np.float32)
-            goals_out = np.zeros((agents_per_batch, goal_hypothesis_count, goal_count, 2), dtype=np.float32)
-            likeliest_goals = np.zeros((agents_per_batch, goal_count, 4), dtype=np.float32)
-            likeliest_count = np.zeros(agents_per_batch, dtype=np.int32)
+            windows_out = np.zeros((agents_per_batch, goal_hypothesis_count, goal_count, 4), dtype=np.float32)
+            window_count_out = np.zeros((agents_per_batch, goal_hypothesis_count), dtype=np.int32)
             for worker_idx, (worker_env, start, _) in enumerate(agent_ranges):
                 active_count = int(worker_env.agent_offsets[-1])
                 state = goal_beliefs.get(worker_idx)
@@ -2779,11 +2795,10 @@ def _run_eval_rollout(
                             for k in new
                         ]
                         old_last_goals = state["goals"][row, old, state["goal_total"][row, old] - 1, :2]
+                        old_belief = state["belief"][row, old]
                         state["belief"][row] = 0.0
                         if new_paths:
-                            state["belief"][row, new] = carry_belief(
-                                old_last_goals, state["belief"][row, old], new_paths
-                            )
+                            state["belief"][row, new] = carry_belief(old_last_goals, old_belief, new_paths)
                         state["goals"][row] = new_goals[out_idx]
                         state["goal_total"][row] = new_total[out_idx]
                         state["next_goal"][row] = 0
@@ -2814,25 +2829,24 @@ def _run_eval_rollout(
                 state["belief"][~valid] = 0.0
                 state["belief"] /= np.maximum(state["belief"].sum(axis=1, keepdims=True), 1e-12)
                 belief_out[start : start + active_count] = state["belief"]
-                goals_out[start : start + active_count] = windows[..., :2]
-                rows, likeliest = np.arange(active_count), np.argmax(state["belief"], axis=1)
-                likeliest_goals[start : start + active_count] = windows[rows, likeliest]
-                likeliest_count[start : start + active_count] = window_count[rows, likeliest]
-            return goals_out, belief_out, likeliest_goals, likeliest_count
+                windows_out[start : start + active_count] = windows
+                window_count_out[start : start + active_count] = window_count
+            return windows_out, window_count_out, belief_out
 
         extension_goal_count = min(
             drive_binding.MAX_GOALS - goal_count,
             math.ceil(args["eval"]["joint_prediction_horizon_s"] * JOINT_PREDICTION_MAX_SPEED_MPS / goal_spacing_m),
         )
 
-        def extended_goal_lists(worker_env, windows, counts):
-            """Each agent's goal window continued along the cheapest way past its last goal, so the list outlasts the
-            prediction horizon; returns the (agents, list goals, 4) lists and their (agents,) lengths."""
+        def extended_goal_lists(worker_env, agent_rows, windows, counts):
+            """Each goal window, of the worker's active agent in agent_rows, continued along the cheapest way past its
+            last goal so the list outlasts the prediction horizon; returns the (windows, list goals, 4) lists and their
+            (windows,) lengths."""
             goal_list = np.zeros((len(windows), goal_count + extension_goal_count, 4), dtype=np.float32)
             list_count = counts.astype(np.int32)
             goal_list[:, :goal_count] = windows
             rows = np.flatnonzero(counts > 0)
-            for row, (graph, pose, offset) in zip(rows, row_route_graphs(worker_env, rows)):
+            for row, (graph, pose, offset) in zip(rows, row_route_graphs(worker_env, agent_rows[rows])):
                 window = windows[row, : counts[row]]
                 previous_xy = window[-2, :2] if len(window) > 1 else np.asarray(pose[:2]) - offset
                 heading = math.atan2(window[-1, 1] - previous_xy[1], window[-1, 0] - previous_xy[0])
@@ -2850,9 +2864,18 @@ def _run_eval_rollout(
                 list_count[row] += len(extension)
             return goal_list, list_count
 
-        def joint_predict(likeliest_goals, likeliest_count):
+        def ego_mask(worker_env):
+            if args["eval"]["ego_agent_id"] is None:
+                return np.zeros(int(worker_env.agent_offsets[-1]), dtype=bool)
+            return worker_env.get_active_agent_ids() == args["eval"]["ego_agent_id"]
+
+        def joint_predict(goal_windows, goal_window_count, goal_belief):
             """Roll every policy agent forward together, the ego on its own goals and the rest on their likeliest
             inferred goals; returns the (agents, steps, 2) paths and the (agents,) ego mask."""
+            agent_rows = np.arange(agents_per_batch)
+            likeliest = np.argmax(goal_belief, axis=1)
+            likeliest_goals = goal_windows[agent_rows, likeliest]
+            likeliest_count = goal_window_count[agent_rows, likeliest]
             predicted_xy = np.zeros((agents_per_batch, joint_prediction_steps, 2), dtype=np.float32)
             step_xy = np.zeros((agents_per_batch, 2), dtype=np.float32)
             last_xy = np.zeros((agents_per_batch, 2), dtype=np.float32)
@@ -2862,12 +2885,13 @@ def _run_eval_rollout(
             goal_lists = []
             for worker_env, start, _ in agent_ranges:
                 active_count = int(worker_env.agent_offsets[-1])
-                if args["eval"]["ego_agent_id"] is not None:
-                    ego[start : start + active_count] = (
-                        worker_env.get_active_agent_ids() == args["eval"]["ego_agent_id"]
-                    )
+                ego[start : start + active_count] = ego_mask(worker_env)
                 count = np.where(ego[start : start + active_count], 0, likeliest_count[start : start + active_count])
-                goal_lists.append(extended_goal_lists(worker_env, likeliest_goals[start : start + active_count], count))
+                goal_lists.append(
+                    extended_goal_lists(
+                        worker_env, np.arange(active_count), likeliest_goals[start : start + active_count], count
+                    )
+                )
             for worker_env in vecenv.envs:
                 worker_env.predict_begin()
             try:
@@ -2888,19 +2912,112 @@ def _run_eval_rollout(
                     worker_env.predict_end()
             return predicted_xy, ego.astype(np.uint8)
 
+        robust_route_count = args["eval"]["robust_prediction_max_routes"]
+
+        def robust_routes(row_belief, row_window_count):
+            """An agent's routes for the robust rollout, likeliest first: every route with belief of at least
+            robust_prediction_min_belief, at most robust_route_count, and always its likeliest."""
+            order = [k for k in np.argsort(-row_belief, kind="stable") if row_window_count[k] > 0]
+            kept = [
+                k for k in order[:robust_route_count] if row_belief[k] >= args["eval"]["robust_prediction_min_belief"]
+            ]
+            return kept or order[:1]
+
+        def robust_predict(goal_windows, goal_window_count, goal_belief):
+            """Roll the ego out against every likely route of every other agent at once.
+
+            Each agent drives its likeliest route, and per further kept route a copy of it starts from the same state
+            and drives that one; copies of one agent neither see nor hit each other, so the ego must clear them all.
+            Runs in hypothesis scenes, leaving the envs untouched. Returns the (agents, routes, steps, 2) paths, the
+            (agents, routes) belief of each (0: no such route; 1 for the ego and agents without routes), the (agents,)
+            ego mask and every agent's (agents, 2) first action in the rollout.
+            """
+            first_action = np.zeros((agents_per_batch, 2), dtype=np.float32)
+            robust_xy = np.zeros((agents_per_batch, robust_route_count, robust_prediction_steps, 2), dtype=np.float32)
+            robust_belief = np.zeros((agents_per_batch, robust_route_count), dtype=np.float32)
+            ego = np.zeros(agents_per_batch, dtype=bool)
+            scenes = []
+            for worker_env, start, _ in agent_ranges:
+                active_count = int(worker_env.agent_offsets[-1])
+                ego[start : start + active_count] = ego_mask(worker_env)
+                routes = [
+                    [] if ego[start + row] else robust_routes(goal_belief[start + row], goal_window_count[start + row])
+                    for row in range(active_count)
+                ]
+                # Scene agent order: per env, its active agents, then their copies.
+                source, route, slot, ghost_sources = [], [], [], []
+                for env_start, env_end in zip(worker_env.agent_offsets[:-1], worker_env.agent_offsets[1:]):
+                    env_rows = range(int(env_start), int(env_end))
+                    source += list(env_rows)
+                    route += [routes[row][0] if routes[row] else -1 for row in env_rows]
+                    slot += [0] * len(env_rows)
+                    copies = [(row, copy_slot, k) for row in env_rows for copy_slot, k in enumerate(routes[row][1:], 1)]
+                    source += [row for row, _, _ in copies]
+                    route += [k for _, _, k in copies]
+                    slot += [copy_slot for _, copy_slot, _ in copies]
+                    ghost_sources.append(np.array([row - env_start for row, _, _ in copies], dtype=np.int32))
+                source, route, slot = np.array(source), np.array(route), np.array(slot)
+                has_route = route >= 0
+                windows = np.zeros((len(source), goal_count, 4), dtype=np.float32)
+                counts = np.zeros(len(source), dtype=np.int32)
+                windows[has_route] = goal_windows[start + source[has_route], route[has_route]]
+                counts[has_route] = goal_window_count[start + source[has_route], route[has_route]]
+                robust_belief[start + source, slot] = np.where(
+                    has_route, goal_belief[start + source, np.maximum(route, 0)], 1.0
+                )
+                goal_list, list_count = extended_goal_lists(worker_env, source, windows, counts)
+                scene_rows = worker_env.hypothesis_scene_begin(ghost_sources)
+                worker_env.hypothesis_scene_set_dt(joint_prediction_dt)
+                worker_env.hypothesis_scene_set_goals(goal_list, list_count)
+                env_xy = np.zeros((active_count, 2), dtype=np.float32)
+                worker_env.get_active_agent_xy(env_xy)
+                scenes.append(
+                    {
+                        "env": worker_env,
+                        "rows": scene_rows,
+                        "agents": start + source,
+                        "slots": slot,
+                        "xy": np.zeros((len(source), 2), dtype=np.float32),
+                        "last_xy": env_xy[source],
+                    }
+                )
+            for rollout_step in range(robust_prediction_steps):
+                action, _ = infer_candidates(
+                    np.concatenate([scene["env"].scene_observations[scene["rows"]] for scene in scenes])
+                )
+                split_points = np.cumsum([len(scene["rows"]) for scene in scenes])[:-1]
+                for scene, scene_action in zip(scenes, np.split(action, split_points)):
+                    if rollout_step == 0:
+                        original = scene["slots"] == 0
+                        first_action[scene["agents"][original]] = scene_action[original]
+                    scene["env"].hypothesis_scene_step(scene_action, scene["rows"])
+                    scene["env"].get_hypothesis_scene_agent_xy(scene["xy"])
+                    # An agent that runs out of road leaves the sim; its path ends where it last was.
+                    gone = np.abs(scene["xy"]).max(axis=1) >= JOINT_PREDICTION_INVALID_M
+                    scene["xy"][gone] = scene["last_xy"][gone]
+                    scene["last_xy"][:] = scene["xy"]
+                    robust_xy[scene["agents"], scene["slots"], rollout_step] = scene["xy"]
+            return robust_xy, robust_belief, ego.astype(np.uint8), first_action
+
         episode_summaries = []
         scenario_progress = tqdm(total=expected_episodes, desc=desc, unit="scenario")
         for _ in range(total_steps):
-            predicted_xy, mppi_xy, goal_belief, joint_paths = None, None, None, None
+            predicted_xy, mppi_xy, goal_belief, joint_paths, robust_paths = None, None, None, None, None
             if goal_inference:
-                *goal_belief, likeliest_goals, likeliest_count = update_goal_beliefs()
+                goal_windows, goal_window_count, goal_belief_values = update_goal_beliefs()
+                goal_belief = (goal_windows[..., :2], goal_belief_values)
             if joint_prediction_steps:
-                joint_paths = joint_predict(likeliest_goals, likeliest_count)
+                joint_paths = joint_predict(goal_windows, goal_window_count, goal_belief_values)
+            if robust_prediction:
+                *robust_paths, robust_first_action = robust_predict(goal_windows, goal_window_count, goal_belief_values)
             if rollout_steps:
                 predicted_xy, nominal_actions = rollout_policy()
             raw_action, action, logits, value, logprob, entropy = infer(obs)
             if mppi_samples:
                 action, mppi_xy = mppi_plan(nominal_actions)
+            if robust_control:
+                # The robust rollout's first step sees the same scene as the policy plus the other agents' copies.
+                action = np.where(robust_paths[2][:, None] == 1, robust_first_action, action)
 
             if replay_capture is not None:
                 replay_capture.capture_frame(
@@ -2916,6 +3033,7 @@ def _run_eval_rollout(
                     mppi_xy,
                     goal_belief,
                     joint_paths,
+                    robust_paths,
                 )
 
             obs, _, terminals, truncations, infos = vecenv.step(action)
