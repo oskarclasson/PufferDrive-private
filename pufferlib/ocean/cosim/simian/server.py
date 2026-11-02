@@ -6,10 +6,14 @@ policy. POST /reset builds a map-only bin from the adapter's road graph, or load
 ego in slot 0 and Simian's ground-truth actors streamed into the co-sim partner slots. Every POST /step
 syncs ego, actors, lights and the route goal window, runs the policy once and integrates the jerk
 dynamics one dt; the adapter tracks the returned acceleration, speed and curvature with the tire model.
-With --rollout-horizon-s every step also rolls the policy ahead, the actors held at constant velocity, and
-returns the rollout in the step debug, which GET /reference also serves. In the full stack AD is the client
-instead of the adapter: it resets and steps the policy with its own ego state and tracked obstacles, without a
-road graph, so --drawn-map is required, and the rollout is the reference its trajectory planner tracks.
+With --rollout-horizon-s every step also rolls the policy ahead, the actors held at constant velocity, those slower
+than --min-moving-speed-mps standing still, and returns the rollout and the path of every tracked actor in it in the
+step debug; GET /reference serves the rollout too. With --actor-prediction joint the nearest moving tracked actors
+are instead driven by the policy too, each to the goals goal inference finds likeliest for it, so the ego rollout
+and the actors' predicted paths come from one joint rollout; the others, and those with a negative id, untracked
+obstacles, are held as without it. In the full stack AD is the client instead of the adapter: it resets and
+steps the policy with its own ego state and tracked obstacles, without a road graph, so --drawn-map is required,
+and the rollout is the reference its trajectory planner tracks.
 
 All JSON coordinates are in the Simian map frame [m], headings CCW from +x [rad], velocities in that
 frame [m/s], and the ego position is the bounding-box center.
@@ -34,6 +38,7 @@ import pufferlib.pytorch
 import pufferlib.spaces
 from pufferlib.ocean.cosim.arch import checkpoint_config_path, shadow_env_kwargs
 from pufferlib.ocean.cosim.goals import RouteGoalWindow, route_goals_from_xy
+from pufferlib.ocean.cosim.joint_prediction import GOAL_COLUMNS, GoalInference
 from pufferlib.ocean.cosim.nuplan_bridge import DEFAULT_ARCH, FAR_AWAY, LIGHT_STATE_GREEN, goals_along
 from pufferlib.ocean.cosim.simian.debug import POOL_NAMES, decode_observation
 from pufferlib.ocean.cosim.simian.drawn_map import DrawnMap
@@ -54,14 +59,53 @@ DEFAULT_MAX_STEPS = 6000
 DEFAULT_MAX_PARTNERS = 63
 DEFAULT_GOAL_SPACING_M = 30.0
 DEFAULT_ROLLOUT_HORIZON_S = 0.0
+ACTOR_PREDICTION_CONSTANT_VELOCITY = "constant-velocity"
+ACTOR_PREDICTION_JOINT = "joint"
+DEFAULT_JOINT_PREDICTION_ACTORS = 8
+DEFAULT_MIN_MOVING_SPEED_MPS = 0.5
+# The eval's goal_inference_* defaults in puffer_drive.yaml.
+DEFAULT_GOAL_INFERENCE_HYPOTHESES = 8
+DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M = 10.0
+DEFAULT_GOAL_INFERENCE_UPDATE_S = 1.0
+DEFAULT_GOAL_INFERENCE_BETA = 10.0
+DEFAULT_GOAL_INFERENCE_FORGETTING = 0.01
 STEP_LOG_INTERVAL_STEPS = 10
 REFERENCE_MISS_LOG_INTERVAL_S = 5.0
 NS_PER_S = 1e9
 COMPILE_PREFIXES = ("module.", "_orig_mod.")
+MAX_PARTNER_LENGTH_M = 7.0  # largest agent spawn_agent in drive.h trains with
+MAX_PARTNER_WIDTH_M = 3.0
 
 
 def log(message):
     print(f"[simian_policy] {message}", flush=True)
+
+
+def split_actor(actor):
+    """The actor as the fewest equal pieces no longer than MAX_PARTNER_LENGTH_M and no wider than
+    MAX_PARTNER_WIDTH_M, each moving like it; the actor itself when it fits."""
+    length_count = math.ceil(float(actor["length"]) / MAX_PARTNER_LENGTH_M)
+    width_count = math.ceil(float(actor["width"]) / MAX_PARTNER_WIDTH_M)
+    if length_count <= 1 and width_count <= 1:
+        return [actor]
+    piece_length_m = float(actor["length"]) / length_count
+    piece_width_m = float(actor["width"]) / width_count
+    cos_heading, sin_heading = math.cos(float(actor["heading"])), math.sin(float(actor["heading"]))
+    pieces = []
+    for length_idx in range(length_count):
+        along_m = (length_idx + 0.5) * piece_length_m - 0.5 * float(actor["length"])
+        for width_idx in range(width_count):
+            across_m = (width_idx + 0.5) * piece_width_m - 0.5 * float(actor["width"])
+            pieces.append(
+                {
+                    **actor,
+                    "x": float(actor["x"]) + along_m * cos_heading - across_m * sin_heading,
+                    "y": float(actor["y"]) + along_m * sin_heading + across_m * cos_heading,
+                    "length": piece_length_m,
+                    "width": piece_width_m,
+                }
+            )
+    return pieces
 
 
 def rollout_summary(points):
@@ -95,6 +139,10 @@ class PolicySession:
         self.ego_length_m = float(args.ego_length_m or ego["length"])
         self.ego_width_m = float(args.ego_width_m or ego["width"])
         scenario_length = int(args.max_steps) + SCENARIO_LENGTH_MARGIN_STEPS
+        joint = args.actor_prediction == ACTOR_PREDICTION_JOINT
+        self.actor_slot_count = int(args.joint_prediction_actors) if joint else 0
+        self.min_moving_speed_mps = float(args.min_moving_speed_mps)
+        self.static_slot_start = 1 + self.actor_slot_count
         if args.drawn_map:
             bin_path = Path(args.drawn_map)
             self.map = DrawnMap(
@@ -111,8 +159,8 @@ class PolicySession:
         overrides = {
             "map_dir": str(bin_path),
             "num_maps": 1,
-            "num_agents": 1,
-            "min_agents_per_env": 1,
+            "num_agents": 1 + self.actor_slot_count,
+            "min_agents_per_env": 1 + self.actor_slot_count,
             "cosim_partner_slots": self.max_partners,
             "goal_source": "external",
             "goal_reach_requires_speed": True,
@@ -130,11 +178,18 @@ class PolicySession:
         self.env = Drive(**self.arch)
         self.env.reset()
         self.dt = float(self.arch["dt"])
+        if int(self.env.agent_offsets[-1]) != 1 + self.actor_slot_count:
+            raise RuntimeError(
+                f"gigaflow spawned {int(self.env.agent_offsets[-1])} of the {1 + self.actor_slot_count} policy agents "
+                "on the map bin; lower --joint-prediction-actors"
+            )
 
         ex, ey = self.map.to_bin(float(ego["x"]), float(ego["y"]))
         self.ego_stopped_s = 0.0
         self.partner_stopped_s = {}  # Simian actor id -> seconds at standstill
         self.partners = None
+        self.static_actors = []
+        self.predicted = None
         self._set_ego(ego, ex, ey, accel_long=0.0)
         readback = self.env.get_global_agent_state()
         if (
@@ -142,6 +197,9 @@ class PolicySession:
             or abs(float(readback["y"][0]) - ey) > SPAWN_PROBE_TOLERANCE_M
         ):
             raise RuntimeError("shadow env slot 0 is not the ego: gigaflow spawning failed on the Simian map bin")
+        sim_xy = np.zeros((1 + self.actor_slot_count, 2), np.float32)
+        self.env.get_active_agent_xy(sim_xy)
+        self.world_minus_sim_xy = np.array([readback["x"][EGO_SLOT], readback["y"][EGO_SLOT]]) - sim_xy[EGO_SLOT]
         self.env.set_agent_sizes(
             np.array([EGO_SLOT], np.int32),
             np.array([self.ego_length_m], np.float32),
@@ -171,6 +229,21 @@ class PolicySession:
         self.scenario_length = scenario_length
         self.rollout_steps = int(round(float(args.rollout_horizon_s) / self.dt))
         self.reference = None
+        self.goal_inference = None
+        if joint:
+            self.goal_inference = GoalInference(
+                bin_path,
+                num_goals=self.env.num_goals,
+                hypothesis_count=args.goal_inference_hypotheses,
+                goal_spacing_m=args.goal_inference_goal_spacing_m,
+                update_steps=max(1, round(args.goal_inference_update_s / self.dt)),
+                beta=args.goal_inference_beta,
+                forgetting=args.goal_inference_forgetting,
+                gamma=cfg["train"]["gamma"],
+                goal_radius_m=self.env.goal_radius,
+                reward_goal=self.env.reward_goal,
+                horizon_s=args.rollout_horizon_s,
+            )
 
     def _set_ego(self, ego, ex, ey, accel_long):
         vx, vy = self.map.velocity_to_bin(float(ego["vx"]), float(ego["vy"]))
@@ -198,56 +271,120 @@ class PolicySession:
             stopped_by_id[actor["id"]] = self.partner_stopped_s.get(actor["id"], 0.0) + dt if actor_stopped else 0.0
         self.partner_stopped_s = stopped_by_id
 
-    def _set_partners(self, ego_x, ego_y, actors):
-        actors = sorted(actors, key=lambda a: (a["x"] - ego_x) ** 2 + (a["y"] - ego_y) ** 2)[: self.max_partners]
-        self.partners = None
-        if actors:
-            idx = np.arange(1, 1 + len(actors), dtype=np.int32)
-            bx, by = self.map.to_bin(np.array([a["x"] for a in actors]), np.array([a["y"] for a in actors]))
-            bvx, bvy = self.map.velocity_to_bin(
-                np.array([a["vx"] for a in actors]), np.array([a["vy"] for a in actors])
-            )
-            self.partners = {
-                "idx": idx,
-                "x": bx,
-                "y": by,
-                "z": np.array([a["z"] for a in actors], np.float32),
-                "heading": self.map.heading_to_bin(np.array([a["heading"] for a in actors], np.float32)),
-                "vx": bvx,
-                "vy": bvy,
-                "stopped_s": np.array([self.partner_stopped_s[a["id"]] for a in actors], np.float32),
-            }
-            self._place_partners(elapsed_s=0.0)
+    def _partner_states(self, actors, first_slot):
+        bx, by = self.map.to_bin(np.array([a["x"] for a in actors]), np.array([a["y"] for a in actors]))
+        bvx, bvy = self.map.velocity_to_bin(np.array([a["vx"] for a in actors]), np.array([a["vy"] for a in actors]))
+        return {
+            "ids": [a["id"] for a in actors],
+            "idx": np.arange(first_slot, first_slot + len(actors), dtype=np.int32),
+            "x": bx,
+            "y": by,
+            "z": np.array([a["z"] for a in actors], np.float32),
+            "heading": self.map.heading_to_bin(np.array([a["heading"] for a in actors], np.float32)),
+            "vx": bvx,
+            "vy": bvy,
+            "moving": np.array([self._moving(a) for a in actors]),
+            "stopped_s": np.array([self.partner_stopped_s[a["id"]] for a in actors], np.float32),
+        }
+
+    def _moving(self, actor):
+        """Whether the actor moves in the rollout: slower than --min-moving-speed-mps it stands still there."""
+        return math.hypot(actor["vx"], actor["vy"]) >= self.min_moving_speed_mps
+
+    def _set_partners(self, actors, predicted_ids):
+        """Write the joint-predicted actors into the policy actor slots and the rest, split into pieces the policy
+        knows the size of, into the static partner slots, nearest first, and park the slots left over."""
+        predicted = [a for a in actors if a["id"] in predicted_ids]
+        static = [a for a in actors if a["id"] not in predicted_ids]
+        pieces = [piece for actor in static for piece in split_actor(actor)][: self.max_partners]
+        self.predicted = self._partner_states(predicted, 1) if predicted else None
+        self.partners = self._partner_states(pieces, self.static_slot_start) if pieces else None
+        self.static_actors = static
+        for partners, slot_actors in ((self.predicted, predicted), (self.partners, pieces)):
+            if partners is None:
+                continue
+            self._place(partners, elapsed_s=0.0)
             self.env.set_agent_sizes(
-                idx,
-                np.array([a["length"] for a in actors], np.float32),
-                np.array([a["width"] for a in actors], np.float32),
+                partners["idx"],
+                np.array([a["length"] for a in slot_actors], np.float32),
+                np.array([a["width"] for a in slot_actors], np.float32),
             )
-        surplus = np.arange(1 + len(actors), 1 + self.max_partners, dtype=np.int32)
+        surplus = np.concatenate(
+            [
+                np.arange(1 + len(predicted), self.static_slot_start, dtype=np.int32),
+                np.arange(
+                    self.static_slot_start + len(pieces), self.static_slot_start + self.max_partners, dtype=np.int32
+                ),
+            ]
+        )
         if len(surplus):
             far = np.full(len(surplus), FAR_AWAY, np.float32)
             zero = np.zeros_like(far)
             self.env.set_agent_states(surplus, far, far, far, zero, zero, zero, zero, zero)
 
     def _place_partners(self, elapsed_s):
-        """Write the streamed actors into their slots, extrapolated elapsed_s ahead at constant velocity."""
-        if self.partners is None:
-            return
-        partners = self.partners
-        stopped = np.hypot(partners["vx"], partners["vy"]) < float(binding.AGENT_STOPPED_SPEED_THRESHOLD)
+        """Write the static partners into their slots, extrapolated elapsed_s ahead at constant velocity."""
+        if self.partners is not None:
+            self._place(self.partners, elapsed_s)
+
+    def _place(self, partners, elapsed_s):
+        # the policy sees the actors as they are now, and in the rollout the slow ones as standing still
+        still = ~partners["moving"] & (elapsed_s > 0)
+        vx = np.where(still, 0.0, partners["vx"])
+        vy = np.where(still, 0.0, partners["vy"])
+        stopped = np.hypot(vx, vy) < float(binding.AGENT_STOPPED_SPEED_THRESHOLD)
         zero = np.zeros(len(partners["idx"]), np.float32)
         self.env.set_agent_states(
             partners["idx"],
-            (partners["x"] + partners["vx"] * elapsed_s).astype(np.float32),
-            (partners["y"] + partners["vy"] * elapsed_s).astype(np.float32),
+            (partners["x"] + vx * elapsed_s).astype(np.float32),
+            (partners["y"] + vy * elapsed_s).astype(np.float32),
             partners["z"],
             partners["heading"],
-            partners["vx"].astype(np.float32),
-            partners["vy"].astype(np.float32),
+            vx.astype(np.float32),
+            vy.astype(np.float32),
             zero,
             zero,
             (partners["stopped_s"] + stopped * elapsed_s).astype(np.float32),
         )
+
+    def _advance_goal_inference(self, actors):
+        """Advance goal inference for the nearest moving tracked actors no larger than the policy was trained with
+        until the actor slots are full; returns the ids of those with a way ahead, which the joint rollout drives."""
+        predicted_ids, advanced_ids = [], []
+        for actor in actors:
+            if len(predicted_ids) == self.actor_slot_count:
+                break
+            if actor["id"] < 0 or not self._moving(actor) or len(split_actor(actor)) > 1:
+                continue
+            bx, by = self.map.to_bin(float(actor["x"]), float(actor["y"]))
+            heading = self.map.heading_to_bin(float(actor["heading"]))
+            advanced_ids.append(actor["id"])
+            if self.goal_inference.advance(actor["id"], float(bx), float(by), float(heading)):
+                predicted_ids.append(actor["id"])
+        self.goal_inference.retain(advanced_ids)
+        return set(predicted_ids)
+
+    def _update_goal_beliefs(self):
+        """Update the predicted actors' beliefs with the critic values of their goal windows."""
+        if self.predicted is None:
+            return
+        inference = self.goal_inference
+        agent_count = 1 + self.actor_slot_count
+        windows = np.zeros((agent_count, inference.hypothesis_count, inference.num_goals, GOAL_COLUMNS), np.float32)
+        counts = np.zeros((agent_count, inference.hypothesis_count), np.int32)
+        for row, actor_id in zip(self.predicted["idx"], self.predicted["ids"]):
+            windows[row], counts[row] = inference.windows(actor_id)
+            windows[row, ..., :2] -= self.world_minus_sim_xy
+        obs = np.zeros((*counts.shape, self.env.observations.shape[1]), np.float32)
+        self.env.goal_window_observations(windows, counts, obs)
+        values = np.zeros(counts.shape, np.float32)
+        valid = counts > 0
+        if valid.any():
+            with torch.no_grad():
+                _, value = self.policy.forward_eval(torch.as_tensor(obs[valid]).to(self.device))
+            values[valid] = value.reshape(-1).float().cpu().numpy()
+        for row, actor_id in zip(self.predicted["idx"], self.predicted["ids"]):
+            inference.update(actor_id, values[row])
 
     def _set_lights(self, light_states):
         if not self.map.num_traffic:
@@ -295,6 +432,30 @@ class PolicySession:
             "curvature_inv_m": curvature_inv_m,
         }
 
+    def _actor_point(self, state, slot, time_s):
+        x, y = self.map.from_bin(float(state["x"][slot]), float(state["y"][slot]))
+        return {
+            "t": time_s,
+            "x": float(x),
+            "y": float(y),
+            "heading": float(self.map.heading_from_bin(float(state["heading"][slot]))),
+        }
+
+    def _constant_velocity_rollout(self, actor, times_s):
+        """The path of a static partner in the rollout, at constant velocity or standing still like _place_partners
+        moves it."""
+        vx, vy = (float(actor["vx"]), float(actor["vy"])) if self._moving(actor) else (0.0, 0.0)
+        points = [
+            {
+                "t": time_s,
+                "x": float(actor["x"]) + vx * time_s,
+                "y": float(actor["y"]) + vy * time_s,
+                "heading": float(actor["heading"]),
+            }
+            for time_s in times_s
+        ]
+        return {"id": actor["id"], "points": points}
+
     def _rollout(self, first_action):
         """The ego poses of the policy rolled ahead from now, the Simian actors held at constant velocity."""
         points = [self._rollout_point(0.0)]
@@ -312,6 +473,44 @@ class PolicySession:
         finally:
             self.env.predict_end()
         return points
+
+    def _joint_rollout(self):
+        """The ego poses of the policy rolled ahead from now together with the predicted actors, each driving to its
+        likeliest inferred goals, the other actors held at constant velocity; and the predicted actors' paths with the
+        goals they drive to."""
+        agent_count = 1 + self.actor_slot_count
+        goal_lists = np.zeros((agent_count, binding.MAX_GOALS, GOAL_COLUMNS), np.float32)
+        list_counts = np.zeros(agent_count, np.int32)
+        predicted = [] if self.predicted is None else list(zip(self.predicted["idx"], self.predicted["ids"]))
+        actor_goals = {}
+        for row, actor_id in predicted:
+            goal_list = self.goal_inference.likeliest_goal_list(actor_id)
+            goals_x, goals_y = self.map.from_bin(goal_list[:, 0].astype(np.float64), goal_list[:, 1].astype(np.float64))
+            actor_goals[actor_id] = [{"x": float(x), "y": float(y)} for x, y in zip(goals_x, goals_y)]
+            goal_list[:, :2] -= self.world_minus_sim_xy
+            goal_lists[row, : len(goal_list)] = goal_list
+            list_counts[row] = len(goal_list)
+        state = self.env.get_global_agent_state()
+        points = [self._rollout_point(0.0)]
+        actor_paths = {actor_id: [self._actor_point(state, row, 0.0)] for row, actor_id in predicted}
+        self.env.predict_begin()
+        try:
+            self.env.predict_set_goals(goal_lists, list_counts)
+            for step_idx in range(self.rollout_steps):
+                self.env.predict_step(self._infer(self.env.observations)[1])
+                # c_step holds static slots in place, so the streamed actors are moved here
+                self._place_partners(elapsed_s=(step_idx + 1) * self.dt)
+                self.env.recompute_observations()
+                time_s = (step_idx + 1) * self.dt
+                points.append(self._rollout_point(time_s))
+                state = self.env.get_global_agent_state()
+                for row, actor_id in predicted:
+                    actor_paths[actor_id].append(self._actor_point(state, row, time_s))
+        finally:
+            self.env.predict_end()
+        return points, [
+            {"id": actor_id, "points": path, "goals": actor_goals[actor_id]} for actor_id, path in actor_paths.items()
+        ]
 
     def _debug(self, obs_tensor, logits, value):
         """What the policy saw and chose this step: the decoded ego-frame observation, the goal window in the map
@@ -340,17 +539,32 @@ class PolicySession:
         ex, ey = self.map.to_bin(float(ego["x"]), float(ego["y"]))
         self._update_stopped_times(ego, request["actors"])
         self._set_ego(ego, ex, ey, accel_long=float(ego["accel_long"]))
-        self._set_partners(float(ego["x"]), float(ego["y"]), request["actors"])
+        actors = sorted(
+            request["actors"], key=lambda a: (a["x"] - float(ego["x"])) ** 2 + (a["y"] - float(ego["y"])) ** 2
+        )[: self.max_partners]
+        predicted_ids = set() if self.goal_inference is None else self._advance_goal_inference(actors)
+        self._set_partners(actors, predicted_ids)
         self._set_lights(request["traffic_light_states"])
         self.goal_window.sync(ex, ey, self.map.heading_to_bin(float(ego["heading"])))
         obs = np.asarray(self.env.recompute_observations())
+        if self.goal_inference is not None:
+            self._update_goal_beliefs()
         start_speed_mps = float(obs[EGO_SLOT][EGO_OBS_SPEED_IDX]) * float(self.env.obs_norm_speed_mps)
 
         obs_tensor, act, logits, value = self._infer(obs)
         debug = self._debug(obs_tensor, logits, value)
         if self.rollout_steps:
-            self.reference = {"time_ns": int(request["time_ns"]), "dt": self.dt, "points": self._rollout(act)}
-            debug["rollout"] = self.reference["points"]
+            if self.goal_inference is None:
+                points, actor_rollouts = self._rollout(act), []
+            else:
+                points, actor_rollouts = self._joint_rollout()
+            times_s = [point["t"] for point in points]
+            actor_rollouts += [
+                self._constant_velocity_rollout(actor, times_s) for actor in self.static_actors if actor["id"] >= 0
+            ]
+            self.reference = {"time_ns": int(request["time_ns"]), "dt": self.dt, "points": points}
+            debug["rollout"] = points
+            debug["actor_rollouts"] = actor_rollouts
         self.env.step(act)
 
         speed_mps, accel_mps2, steering_angle, curvature_inv_m = self._ego_motion()
@@ -439,7 +653,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
                         f"reset in {time.monotonic() - start_s:.1f} s: ego at ({ego['x']:.1f}, {ego['y']:.1f}) "
                         f"heading {ego['heading']:+.2f} rad, {'drawn' if server.args.drawn_map else 'Simian'} map "
                         f"with {session.lane_count} lanes, {session.goal_count} goals, dt {session.dt} s, "
-                        f"rollout {session.rollout_steps} steps"
+                        f"rollout {session.rollout_steps} steps, {server.args.actor_prediction} actor prediction"
                     )
                     self._reply(
                         200,
@@ -507,6 +721,29 @@ def main():
         default=DEFAULT_ROLLOUT_HORIZON_S,
         help="seconds the policy is rolled ahead every step for GET /reference, 0 disables",
     )
+    parser.add_argument(
+        "--actor-prediction",
+        choices=(ACTOR_PREDICTION_CONSTANT_VELOCITY, ACTOR_PREDICTION_JOINT),
+        default=ACTOR_PREDICTION_CONSTANT_VELOCITY,
+        help="how the rollout moves the actors: at constant velocity, or driven by the policy to inferred goals",
+    )
+    parser.add_argument(
+        "--joint-prediction-actors",
+        type=int,
+        default=DEFAULT_JOINT_PREDICTION_ACTORS,
+        help="nearest tracked actors the joint rollout drives",
+    )
+    parser.add_argument(
+        "--min-moving-speed-mps",
+        type=float,
+        default=DEFAULT_MIN_MOVING_SPEED_MPS,
+        help="estimated speed from which an actor moves in the rollout, and a tracked one can be driven by the policy",
+    )
+    parser.add_argument("--goal-inference-hypotheses", type=int, default=DEFAULT_GOAL_INFERENCE_HYPOTHESES)
+    parser.add_argument("--goal-inference-goal-spacing-m", type=float, default=DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M)
+    parser.add_argument("--goal-inference-update-s", type=float, default=DEFAULT_GOAL_INFERENCE_UPDATE_S)
+    parser.add_argument("--goal-inference-beta", type=float, default=DEFAULT_GOAL_INFERENCE_BETA)
+    parser.add_argument("--goal-inference-forgetting", type=float, default=DEFAULT_GOAL_INFERENCE_FORGETTING)
     args = parser.parse_args()
     if bool(args.drawn_map) != bool(args.drawn_map_spec):
         parser.error("--drawn-map and --drawn-map-spec go together")
@@ -514,11 +751,25 @@ def main():
         parser.error("--ego-length-m and --ego-width-m must be positive")
     if not args.rollout_horizon_s >= 0:
         parser.error("--rollout-horizon-s must not be negative")
+    if args.actor_prediction == ACTOR_PREDICTION_JOINT and not args.rollout_horizon_s > 0:
+        parser.error("--actor-prediction joint needs --rollout-horizon-s")
+    if not 0 < args.joint_prediction_actors <= args.max_partners:
+        parser.error("--joint-prediction-actors must be in 1..--max-partners")
+    if not args.min_moving_speed_mps >= 0:
+        parser.error("--min-moving-speed-mps must not be negative")
+    if args.goal_inference_hypotheses < 1:
+        parser.error("--goal-inference-hypotheses must be positive")
+    if not (
+        args.goal_inference_goal_spacing_m > 0 and args.goal_inference_update_s > 0 and args.goal_inference_beta >= 0
+    ):
+        parser.error("--goal-inference-goal-spacing-m and -update-s must be positive and -beta not negative")
+    if not 0 <= args.goal_inference_forgetting <= 1:
+        parser.error("--goal-inference-forgetting must be in [0, 1]")
     torch.set_num_threads(1)
     server = PolicyServer((args.host, args.port), args)
     log(
         f"serving {args.checkpoint} on {args.host}:{args.port}, rollout {args.rollout_horizon_s} s "
-        f"{'enabled' if args.rollout_horizon_s else 'disabled'}"
+        f"{'enabled' if args.rollout_horizon_s else 'disabled'}, {args.actor_prediction} actor prediction"
     )
     server.serve_forever()
 
