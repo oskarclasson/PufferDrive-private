@@ -458,16 +458,6 @@ eval:
   mppi_progress_weight: 2.0
   mppi_obstacle_margin_m: 0.5
   mppi_boundary_margin_m: 0.3
-  # Value-guided test-time search (DriveZero): the policy and tts_samples rollouts whose first tts_noise_steps policy
-  # actions get Gaussian noise (normalized action units) run for tts_horizon_s in batched env clones, with every other
-  # actor holding speed and steering, then are scored by the discounted env reward plus the critic's terminal value.
-  # A winning rollout only replaces the first action. Exclusive with MPPI.
-  tts: false
-  tts_samples: 100
-  tts_noise_steps: 5
-  tts_jerk_noise_std: 0.3
-  tts_steer_noise_std: 0.3
-  tts_horizon_s: 2.0
   # Goal inference: every active agent keeps a belief over the ways ahead of it in the editor's route graph (goals spaced
   # along each branch, junction exits and lane changes included),
   # updated each step by exp(beta * advantage) with the critic's advantage gamma * V(next) - V(now) under that route;
@@ -485,12 +475,10 @@ eval:
   # past them). Needs goal_inference.
   joint_prediction: false
   joint_prediction_horizon_s: 5.0
-  # Scenario agent id of the ego (null: none): the only agent that runs test-time search, and the one that keeps its
-  # own goals in the joint prediction.
+  # The rollout's own timestep, the policy's training dt, so a horizon needs fewer policy calls than at the env's dt.
+  joint_prediction_dt: 0.3
+  # Scenario agent id of the ego (null: none): the agent that keeps its own goals in the joint prediction.
   ego_agent_id: null
-  # Return a candidate must beat the policy action by before it replaces it; the paper's 0.03 is below this critic's
-  # noise between near-identical candidates, so the search would switch on noise.
-  tts_switch_margin: 0.3
 controlled_exp:
   train:
     # [sweep.train.learning_rate]

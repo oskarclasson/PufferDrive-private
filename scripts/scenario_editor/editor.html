@@ -116,7 +116,6 @@
 
   <h2>Evaluate (all actors on the policy)</h2>
   <label class="checkbox"><input type="checkbox" id="useMppi" checked> MPPI safety filter (+ light/sign rules)</label>
-  <label class="checkbox"><input type="checkbox" id="useTts"> Value-guided test-time search (instead of MPPI; ego actor only, or every actor when none is marked ego)</label>
   <label class="checkbox"><input type="checkbox" id="usePrediction" checked> 10 s predicted trajectory overlay</label>
   <label class="checkbox"><input type="checkbox" id="useGoalInference"> Infer each actor's goal from its motion (goals in the vehicle's color, size and opacity by belief, B in replay)</label>
   <label class="checkbox"><input type="checkbox" id="useJointPrediction"> Joint prediction: ego on its goals, other actors on their inferred goals (J in replay)</label>
@@ -592,7 +591,7 @@ function renderProps() {
       if (egoInput.checked) box.ego = true;
       refresh();
     });
-    egoLabel.append(egoInput, " Ego: runs test-time search and keeps its own goals in the joint prediction");
+    egoLabel.append(egoInput, " Ego: keeps its own goals in the joint prediction");
     panel.appendChild(egoLabel);
   }
   const row3 = document.createElement("div"); row3.className = "row";
@@ -703,7 +702,7 @@ const METRIC_LABELS = [["active_agent_count", "actors driven by policy", 0], ["c
   ["total_distance_travelled", "total distance m", 0], ["multi_lane_time", "time straddling lanes s", 1],
   ["comfort_violation_count", "comfort violations", 2], ["speed_limit_compliance", "speed-limit compliance", 3]];
 const SETTING_LABELS = [["map", "map"], ["duration_s", "duration s"], ["actor_count", "actors"], ["obstacle_count", "obstacles"],
-  ["mppi", "MPPI"], ["tts", "test-time search"], ["ego_actor", "ego"], ["goal_inference", "goal inference"], ["joint_prediction", "joint prediction"], ["inferred_goal_spacing_m", "inferred goal spacing m"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
+  ["mppi", "MPPI"], ["ego_actor", "ego"], ["goal_inference", "goal inference"], ["joint_prediction", "joint prediction"], ["inferred_goal_spacing_m", "inferred goal spacing m"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
 let runs = [];
 let selectedRun = null;
 let runsTimer = null;
@@ -732,7 +731,7 @@ async function loadRuns() {
     const facts = r.status === "running" ? `running for ${formatElapsed(r.elapsed_s)}`
       : m ? `collisions ${formatMetric(m.collision_rate, 2)} · goals ${formatMetric(m.num_goals_reached, 1)} · red flags ${formatMetric(m.red_light_violation_rate, 2)}`
       : "no results written";
-    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : r.settings.tts ? "RL+TTS" : "RL only");
+    const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : "RL only");
     return `<div class="run ${selectedRun === r.label ? "selected" : ""}" data-label="${escapeHtml(r.label)}">
       <div class="top"><b>${escapeHtml(r.scenario)}</b><span class="badge ${r.status}">${r.status}</span></div>
       <div class="meta">${escapeHtml(r.started)} ${mode ? "· " + mode : ""}</div><div class="meta">${facts}</div></div>`;
@@ -802,7 +801,7 @@ $("evaluate").addEventListener("click", async () => {
   try {
     await saveScenario();
     const {label} = await api("/api/evaluate", {
-      name: $("scenarioName").value.trim(), mppi: $("useMppi").checked, tts: $("useTts").checked,
+      name: $("scenarioName").value.trim(), mppi: $("useMppi").checked,
       prediction: $("usePrediction").checked, goal_inference: $("useGoalInference").checked,
       joint_prediction: $("useJointPrediction").checked,
       capture_observations: $("captureObs").checked, goal_radius: parseFloat($("goalRadius").value),
@@ -811,8 +810,6 @@ $("evaluate").addEventListener("click", async () => {
     setTab("results"); showRun(label);
   } catch (e) { alert(e.message); }
 });
-$("useMppi").addEventListener("change", () => { if ($("useMppi").checked) $("useTts").checked = false; });
-$("useTts").addEventListener("change", () => { if ($("useTts").checked) $("useMppi").checked = false; });
 $("useJointPrediction").addEventListener("change", () => { if ($("useJointPrediction").checked) $("useGoalInference").checked = true; });
 $("useGoalInference").addEventListener("change", () => { if (!$("useGoalInference").checked) $("useJointPrediction").checked = false; });
 $("tabEditor").addEventListener("click", () => setTab("editor"));

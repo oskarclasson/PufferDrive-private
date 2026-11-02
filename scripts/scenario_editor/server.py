@@ -212,8 +212,6 @@ class EditorState:
             raise scenario_builder.ScenarioSpecError(
                 f"inferred goal spacing must be {MIN_INFERRED_GOAL_SPACING_M:g}-{MAX_INFERRED_GOAL_SPACING_M:g} m"
             )
-        if request.get("tts") and request.get("mppi", True):
-            raise scenario_builder.ScenarioSpecError("choose MPPI or test-time search, not both")
         with self.lock:
             if any(run["status"] == "running" for run in self.list_runs()):
                 raise scenario_builder.ScenarioSpecError("an evaluation is already running (see Results)")
@@ -231,7 +229,6 @@ class EditorState:
             run_label = f"{scenario_name}_{datetime.datetime.now():{RUN_STAMP_FORMAT}}"
             settings = {
                 "mppi": bool(request.get("mppi", True)),
-                "tts": bool(request.get("tts", False)),
                 "ego_actor": "none" if ego_actor_idx is None else f"A{ego_actor_idx + 1}",
                 "goal_inference": bool(request.get("goal_inference", False) or request.get("joint_prediction", False)),
                 "joint_prediction": bool(request.get("joint_prediction", False)),
@@ -263,7 +260,6 @@ class EditorState:
                 f"eval.capture_observations={str(settings['capture_observations']).lower()}",
                 f"eval.predict_horizon_s={PREDICT_HORIZON_SECONDS if settings['prediction'] else 0.0}",
                 f"eval.mppi_samples={MPPI_SAMPLE_COUNT if settings['mppi'] else 0}",
-                f"eval.tts={str(settings['tts']).lower()}",
                 f"eval.ego_agent_id={'null' if ego_actor_idx is None else ego_actor_idx}",
                 f"eval.goal_inference={str(settings['goal_inference']).lower()}",
                 f"eval.joint_prediction={str(settings['joint_prediction']).lower()}",
