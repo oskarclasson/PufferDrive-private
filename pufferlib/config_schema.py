@@ -512,9 +512,26 @@ class EvaluationConfig:
     mppi_collision_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     mppi_control_zone_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     mppi_stop_approach_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    mppi_speed_limit_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     mppi_progress_weight: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     mppi_obstacle_margin_m: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     mppi_boundary_margin_m: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    tts: bool = MISSING
+    tts_samples: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
+    tts_noise_steps: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
+    tts_jerk_noise_std: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    tts_steer_noise_std: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    tts_horizon_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    tts_switch_margin: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    goal_inference: bool = MISSING
+    goal_inference_hypotheses: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
+    goal_inference_goal_spacing_m: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_update_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_beta: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    goal_inference_forgetting: float = _constrained_field(PROBABILITY_CONSTRAINT)
+    joint_prediction: bool = MISSING
+    joint_prediction_horizon_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    ego_agent_id: int | None = _constrained_field(NONNEGATIVE_INT_CONSTRAINT)
 
 
 @dataclass

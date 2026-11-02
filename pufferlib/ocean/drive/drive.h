@@ -375,6 +375,7 @@ struct PredictState {
     float *obstacle_poses; // [rollout step][collision-order agent][OBSTACLE_POSE_FIELD_COUNT], step 0 = now
     int obstacle_pose_capacity;
     int recorded_step_count;
+    int ego_active_idx; // -1: every policy agent drives; else the other policy agents hold speed and steering too
 };
 
 typedef struct {
@@ -5346,37 +5347,44 @@ static int write_traffic_control_obs(Drive *env, Agent *ego, float *obs, int obs
     return obs_idx + (env->obs_slots_traffic_controls_n - controls_written) * TRAFFIC_CONTROL_FEATURES;
 }
 
-static void compute_observations(Drive *env) {
-    int obs_per_agent = compute_observation_size(env);
-    memset(env->observations, 0, obs_per_agent * env->active_agent_count * sizeof(float));
-    float (*obs_matrix)[obs_per_agent] = (float (*)[obs_per_agent]) env->observations;
-    PartnerScanEntry partner_scan[env->num_agents];
+static void fill_partner_scan(Drive *env, PartnerScanEntry *partner_scan) {
     for (int j = 0; j < env->num_agents; j++) {
         int index = (j < env->active_agent_count) ? env->active_agent_indices[j]
                                                   : env->static_agent_indices[j - env->active_agent_count];
         Agent *agent = &env->agents[index];
         partner_scan[j] = (PartnerScanEntry) {agent->sim_x, agent->sim_y, agent->sim_z, index};
     }
-    for (int i = 0; i < env->active_agent_count; i++) {
-        float *obs = &obs_matrix[i][0];
-        int agent_idx = env->active_agent_indices[i];
-        Agent *ego = &env->agents[agent_idx];
-        int partner_count = 0;
-        int lane_count = 0;
-        int boundary_count = 0;
-        int traffic_control_count = 0;
-        int obs_idx = 0;
+}
 
-        obs_idx = write_ego_obs(env, ego, obs, obs_idx);
-        obs_idx = write_reward_target_obs(env, ego, obs, obs_idx);
-        obs_idx = write_partner_obs(env, ego, agent_idx, partner_scan, obs, obs_idx, &partner_count);
-        obs_idx = write_road_obs(env, ego, obs, obs_idx, &lane_count, &boundary_count);
-        obs_idx = write_traffic_control_obs(env, ego, obs, obs_idx, &traffic_control_count);
-        obs[obs_idx++] = (float) lane_count;
-        obs[obs_idx++] = (float) boundary_count;
-        obs[obs_idx++] = (float) partner_count;
-        obs[obs_idx++] = (float) traffic_control_count;
-        assert(obs_idx == obs_per_agent);
+// obs must be zeroed: writers skip absent slots.
+static void write_agent_observation(Drive *env, int active_idx, const PartnerScanEntry *partner_scan, float *obs) {
+    int agent_idx = env->active_agent_indices[active_idx];
+    Agent *ego = &env->agents[agent_idx];
+    int partner_count = 0;
+    int lane_count = 0;
+    int boundary_count = 0;
+    int traffic_control_count = 0;
+    int obs_idx = 0;
+
+    obs_idx = write_ego_obs(env, ego, obs, obs_idx);
+    obs_idx = write_reward_target_obs(env, ego, obs, obs_idx);
+    obs_idx = write_partner_obs(env, ego, agent_idx, partner_scan, obs, obs_idx, &partner_count);
+    obs_idx = write_road_obs(env, ego, obs, obs_idx, &lane_count, &boundary_count);
+    obs_idx = write_traffic_control_obs(env, ego, obs, obs_idx, &traffic_control_count);
+    obs[obs_idx++] = (float) lane_count;
+    obs[obs_idx++] = (float) boundary_count;
+    obs[obs_idx++] = (float) partner_count;
+    obs[obs_idx++] = (float) traffic_control_count;
+    assert(obs_idx == compute_observation_size(env));
+}
+
+static void compute_observations(Drive *env) {
+    int obs_per_agent = compute_observation_size(env);
+    memset(env->observations, 0, obs_per_agent * env->active_agent_count * sizeof(float));
+    PartnerScanEntry partner_scan[env->num_agents];
+    fill_partner_scan(env, partner_scan);
+    for (int i = 0; i < env->active_agent_count; i++) {
+        write_agent_observation(env, i, partner_scan, &env->observations[i * obs_per_agent]);
     }
 }
 
@@ -5838,6 +5846,24 @@ static void move_predicted_actor(Drive *env, int agent_idx) {
     update_agent_speed(agent);
 }
 
+// Removes the goals a predicted-goal-list agent has reached, so its obs window shows the next ones.
+static void drop_reached_predicted_goals(Agent *agent) {
+    int reached_count = agent->current_goal_idx;
+    for (int goal_idx = reached_count; goal_idx < agent->goal_count; goal_idx++) {
+        agent->list_goal_x[goal_idx - reached_count] = agent->list_goal_x[goal_idx];
+        agent->list_goal_y[goal_idx - reached_count] = agent->list_goal_y[goal_idx];
+        agent->list_goal_z[goal_idx - reached_count] = agent->list_goal_z[goal_idx];
+        agent->list_goal_lane[goal_idx - reached_count] = agent->list_goal_lane[goal_idx];
+    }
+    agent->goal_count -= reached_count;
+    agent->current_goal_idx = 0;
+    if (agent->goal_count > 0) {
+        agent->current_goal_x = agent->list_goal_x[0];
+        agent->current_goal_y = agent->list_goal_y[0];
+        agent->current_goal_z = agent->list_goal_z[0];
+    }
+}
+
 void c_step(Drive *env) {
     // In eval, a scenario is evaluated once: hold the env after its episode
     // ended, so a short episode does not replay and re-emit within the window.
@@ -5882,7 +5908,9 @@ void c_step(Drive *env) {
         env->logs[i].episode_length += 1;
         int agent_idx = env->active_agent_indices[i];
         Agent *agent = &env->agents[agent_idx];
-        if (agent->controller == CONTROLLER_POLICY) {
+        bool predicted_as_actor = env->predict_mode && env->predict_state->ego_active_idx >= 0
+            && env->predict_state->ego_active_idx != i;
+        if (agent->controller == CONTROLLER_POLICY && !predicted_as_actor) {
             move_dynamics(env, i, agent_idx);
             if (!agent->stopped && !agent->removed && (env->pose_noise_xy_m > 0.0f || env->pose_noise_yaw_rad > 0.0f)
                 && (!env->eval_mode || env->eval_training_render)) {
@@ -5980,6 +6008,10 @@ void c_step(Drive *env) {
         int agent_idx = env->active_agent_indices[i];
         Agent *agent = &env->agents[agent_idx];
         if (agent->metrics_array[REACHED_GOAL_IDX] == 0.0f) {
+            continue;
+        }
+        if (env->predict_mode && agent->predicted_goal_list) {
+            drop_reached_predicted_goals(agent);
             continue;
         }
         if (env->goal_source == GOAL_SOURCE_GT || env->goal_source == GOAL_SOURCE_GT_MAP
@@ -6142,6 +6174,7 @@ int c_predict_begin(Drive *env) {
     }
     write_obstacle_poses(env, ps->obstacle_poses);
     ps->recorded_step_count = 1;
+    ps->ego_active_idx = -1;
     env->predict_mode = 1;
     return 0;
 }
@@ -6184,6 +6217,148 @@ void c_predict_end(Drive *env) {
     *env = ps->saved_env; // scalars, rng streams, episode log and clock; predict_mode was 0 when saved
 }
 
+// ── Candidate clones ─────────────────────────────────────────────────────────
+// A clone shares its source's map and scenario data and owns only what a prediction step mutates, so many
+// candidate rollouts of one env can step side by side. Buffers come from the caller; returns NULL on failure.
+Drive *c_clone_create(
+    Drive *src, float *observations, float *actions, float *rewards, unsigned char *terminals) {
+    Drive *clone = (Drive *) calloc(1, sizeof(Drive));
+    if (clone == NULL) {
+        return NULL;
+    }
+    clone->num_total_agents = src->num_total_agents;
+    clone->logs_capacity = src->logs_capacity;
+    clone->active_agent_count = src->active_agent_count;
+    clone->observations = observations;
+    clone->actions = actions;
+    clone->rewards = rewards;
+    clone->terminals = terminals;
+    clone->agents = (Agent *) calloc(src->num_total_agents, sizeof(Agent));
+    clone->logs = (Log *) calloc(src->logs_capacity > 0 ? src->logs_capacity : 1, sizeof(Log));
+    clone->truncations = (unsigned char *) calloc(src->active_agent_count, sizeof(unsigned char));
+    clone->masks = (unsigned char *) calloc(src->active_agent_count, sizeof(unsigned char));
+    if (clone->agents == NULL || clone->logs == NULL || clone->truncations == NULL || clone->masks == NULL) {
+        free(clone->agents);
+        free(clone->logs);
+        free(clone->truncations);
+        free(clone->masks);
+        free(clone);
+        return NULL;
+    }
+    return clone;
+}
+
+void c_clone_close(Drive *clone) {
+    c_predict_end(clone);
+    for (int i = 0; i < clone->num_total_agents; i++) {
+        free(clone->agents[i].route);
+    }
+    free(clone->agents);
+    free(clone->logs);
+    free(clone->truncations);
+    free(clone->masks);
+    free_predict_state(clone);
+    free(clone);
+}
+
+// Overwrites the clone with src's current state and starts a prediction rollout in which only active index
+// ego_active_idx drives. Returns 0 on success, -1 on allocation failure or a source whose sizes changed.
+int c_clone_predict_begin(Drive *clone, Drive *src, int ego_active_idx) {
+    c_predict_end(clone);
+    if (clone->num_total_agents != src->num_total_agents || clone->logs_capacity != src->logs_capacity
+        || clone->active_agent_count != src->active_agent_count) {
+        return -1;
+    }
+    for (int i = 0; i < clone->num_total_agents; i++) {
+        free(clone->agents[i].route);
+    }
+    Drive owned = *clone;
+    *clone = *src;
+    clone->observations = owned.observations;
+    clone->actions = owned.actions;
+    clone->rewards = owned.rewards;
+    clone->terminals = owned.terminals;
+    clone->truncations = owned.truncations;
+    clone->masks = owned.masks;
+    clone->agents = owned.agents;
+    clone->logs = owned.logs;
+    clone->predict_state = owned.predict_state;
+    memcpy(clone->agents, src->agents, src->num_total_agents * sizeof(Agent));
+    int route_failed = 0;
+    for (int i = 0; i < src->num_total_agents; i++) {
+        Agent *agent = &clone->agents[i];
+        if (agent->route == NULL || agent->route_length <= 0 || route_failed) {
+            agent->route = NULL;
+            continue;
+        }
+        agent->route = (int *) malloc(agent->route_length * sizeof(int));
+        if (agent->route == NULL) {
+            route_failed = 1;
+            continue;
+        }
+        memcpy(agent->route, src->agents[i].route, agent->route_length * sizeof(int));
+    }
+    if (route_failed) {
+        return -1;
+    }
+    if (src->logs_capacity > 0) {
+        memcpy(clone->logs, src->logs, src->logs_capacity * sizeof(Log));
+    }
+    int active_count = src->active_agent_count;
+    memcpy(clone->observations, src->observations, active_count * compute_observation_size(src) * sizeof(float));
+    memcpy(clone->rewards, src->rewards, active_count * sizeof(float));
+    memcpy(clone->terminals, src->terminals, active_count * sizeof(unsigned char));
+    memcpy(clone->truncations, src->truncations, active_count * sizeof(unsigned char));
+    memcpy(clone->masks, src->masks, active_count * sizeof(unsigned char));
+    if (c_predict_begin(clone) != 0) {
+        return -1;
+    }
+    clone->predict_state->ego_active_idx = ego_active_idx;
+    return 0;
+}
+
+// ── Goal hypotheses ──────────────────────────────────────────────────────────
+// Inside a prediction rollout, gives active agent active_idx a fixed list of goal_count (x, y, z, lane) goals: the
+// obs shows the first num_goals and reaching one slides the list on, with no regeneration or removal. goal_count is
+// at most MAX_GOALS; c_predict_end restores the agent.
+void c_predict_set_goals(Drive *env, int active_idx, const float *goals, int goal_count) {
+    Agent *agent = &env->agents[env->active_agent_indices[active_idx]];
+    for (int goal_idx = 0; goal_idx < goal_count; goal_idx++) {
+        agent->list_goal_x[goal_idx] = goals[4 * goal_idx];
+        agent->list_goal_y[goal_idx] = goals[4 * goal_idx + 1];
+        agent->list_goal_z[goal_idx] = goals[4 * goal_idx + 2];
+        agent->list_goal_lane[goal_idx] = (int) goals[4 * goal_idx + 3];
+    }
+    agent->goal_count = goal_count;
+    agent->current_goal_idx = 0;
+    agent->current_goal_x = agent->list_goal_x[0];
+    agent->current_goal_y = agent->list_goal_y[0];
+    agent->current_goal_z = agent->list_goal_z[0];
+    agent->predicted_goal_list = 1;
+}
+
+// Observation of active agent active_idx with goal_count (x, y, z, lane) goals as its window; leaves the env untouched.
+void c_goal_window_observation(
+    Drive *env, int active_idx, const PartnerScanEntry *partner_scan, const float *goals, int goal_count, float *obs_out) {
+    Agent *agent = &env->agents[env->active_agent_indices[active_idx]];
+    float goal_x[MAX_GOALS], goal_y[MAX_GOALS], goal_z[MAX_GOALS];
+    int goal_lane[MAX_GOALS];
+    for (int goal_idx = 0; goal_idx < goal_count; goal_idx++) {
+        goal_x[goal_idx] = goals[4 * goal_idx];
+        goal_y[goal_idx] = goals[4 * goal_idx + 1];
+        goal_z[goal_idx] = goals[4 * goal_idx + 2];
+        goal_lane[goal_idx] = (int) goals[4 * goal_idx + 3];
+    }
+    // Observation writers advance per-agent counters and the env rng, so both are restored afterwards.
+    Agent saved_agent = *agent;
+    Rng saved_rng = env->rng_state;
+    commit_goals(env, agent, goal_x, goal_y, goal_z, goal_lane, goal_count, 0);
+    memset(obs_out, 0, compute_observation_size(env) * sizeof(float));
+    write_agent_observation(env, active_idx, partner_scan, obs_out);
+    *agent = saved_agent;
+    env->rng_state = saved_rng;
+}
+
 // ── MPPI safety cost ─────────────────────────────────────────────────────────
 typedef struct {
     float cbf_decay_rate; // 1/s: a safe step keeps h(t+1) >= (1 - cbf_decay_rate * dt) * h(t)
@@ -6193,6 +6368,7 @@ typedef struct {
     float collision_weight;
     float control_zone_weight;
     float stop_approach_weight;
+    float speed_limit_weight;
 } MppiCostParams;
 
 // Box just past a stop line, pose as x, y, cos, sin with cos/sin along the controlled travel direction.
@@ -6433,8 +6609,25 @@ void c_mppi_prepare_agent(Drive *env, int active_idx, const float *nominal_actio
     }
 }
 
+// Re-associates the agent with a lane as compute_metrics does and returns its speed above that lane's limit.
+static float compute_speed_limit_excess(Drive *env, Agent *agent) {
+    bool is_offroad;
+    int lane_idx, lane_seg_idx;
+    float signed_lane_distance, lane_heading;
+    find_lane_and_offroad(env, agent, &is_offroad, &lane_idx, &lane_seg_idx, &signed_lane_distance, &lane_heading);
+    if (lane_idx != -1) {
+        agent->current_lane_idx = lane_idx;
+    }
+    float speed_limit_mps = UNKNOWN_LANE_SPEED_LIMIT_MPS;
+    if (agent->current_lane_idx != -1 && env->lane_speed_limit_mps[agent->current_lane_idx] > 0) {
+        speed_limit_mps = env->lane_speed_limit_mps[agent->current_lane_idx];
+    }
+    return fmaxf(agent->sim_speed - speed_limit_mps - env->overspeed_tolerance_mps, 0.0f);
+}
+
 // Rolls one policy agent through sample_count action sequences of horizon_steps against the obstacle poses of the
-// last prediction rollout, and scores each with discrete-time CBF violations on obstacle and road-edge clearance.
+// last prediction rollout, and scores each with discrete-time CBF violations on obstacle and road-edge clearance
+// plus the distance driven above the lane speed limit.
 // sample_actions is [sample][step][2]; outputs costs[sample] and sample_xy[sample][step][2]. Leaves the env unchanged.
 void c_mppi_rollout_costs(
     Drive *env,
@@ -6512,6 +6705,9 @@ void c_mppi_rollout_costs(
             }
             if (is_footprint_in_zones(agent, uncertain_zones, uncertain_count, cleared_mask)) {
                 cost += params->control_zone_weight;
+            }
+            if (params->speed_limit_weight > 0.0f) {
+                cost += params->speed_limit_weight * compute_speed_limit_excess(env, agent) * env->dt;
             }
             prev_obstacle_barrier = obstacle_barrier;
             prev_boundary_barrier = boundary_barrier;

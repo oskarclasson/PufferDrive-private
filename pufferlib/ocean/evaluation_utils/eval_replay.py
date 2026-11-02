@@ -85,6 +85,9 @@ class EvalReplayCapture:
         entropy,
         predicted_xy=None,
         mppi_xy=None,
+        tts_paths=None,
+        goal_belief=None,
+        joint_paths=None,
     ):
         if self.policy_history_frame_count == self.capture_batch_steps:
             self.policy_history = {}
@@ -101,6 +104,19 @@ class EvalReplayCapture:
             replay_frame["predicted_xy"] = predicted_xy[: self.agents_per_batch]
         if mppi_xy is not None:
             replay_frame["mppi_xy"] = mppi_xy[: self.agents_per_batch]
+        if tts_paths is not None:
+            tts_xy, tts_best, tts_switched = tts_paths
+            replay_frame["tts_xy"] = tts_xy[: self.agents_per_batch]
+            replay_frame["tts_best"] = tts_best[: self.agents_per_batch]
+            replay_frame["tts_switched"] = tts_switched[: self.agents_per_batch]
+        if goal_belief is not None:
+            goal_xy, belief = goal_belief
+            replay_frame["inferred_goal_xy"] = goal_xy[: self.agents_per_batch]
+            replay_frame["inferred_goal_belief"] = belief[: self.agents_per_batch]
+        if joint_paths is not None:
+            joint_xy, joint_ego = joint_paths
+            replay_frame["joint_prediction_xy"] = joint_xy[: self.agents_per_batch]
+            replay_frame["joint_prediction_ego"] = joint_ego[: self.agents_per_batch]
         if isinstance(logits, torch.distributions.Normal):
             replay_frame["policy_mean"] = logits.loc[: self.agents_per_batch].detach().float().cpu().numpy()
             replay_frame["policy_std"] = logits.scale[: self.agents_per_batch].detach().float().cpu().numpy()

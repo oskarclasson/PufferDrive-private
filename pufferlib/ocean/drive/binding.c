@@ -30,7 +30,13 @@ static PyObject *map_cache_preload_py(PyObject *self __attribute__((unused)), Py
 static PyObject *map_cache_release_py(PyObject *self __attribute__((unused)), PyObject *args, PyObject *kwargs);
 static PyObject *vec_predict_begin_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_predict_end_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_clone_create_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_clone_predict_begin_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_clone_close_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_goal_window_observations_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_predict_set_goals_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_get_active_agent_xy_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_get_active_agent_ids_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_predict_record_obstacles_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_mppi_rollout_costs_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyObject *args);
@@ -46,12 +52,23 @@ static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyO
     {"vec_predict_begin", vec_predict_begin_py, METH_VARARGS, \
      "Snapshot every env and start a prediction rollout (non-policy actors hold speed and steering)."}, \
     {"vec_predict_end", vec_predict_end_py, METH_VARARGS, "Restore every env to its pre-prediction snapshot."}, \
+    {"vec_clone_create", vec_clone_create_py, METH_VARARGS, \
+     "Create copy_count candidate clones of every env, stepping into (copies x active agents) buffers."}, \
+    {"vec_clone_predict_begin", vec_clone_predict_begin_py, METH_VARARGS, \
+     "Copy each source env into its clones and start rollouts; copy c of env e drives ego_indices[e, c / candidates]."}, \
+    {"vec_clone_close", vec_clone_close_py, METH_VARARGS, "Free candidate clones without touching shared map data."}, \
+    {"vec_predict_set_goals", vec_predict_set_goals_py, METH_VARARGS, \
+     "In a running prediction rollout, give each active agent with count > 0 a fixed, sliding (x, y, z, lane) goal list."}, \
+    {"vec_goal_window_observations", vec_goal_window_observations_py, METH_VARARGS, \
+     "Observation of every active agent under each (x, y, z, lane) goal window, the env left untouched."}, \
     {"vec_get_active_agent_xy", vec_get_active_agent_xy_py, METH_VARARGS, \
      "Fill an (active agents, 2) float32 array with active-agent sim positions."}, \
+    {"vec_get_active_agent_ids", vec_get_active_agent_ids_py, METH_VARARGS, \
+     "Fill an (active agents,) int32 array with each active agent's scenario id."}, \
     {"vec_predict_record_obstacles", vec_predict_record_obstacles_py, METH_VARARGS, \
      "Record every collision candidate's pose as the next step of the running prediction rollout."}, \
     {"vec_mppi_rollout_costs", vec_mppi_rollout_costs_py, METH_VARARGS, \
-     "Roll sampled action sequences per active agent and score them with CBF obstacle/road-edge costs."}, \
+     "Roll sampled action sequences per active agent and score them with CBF obstacle/road-edge and speed-limit costs."}, \
     {"vec_mppi_prepare", vec_mppi_prepare_py, METH_VARARGS, \
      "Set each active agent's forward_only flag and stop-sign clearance from its nominal (steps, 2) plan."}
 // clang-format on
@@ -2077,6 +2094,40 @@ static PyObject *vec_get_active_agent_xy_py(PyObject *self __attribute__((unused
     Py_RETURN_NONE;
 }
 
+static PyObject *vec_get_active_agent_ids_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    if (PyTuple_Size(args) != 2) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_active_agent_ids requires 2 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    PyObject *out_obj = PyTuple_GetItem(args, 1);
+    if (!PyArray_Check(out_obj) || PyArray_TYPE((PyArrayObject *) out_obj) != NPY_INT32
+        || !PyArray_IS_C_CONTIGUOUS((PyArrayObject *) out_obj)) {
+        PyErr_SetString(PyExc_TypeError, "out must be a C-contiguous int32 NumPy array");
+        return NULL;
+    }
+    int total_active = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total_active += ((Drive *) vec->envs[i])->active_agent_count;
+    }
+    if ((int) PyArray_SIZE((PyArrayObject *) out_obj) < total_active) {
+        PyErr_SetString(PyExc_ValueError, "out is smaller than the active agent count");
+        return NULL;
+    }
+    int *out = (int *) PyArray_DATA((PyArrayObject *) out_obj);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        for (int j = 0; j < drive->active_agent_count; j++) {
+            out[row++] = drive->agents[drive->active_agent_indices[j]].id;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *vec_predict_record_obstacles_py(PyObject *self __attribute__((unused)), PyObject *args) {
     VecEnv *vec = unpack_vecenv(args);
     if (!vec) {
@@ -2105,12 +2156,283 @@ static PyArrayObject *require_float32_array(PyObject *obj, int ndim, const char 
     return (PyArrayObject *) obj;
 }
 
+static PyArrayObject *require_byte_array(PyObject *obj, const char *name) {
+    if (!PyArray_Check(obj) || PyArray_ITEMSIZE((PyArrayObject *) obj) != 1
+        || !PyArray_IS_C_CONTIGUOUS((PyArrayObject *) obj) || PyArray_NDIM((PyArrayObject *) obj) != 1) {
+        PyErr_Format(PyExc_TypeError, "%s must be a C-contiguous 1-D bool or uint8 NumPy array", name);
+        return NULL;
+    }
+    return (PyArrayObject *) obj;
+}
+
+// Clone index c * source_count + e is copy c of source env e; its rows start at c * total_active + offset of e.
+static PyObject *vec_clone_create_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *src_obj, *observations_obj, *actions_obj, *rewards_obj, *terminals_obj;
+    int copy_count;
+    if (!PyArg_ParseTuple(
+            args, "OiOOOO", &src_obj, &copy_count, &observations_obj, &actions_obj, &rewards_obj, &terminals_obj)) {
+        return NULL;
+    }
+    VecEnv *src_vec = unpack_vecenv(args);
+    if (!src_vec) {
+        return NULL;
+    }
+    PyArrayObject *observations = require_float32_array(observations_obj, 2, "observations");
+    PyArrayObject *actions = observations ? require_float32_array(actions_obj, 2, "actions") : NULL;
+    PyArrayObject *rewards = actions ? require_float32_array(rewards_obj, 1, "rewards") : NULL;
+    PyArrayObject *terminals = rewards ? require_byte_array(terminals_obj, "terminals") : NULL;
+    if (!terminals) {
+        return NULL;
+    }
+    if (copy_count <= 0) {
+        PyErr_SetString(PyExc_ValueError, "copy_count must be positive");
+        return NULL;
+    }
+    int total_active = 0;
+    for (int e = 0; e < src_vec->num_envs; e++) {
+        total_active += ((Drive *) src_vec->envs[e])->active_agent_count;
+    }
+    int observation_size = compute_observation_size((Drive *) src_vec->envs[0]);
+    npy_intp row_count = (npy_intp) copy_count * total_active;
+    if (PyArray_DIM(observations, 0) != row_count || PyArray_DIM(observations, 1) != observation_size
+        || PyArray_DIM(actions, 0) != row_count || PyArray_DIM(actions, 1) != 2
+        || PyArray_DIM(rewards, 0) != row_count || PyArray_DIM(terminals, 0) != row_count) {
+        PyErr_SetString(PyExc_ValueError, "clone buffers must have copy_count * active agents rows");
+        return NULL;
+    }
+    VecEnv *clone_vec = (VecEnv *) calloc(1, sizeof(VecEnv));
+    if (clone_vec == NULL) {
+        return PyErr_NoMemory();
+    }
+    clone_vec->envs = (Env **) calloc((size_t) copy_count * src_vec->num_envs, sizeof(Env *));
+    if (clone_vec->envs == NULL) {
+        free(clone_vec);
+        return PyErr_NoMemory();
+    }
+    float *observation_data = (float *) PyArray_DATA(observations);
+    float *action_data = (float *) PyArray_DATA(actions);
+    float *reward_data = (float *) PyArray_DATA(rewards);
+    unsigned char *terminal_data = (unsigned char *) PyArray_DATA(terminals);
+    for (int copy_idx = 0; copy_idx < copy_count; copy_idx++) {
+        int row = copy_idx * total_active;
+        for (int e = 0; e < src_vec->num_envs; e++) {
+            Drive *src = (Drive *) src_vec->envs[e];
+            Drive *clone = c_clone_create(
+                src,
+                &observation_data[(size_t) row * observation_size],
+                &action_data[(size_t) row * 2],
+                &reward_data[row],
+                &terminal_data[row]);
+            if (clone == NULL) {
+                for (int i = 0; i < clone_vec->num_envs; i++) {
+                    c_clone_close((Drive *) clone_vec->envs[i]);
+                }
+                free(clone_vec->envs);
+                free(clone_vec);
+                return PyErr_NoMemory();
+            }
+            clone_vec->envs[clone_vec->num_envs++] = (Env *) clone;
+            row += src->active_agent_count;
+        }
+    }
+    return PyLong_FromVoidPtr(clone_vec);
+}
+
+// An ego index at or past an env's active count leaves every policy agent there holding speed and steering.
+static PyObject *vec_clone_predict_begin_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *clone_obj, *src_obj, *ego_obj;
+    int candidates_per_ego;
+    if (!PyArg_ParseTuple(args, "OOiO", &clone_obj, &src_obj, &candidates_per_ego, &ego_obj)) {
+        return NULL;
+    }
+    VecEnv *clone_vec = unpack_vecenv(args);
+    PyObject *src_args = PyTuple_Pack(1, src_obj);
+    if (!clone_vec || src_args == NULL) {
+        Py_XDECREF(src_args);
+        return NULL;
+    }
+    VecEnv *src_vec = unpack_vecenv(src_args);
+    Py_DECREF(src_args);
+    if (!src_vec) {
+        return NULL;
+    }
+    if (!PyArray_Check(ego_obj) || PyArray_TYPE((PyArrayObject *) ego_obj) != NPY_INT32
+        || !PyArray_IS_C_CONTIGUOUS((PyArrayObject *) ego_obj) || PyArray_NDIM((PyArrayObject *) ego_obj) != 2) {
+        PyErr_SetString(PyExc_TypeError, "ego_indices must be a C-contiguous 2-D int32 NumPy array");
+        return NULL;
+    }
+    PyArrayObject *ego_indices = (PyArrayObject *) ego_obj;
+    npy_intp ego_count = PyArray_DIM(ego_indices, 1);
+    if (candidates_per_ego <= 0 || PyArray_DIM(ego_indices, 0) != src_vec->num_envs
+        || (npy_intp) clone_vec->num_envs != ego_count * candidates_per_ego * src_vec->num_envs) {
+        PyErr_SetString(PyExc_ValueError, "clones do not match the source envs, egos and candidates");
+        return NULL;
+    }
+    int *ego_data = (int *) PyArray_DATA(ego_indices);
+    for (npy_intp i = 0; i < PyArray_SIZE(ego_indices); i++) {
+        if (ego_data[i] < 0) {
+            PyErr_SetString(PyExc_ValueError, "ego_indices must be non-negative");
+            return NULL;
+        }
+    }
+    for (int i = 0; i < clone_vec->num_envs; i++) {
+        int copy_idx = i / src_vec->num_envs;
+        int env_idx = i % src_vec->num_envs;
+        int ego_active_idx = ego_data[env_idx * ego_count + copy_idx / candidates_per_ego];
+        if (c_clone_predict_begin((Drive *) clone_vec->envs[i], (Drive *) src_vec->envs[env_idx], ego_active_idx)
+            != 0) {
+            PyErr_SetString(PyExc_RuntimeError, "vec_clone_predict_begin failed: allocation or source size changed");
+            return NULL;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_clone_close_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    VecEnv *clone_vec = unpack_vecenv(args);
+    if (!clone_vec) {
+        return NULL;
+    }
+    for (int i = 0; i < clone_vec->num_envs; i++) {
+        c_clone_close((Drive *) clone_vec->envs[i]);
+    }
+    free(clone_vec->envs);
+    free(clone_vec);
+    Py_RETURN_NONE;
+}
+
+static int vec_active_agent_count(VecEnv *vec) {
+    int total_active = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total_active += ((Drive *) vec->envs[i])->active_agent_count;
+    }
+    return total_active;
+}
+
+static PyArrayObject *require_int32_array(PyObject *obj, int ndim, const char *name) {
+    if (!PyArray_Check(obj) || PyArray_TYPE((PyArrayObject *) obj) != NPY_INT32
+        || !PyArray_IS_C_CONTIGUOUS((PyArrayObject *) obj) || PyArray_NDIM((PyArrayObject *) obj) != ndim) {
+        PyErr_Format(PyExc_TypeError, "%s must be a C-contiguous %d-D int32 NumPy array", name, ndim);
+        return NULL;
+    }
+    return (PyArrayObject *) obj;
+}
+
+static PyObject *vec_predict_set_goals_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *env_obj, *goals_obj, *counts_obj;
+    if (!PyArg_ParseTuple(args, "OOO", &env_obj, &goals_obj, &counts_obj)) {
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    PyArrayObject *goals = vec ? require_float32_array(goals_obj, 3, "goals") : NULL;
+    PyArrayObject *counts = goals ? require_int32_array(counts_obj, 1, "counts") : NULL;
+    if (!counts) {
+        return NULL;
+    }
+    npy_intp agent_count = vec_active_agent_count(vec);
+    npy_intp list_length = PyArray_DIM(goals, 1);
+    if (PyArray_DIM(goals, 0) != agent_count || list_length > MAX_GOALS || PyArray_DIM(goals, 2) != 4
+        || PyArray_DIM(counts, 0) != agent_count) {
+        PyErr_Format(
+            PyExc_ValueError, "goals must be (active agents, <= %d, 4) and counts (active agents,)", MAX_GOALS);
+        return NULL;
+    }
+    float *goal_data = (float *) PyArray_DATA(goals);
+    int *count_data = (int *) PyArray_DATA(counts);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        if (!drive->predict_mode) {
+            PyErr_SetString(PyExc_RuntimeError, "vec_predict_set_goals requires a running prediction rollout");
+            return NULL;
+        }
+        int env_first_row = row;
+        for (int j = 0; j < drive->active_agent_count; j++, row++) {
+            const float *agent_goals = &goal_data[(size_t) row * list_length * 4];
+            if (count_data[row] < 0 || count_data[row] > list_length) {
+                PyErr_SetString(PyExc_ValueError, "goal count out of range");
+                return NULL;
+            }
+            for (int g = 0; g < count_data[row]; g++) {
+                if (agent_goals[4 * g + 3] < -1.0f || agent_goals[4 * g + 3] >= drive->num_road_elements) {
+                    PyErr_SetString(PyExc_ValueError, "goal lane index out of range");
+                    return NULL;
+                }
+            }
+        }
+        for (int j = 0; j < drive->active_agent_count; j++) {
+            int agent_row = env_first_row + j;
+            if (count_data[agent_row] > 0) {
+                c_predict_set_goals(drive, j, &goal_data[(size_t) agent_row * list_length * 4], count_data[agent_row]);
+            }
+        }
+        // The policy's next action must see the new goals.
+        compute_observations(drive);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_goal_window_observations_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *env_obj, *windows_obj, *counts_obj, *obs_obj;
+    if (!PyArg_ParseTuple(args, "OOOO", &env_obj, &windows_obj, &counts_obj, &obs_obj)) {
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    PyArrayObject *windows = vec ? require_float32_array(windows_obj, 4, "windows") : NULL;
+    PyArrayObject *counts = windows ? require_int32_array(counts_obj, 2, "counts") : NULL;
+    PyArrayObject *obs = counts ? require_float32_array(obs_obj, 3, "obs") : NULL;
+    if (!obs) {
+        return NULL;
+    }
+    Drive *first = (Drive *) vec->envs[0];
+    npy_intp agent_count = vec_active_agent_count(vec), route_count = PyArray_DIM(windows, 1);
+    if (PyArray_DIM(windows, 0) != agent_count || PyArray_DIM(windows, 2) != first->num_goals
+        || PyArray_DIM(windows, 3) != 4 || PyArray_DIM(counts, 0) != agent_count || PyArray_DIM(counts, 1) != route_count
+        || PyArray_DIM(obs, 0) != agent_count || PyArray_DIM(obs, 1) != route_count
+        || PyArray_DIM(obs, 2) != compute_observation_size(first)) {
+        PyErr_SetString(PyExc_ValueError, "goal windows must be (active agents, routes, num_goals, 4) shaped");
+        return NULL;
+    }
+    float *window_data = (float *) PyArray_DATA(windows);
+    int *count_data = (int *) PyArray_DATA(counts);
+    float *obs_data = (float *) PyArray_DATA(obs);
+    int observation_size = compute_observation_size(first);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        PartnerScanEntry partner_scan[drive->num_agents];
+        fill_partner_scan(drive, partner_scan);
+        for (int j = 0; j < drive->active_agent_count; j++, row++) {
+            for (int k = 0; k < route_count; k++) {
+                size_t hypothesis = (size_t) row * route_count + k;
+                int goal_count = count_data[hypothesis];
+                if (goal_count < 0 || goal_count > drive->num_goals) {
+                    PyErr_SetString(PyExc_ValueError, "goal window count out of range");
+                    return NULL;
+                }
+                const float *window = &window_data[hypothesis * drive->num_goals * 4];
+                for (int g = 0; g < goal_count; g++) {
+                    if ((int) window[4 * g + 3] >= drive->num_road_elements) {
+                        PyErr_SetString(PyExc_ValueError, "goal lane index out of range");
+                        return NULL;
+                    }
+                }
+                if (goal_count > 0) {
+                    c_goal_window_observation(
+                        drive, j, partner_scan, window, goal_count, &obs_data[hypothesis * observation_size]);
+                }
+            }
+        }
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *vec_mppi_rollout_costs_py(PyObject *self __attribute__((unused)), PyObject *args) {
     PyObject *env_obj, *actions_obj, *costs_obj, *xy_obj;
     MppiCostParams params;
     if (!PyArg_ParseTuple(
             args,
-            "OOOOfffffff",
+            "OOOOffffffff",
             &env_obj,
             &actions_obj,
             &costs_obj,
@@ -2121,7 +2443,8 @@ static PyObject *vec_mppi_rollout_costs_py(PyObject *self __attribute__((unused)
             &params.cbf_weight,
             &params.collision_weight,
             &params.control_zone_weight,
-            &params.stop_approach_weight)) {
+            &params.stop_approach_weight,
+            &params.speed_limit_weight)) {
         return NULL;
     }
     VecEnv *vec = unpack_vecenv(args);
