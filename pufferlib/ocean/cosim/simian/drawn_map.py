@@ -101,6 +101,9 @@ class DrawnMap:
     def heading_to_bin(self, heading_rad):
         return heading_rad + self.heading_offset_rad
 
+    def heading_from_bin(self, heading_rad):
+        return heading_rad - self.heading_offset_rad
+
     def velocity_to_bin(self, vx, vy):
         cos_offset, sin_offset = math.cos(self.heading_offset_rad), math.sin(self.heading_offset_rad)
         return vx * cos_offset - vy * sin_offset, vx * sin_offset + vy * cos_offset

@@ -6,6 +6,10 @@ policy. POST /reset builds a map-only bin from the adapter's road graph, or load
 ego in slot 0 and Simian's ground-truth actors streamed into the co-sim partner slots. Every POST /step
 syncs ego, actors, lights and the route goal window, runs the policy once and integrates the jerk
 dynamics one dt; the adapter tracks the returned acceleration, speed and curvature with the tire model.
+With --rollout-horizon-s every step also rolls the policy ahead, the actors held at constant velocity, and
+returns the rollout in the step debug, which GET /reference also serves. In the full stack AD is the client
+instead of the adapter: it resets and steps the policy with its own ego state and tracked obstacles, without a
+road graph, so --drawn-map is required, and the rollout is the reference its trajectory planner tracks.
 
 All JSON coordinates are in the Simian map frame [m], headings CCW from +x [rad], velocities in that
 frame [m/s], and the ego position is the bounding-box center.
@@ -16,6 +20,7 @@ import json
 import math
 import tempfile
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,7 +53,26 @@ DEFAULT_PORT = 8710
 DEFAULT_MAX_STEPS = 6000
 DEFAULT_MAX_PARTNERS = 63
 DEFAULT_GOAL_SPACING_M = 30.0
+DEFAULT_ROLLOUT_HORIZON_S = 0.0
+STEP_LOG_INTERVAL_STEPS = 10
+REFERENCE_MISS_LOG_INTERVAL_S = 5.0
+NS_PER_S = 1e9
 COMPILE_PREFIXES = ("module.", "_orig_mod.")
+
+
+def log(message):
+    print(f"[simian_policy] {message}", flush=True)
+
+
+def rollout_summary(points):
+    """Length [m] and duration [s] of the rollout until the policy reverses, and its end speed [m/s]."""
+    length_m, forward_end = 0.0, points[0]
+    for prev, point in zip(points, points[1:]):
+        if point["speed_mps"] < 0:
+            break
+        length_m += math.hypot(point["x"] - prev["x"], point["y"] - prev["y"])
+        forward_end = point
+    return length_m, forward_end["t"], points[-1]["speed_mps"]
 
 
 def clean_policy_state_dict(state_dict):
@@ -76,6 +100,8 @@ class PolicySession:
             self.map = DrawnMap(
                 args.drawn_map_spec, request["utm_zone"], request["utm_north"], float(ego["x"]), float(ego["y"])
             )
+        elif "road_graph" not in request:
+            raise ValueError("reset without a road graph needs the server started with --drawn-map")
         else:
             bin_path = Path(work_dir) / "simian_map.bin"
             origin = (round(float(ego["x"])), round(float(ego["y"])))
@@ -108,6 +134,7 @@ class PolicySession:
         ex, ey = self.map.to_bin(float(ego["x"]), float(ego["y"]))
         self.ego_stopped_s = 0.0
         self.partner_stopped_s = {}  # Simian actor id -> seconds at standstill
+        self.partners = None
         self._set_ego(ego, ex, ey, accel_long=0.0)
         readback = self.env.get_global_agent_state()
         if (
@@ -142,6 +169,8 @@ class PolicySession:
         self.goal_count = len(goals)
         self.lane_count = len(self.map.lane_idx_by_id)
         self.scenario_length = scenario_length
+        self.rollout_steps = int(round(float(args.rollout_horizon_s) / self.dt))
+        self.reference = None
 
     def _set_ego(self, ego, ex, ey, accel_long):
         vx, vy = self.map.velocity_to_bin(float(ego["vx"]), float(ego["vy"]))
@@ -171,25 +200,24 @@ class PolicySession:
 
     def _set_partners(self, ego_x, ego_y, actors):
         actors = sorted(actors, key=lambda a: (a["x"] - ego_x) ** 2 + (a["y"] - ego_y) ** 2)[: self.max_partners]
+        self.partners = None
         if actors:
             idx = np.arange(1, 1 + len(actors), dtype=np.int32)
             bx, by = self.map.to_bin(np.array([a["x"] for a in actors]), np.array([a["y"] for a in actors]))
             bvx, bvy = self.map.velocity_to_bin(
                 np.array([a["vx"] for a in actors]), np.array([a["vy"] for a in actors])
             )
-            zero = np.zeros(len(actors), np.float32)
-            self.env.set_agent_states(
-                idx,
-                bx.astype(np.float32),
-                by.astype(np.float32),
-                np.array([a["z"] for a in actors], np.float32),
-                self.map.heading_to_bin(np.array([a["heading"] for a in actors], np.float32)),
-                bvx.astype(np.float32),
-                bvy.astype(np.float32),
-                zero,
-                zero,
-                np.array([self.partner_stopped_s[a["id"]] for a in actors], np.float32),
-            )
+            self.partners = {
+                "idx": idx,
+                "x": bx,
+                "y": by,
+                "z": np.array([a["z"] for a in actors], np.float32),
+                "heading": self.map.heading_to_bin(np.array([a["heading"] for a in actors], np.float32)),
+                "vx": bvx,
+                "vy": bvy,
+                "stopped_s": np.array([self.partner_stopped_s[a["id"]] for a in actors], np.float32),
+            }
+            self._place_partners(elapsed_s=0.0)
             self.env.set_agent_sizes(
                 idx,
                 np.array([a["length"] for a in actors], np.float32),
@@ -201,6 +229,26 @@ class PolicySession:
             zero = np.zeros_like(far)
             self.env.set_agent_states(surplus, far, far, far, zero, zero, zero, zero, zero)
 
+    def _place_partners(self, elapsed_s):
+        """Write the streamed actors into their slots, extrapolated elapsed_s ahead at constant velocity."""
+        if self.partners is None:
+            return
+        partners = self.partners
+        stopped = np.hypot(partners["vx"], partners["vy"]) < float(binding.AGENT_STOPPED_SPEED_THRESHOLD)
+        zero = np.zeros(len(partners["idx"]), np.float32)
+        self.env.set_agent_states(
+            partners["idx"],
+            (partners["x"] + partners["vx"] * elapsed_s).astype(np.float32),
+            (partners["y"] + partners["vy"] * elapsed_s).astype(np.float32),
+            partners["z"],
+            partners["heading"],
+            partners["vx"].astype(np.float32),
+            partners["vy"].astype(np.float32),
+            zero,
+            zero,
+            (partners["stopped_s"] + stopped * elapsed_s).astype(np.float32),
+        )
+
     def _set_lights(self, light_states):
         if not self.map.num_traffic:
             return
@@ -208,6 +256,62 @@ class PolicySession:
             [int(light_states.get(light_id, LIGHT_STATE_GREEN)) for light_id in self.map.element_light_ids], np.int32
         )
         self.env.set_traffic_light_states(states)
+
+    def _infer(self, obs):
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(obs).to(self.device)
+            logits, value = self.policy.forward_eval(obs_tensor)
+            action, _, _, cont_action = pufferlib.pytorch.sample_logits(
+                logits, action_selection=self.action_selection, env_continuous=self.env_continuous, policy=self.policy
+            )
+        env_action = cont_action if self.env_continuous and cont_action is not None else action
+        act = env_action.cpu().numpy().reshape(self.env.num_agents, -1)
+        if not self.env_continuous:
+            act = act.astype(np.int32)
+        return obs_tensor, act, logits, value
+
+    def _ego_motion(self):
+        """Speed [m/s], acceleration [m/s^2], steering angle [rad] and curvature [1/m] of the shadow ego."""
+        ego_obs = np.asarray(self.env.observations)[EGO_SLOT]
+        steering_angle = float(ego_obs[EGO_OBS_STEERING_IDX]) * EGO_OBS_STEERING_NORM_RAD
+        return (
+            float(ego_obs[EGO_OBS_SPEED_IDX]) * float(self.env.obs_norm_speed_mps),
+            float(ego_obs[EGO_OBS_ACCEL_LONG_IDX]) * float(binding.ACCEL_LONG_NORM),
+            steering_angle,
+            math.tan(steering_angle) / (WHEELBASE_LENGTH_RATIO * self.ego_length_m),
+        )
+
+    def _rollout_point(self, time_s):
+        state = self.env.get_global_agent_state()
+        x, y = self.map.from_bin(float(state["x"][EGO_SLOT]), float(state["y"][EGO_SLOT]))
+        speed_mps, accel_mps2, _, curvature_inv_m = self._ego_motion()
+        return {
+            "t": time_s,
+            "x": float(x),
+            "y": float(y),
+            "heading": float(self.map.heading_from_bin(float(state["heading"][EGO_SLOT]))),
+            "speed_mps": speed_mps,
+            "accel_long_mps2": accel_mps2,
+            "curvature_inv_m": curvature_inv_m,
+        }
+
+    def _rollout(self, first_action):
+        """The ego poses of the policy rolled ahead from now, the Simian actors held at constant velocity."""
+        points = [self._rollout_point(0.0)]
+        action = first_action
+        self.env.predict_begin()
+        try:
+            for step_idx in range(self.rollout_steps):
+                if step_idx:
+                    action = self._infer(self.env.observations)[1]
+                self.env.predict_step(action)
+                # c_step holds static slots in place, so the streamed actors are moved here
+                self._place_partners(elapsed_s=(step_idx + 1) * self.dt)
+                self.env.recompute_observations()
+                points.append(self._rollout_point((step_idx + 1) * self.dt))
+        finally:
+            self.env.predict_end()
+        return points
 
     def _debug(self, obs_tensor, logits, value):
         """What the policy saw and chose this step: the decoded ego-frame observation, the goal window in the map
@@ -242,29 +346,22 @@ class PolicySession:
         obs = np.asarray(self.env.recompute_observations())
         start_speed_mps = float(obs[EGO_SLOT][EGO_OBS_SPEED_IDX]) * float(self.env.obs_norm_speed_mps)
 
-        with torch.no_grad():
-            obs_tensor = torch.as_tensor(obs).to(self.device)
-            logits, value = self.policy.forward_eval(obs_tensor)
-            action, _, _, cont_action = pufferlib.pytorch.sample_logits(
-                logits, action_selection=self.action_selection, env_continuous=self.env_continuous, policy=self.policy
-            )
-        env_action = cont_action if self.env_continuous and cont_action is not None else action
-        act = env_action.cpu().numpy().reshape(self.env.num_agents, -1)
-        if not self.env_continuous:
-            act = act.astype(np.int32)
+        obs_tensor, act, logits, value = self._infer(obs)
         debug = self._debug(obs_tensor, logits, value)
+        if self.rollout_steps:
+            self.reference = {"time_ns": int(request["time_ns"]), "dt": self.dt, "points": self._rollout(act)}
+            debug["rollout"] = self.reference["points"]
         self.env.step(act)
 
-        ego_obs = np.asarray(self.env.observations)[EGO_SLOT]
-        steering_angle = float(ego_obs[EGO_OBS_STEERING_IDX]) * EGO_OBS_STEERING_NORM_RAD
+        speed_mps, accel_mps2, steering_angle, curvature_inv_m = self._ego_motion()
         current_goal_idx, goal_count = self.env.get_agent_goal_progress(EGO_SLOT)
         return {
             "dt": self.dt,
             "start_speed_mps": start_speed_mps,
-            "speed_mps": float(ego_obs[EGO_OBS_SPEED_IDX]) * float(self.env.obs_norm_speed_mps),
-            "accel_long_mps2": float(ego_obs[EGO_OBS_ACCEL_LONG_IDX]) * float(binding.ACCEL_LONG_NORM),
+            "speed_mps": speed_mps,
+            "accel_long_mps2": accel_mps2,
             "steering_angle_rad": steering_angle,
-            "curvature_inv_m": math.tan(steering_angle) / (WHEELBASE_LENGTH_RATIO * self.ego_length_m),
+            "curvature_inv_m": curvature_inv_m,
             "route_done": bool(self.goal_window.exhausted),
             "goal_index": int(self.goal_window.window_start + min(current_goal_idx, goal_count)),
             "goal_count": self.goal_count,
@@ -279,6 +376,10 @@ class PolicyServer(ThreadingHTTPServer):
         self.session = None
         self.lock = threading.Lock()
         self.work_dir = tempfile.mkdtemp(prefix="pufferdrive_simian_")
+        self.step_count = 0
+        self.reference_miss_count = 0
+        self.reference_miss_logged_s = -math.inf
+        self.reference_served_count = 0
 
 
 class PolicyHandler(BaseHTTPRequestHandler):
@@ -291,10 +392,37 @@ class PolicyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path != "/healthz":
+        if self.path == "/healthz":
+            self._reply(200, {"status": "ok"})
+            return
+        if self.path != "/reference":
             self._reply(404, {"error": f"unknown path {self.path}"})
             return
-        self._reply(200, {"status": "ok"})
+        # not under the lock, which a step holds while AD reads within its planning tick
+        server = self.server
+        session = server.session
+        reference = None if session is None else session.reference
+        if reference is None:
+            self._reference_miss(session)
+            self._reply(404, {"error": "no rollout yet: POST /reset and /step with --rollout-horizon-s"})
+            return
+        server.reference_served_count += 1
+        self._reply(200, reference)
+
+    def _reference_miss(self, session):
+        server = self.server
+        server.reference_miss_count += 1
+        now_s = time.monotonic()
+        if now_s - server.reference_miss_logged_s < REFERENCE_MISS_LOG_INTERVAL_S:
+            return
+        server.reference_miss_logged_s = now_s
+        if session is None:
+            reason = "no client has reset the policy"
+        elif not session.rollout_steps:
+            reason = "--rollout-horizon-s is 0"
+        else:
+            reason = "no client has stepped the policy since its reset"
+        log(f"GET /reference without a rollout ({server.reference_miss_count} so far): {reason}")
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -302,8 +430,17 @@ class PolicyHandler(BaseHTTPRequestHandler):
         try:
             with server.lock:
                 if self.path == "/reset":
+                    start_s = time.monotonic()
                     server.session = PolicySession(request, server.args, server.work_dir)
                     session = server.session
+                    server.step_count = 0
+                    ego = request["ego"]
+                    log(
+                        f"reset in {time.monotonic() - start_s:.1f} s: ego at ({ego['x']:.1f}, {ego['y']:.1f}) "
+                        f"heading {ego['heading']:+.2f} rad, {'drawn' if server.args.drawn_map else 'Simian'} map "
+                        f"with {session.lane_count} lanes, {session.goal_count} goals, dt {session.dt} s, "
+                        f"rollout {session.rollout_steps} steps"
+                    )
                     self._reply(
                         200,
                         {
@@ -316,12 +453,36 @@ class PolicyHandler(BaseHTTPRequestHandler):
                 elif self.path == "/step":
                     if server.session is None:
                         raise RuntimeError("POST /reset before /step")
-                    self._reply(200, server.session.step(request))
+                    start_s = time.monotonic()
+                    response = server.session.step(request)
+                    self._reply(200, response)
+                    self._log_step(request, response, time.monotonic() - start_s)
                 else:
                     self._reply(404, {"error": f"unknown path {self.path}"})
         except Exception as exc:
             traceback.print_exc()
             self._reply(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _log_step(self, request, response, duration_s):
+        server = self.server
+        server.step_count += 1
+        if (server.step_count - 1) % STEP_LOG_INTERVAL_STEPS:
+            return
+        ego = request["ego"]
+        message = (
+            f"step {server.step_count} in {1000 * duration_s:.0f} ms: "
+            f"speed {math.hypot(ego['vx'], ego['vy']):.2f} -> {response['speed_mps']:.2f} m/s, "
+            f"accel {response['accel_long_mps2']:+.2f} m/s^2, curvature {response['curvature_inv_m']:+.4f} 1/m, "
+            f"{len(request['actors'])} actors, goal {response['goal_index']}/{response['goal_count']}"
+        )
+        reference = server.session.reference
+        if reference is not None:
+            length_m, forward_s, end_speed_mps = rollout_summary(reference["points"])
+            message += (
+                f", rollout at {reference['time_ns'] / NS_PER_S:.1f} s: {length_m:.1f} m forward over {forward_s:.1f} s, "
+                f"end speed {end_speed_mps:+.2f} m/s, served {server.reference_served_count} times"
+            )
+        log(message)
 
     def log_message(self, format, *args):
         return
@@ -340,14 +501,25 @@ def main():
     parser.add_argument("--ego-width-m", type=float, help="ego width seen by the policy, default the Simian one")
     parser.add_argument("--drawn-map", help="map-editor .bin used instead of the adapter's road graph")
     parser.add_argument("--drawn-map-spec", help="map-editor spec .json of --drawn-map, for its lat/lon origin")
+    parser.add_argument(
+        "--rollout-horizon-s",
+        type=float,
+        default=DEFAULT_ROLLOUT_HORIZON_S,
+        help="seconds the policy is rolled ahead every step for GET /reference, 0 disables",
+    )
     args = parser.parse_args()
     if bool(args.drawn_map) != bool(args.drawn_map_spec):
         parser.error("--drawn-map and --drawn-map-spec go together")
     if any(size is not None and not size > 0 for size in (args.ego_length_m, args.ego_width_m)):
         parser.error("--ego-length-m and --ego-width-m must be positive")
+    if not args.rollout_horizon_s >= 0:
+        parser.error("--rollout-horizon-s must not be negative")
     torch.set_num_threads(1)
     server = PolicyServer((args.host, args.port), args)
-    print(f"[simian_policy] serving {args.checkpoint} on {args.host}:{args.port}", flush=True)
+    log(
+        f"serving {args.checkpoint} on {args.host}:{args.port}, rollout {args.rollout_horizon_s} s "
+        f"{'enabled' if args.rollout_horizon_s else 'disabled'}"
+    )
     server.serve_forever()
 
 

@@ -1,0 +1,25 @@
+# AD with the PufferDrive policy server beside it, for the full simian-adapter stack where AD drives the policy.
+# Build from the repository root on an AD image built from the ads repository:
+#   docker build -f pufferlib/ocean/cosim/simian/Dockerfile.ad --build-arg AD_IMAGE=docker.local/ad -t ad-policy:local .
+# The checkpoint and the drawn map are mounted at runtime in /policy; the container arguments go to the server.
+ARG AD_IMAGE=docker.local/ad
+FROM ${AD_IMAGE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3-dev python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/policy \
+    && /opt/policy/bin/pip install --no-cache-dir torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu \
+    && /opt/policy/bin/pip install --no-cache-dir numpy "gymnasium==0.29.1" pyyaml "setuptools<81"
+
+WORKDIR /pufferdrive
+COPY . .
+RUN NO_TRAIN=1 /opt/policy/bin/python setup.py build_ext --inplace --force
+
+# HOME is writable for any user the stack runs the container as.
+ENV PYTHONPATH=/pufferdrive HOME=/tmp
+WORKDIR /app
+EXPOSE 8710
+ENTRYPOINT ["/pufferdrive/pufferlib/ocean/cosim/simian/ad_entrypoint.sh"]
+CMD ["--checkpoint", "/policy/final_model.pt"]

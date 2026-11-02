@@ -44,6 +44,9 @@ class SimianMap:
     def heading_to_bin(self, heading_rad):
         return heading_rad
 
+    def heading_from_bin(self, heading_rad):
+        return heading_rad
+
     def velocity_to_bin(self, vx, vy):
         return vx, vy
 
