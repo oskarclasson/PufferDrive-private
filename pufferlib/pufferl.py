@@ -2382,22 +2382,24 @@ def _run_eval_rollout(
     mppi_steps = int(round(args["eval"]["mppi_horizon_s"] / args["env"]["dt"])) if mppi_samples else 0
     if mppi_samples and mppi_steps == 0:
         raise pufferlib.APIUsageError("eval.mppi_horizon_s must cover at least one env step")
-    tts_steps = round(args["eval"]["tts_horizon_s"] / args["env"]["dt"]) if args["eval"]["tts"] else 0
-    if args["eval"]["tts"] and tts_steps == 0:
-        raise pufferlib.APIUsageError("eval.tts_horizon_s must cover at least one env step")
-    if tts_steps and mppi_samples:
-        raise pufferlib.APIUsageError("eval.tts and eval.mppi_samples are alternative action filters; enable one")
     rollout_steps = max(predict_steps, mppi_steps)
     goal_inference = args["eval"]["goal_inference"]
+    joint_prediction_dt = args["eval"]["joint_prediction_dt"]
     joint_prediction_steps = (
-        round(args["eval"]["joint_prediction_horizon_s"] / args["env"]["dt"]) if args["eval"]["joint_prediction"] else 0
+        round(args["eval"]["joint_prediction_horizon_s"] / joint_prediction_dt)
+        if args["eval"]["joint_prediction"]
+        else 0
     )
+    if args["eval"]["joint_prediction"] and joint_prediction_steps == 0:
+        raise pufferlib.APIUsageError(
+            "eval.joint_prediction_horizon_s must cover at least one eval.joint_prediction_dt"
+        )
     if joint_prediction_steps and not goal_inference:
         raise pufferlib.APIUsageError("eval.joint_prediction needs eval.goal_inference for the other agents' goals")
-    snapshot_access = rollout_steps or tts_steps or goal_inference
+    snapshot_access = rollout_steps or goal_inference
     if snapshot_access and args["train"].get("use_rnn", False):
         raise pufferlib.APIUsageError(
-            "eval.predict_horizon_s, eval.mppi_samples, eval.tts and eval.goal_inference do not support recurrent policies"
+            "eval.predict_horizon_s, eval.mppi_samples and eval.goal_inference do not support recurrent policies"
         )
     vecenv = pufferlib.vector.make(
         [make_env] * num_workers,
@@ -2456,8 +2458,6 @@ def _run_eval_rollout(
         discrete_policy_on_continuous_env = env_continuous and not uncompiled_policy.is_continuous
         if mppi_samples and not env_continuous:
             raise pufferlib.APIUsageError("eval.mppi_samples requires a continuous action env")
-        if tts_steps and not env_continuous:
-            raise pufferlib.APIUsageError("eval.tts requires a continuous action env")
         device = torch_device(args["train"]["device"])
         use_bfloat16 = args["train"]["precision"] == "bfloat16" and is_cuda_device(device)
         if use_bfloat16 and not torch.cuda.is_bf16_supported():
@@ -2618,15 +2618,8 @@ def _run_eval_rollout(
             _, plan_xy = score_action_sequences(np.ascontiguousarray(plan[:, None]))
             return plan[:, 0], plan_xy[:, 0]
 
-        tts_rng = np.random.default_rng(rollout_seed)
-        tts_noise_std = np.array(
-            [args["eval"]["tts_jerk_noise_std"], args["eval"]["tts_steer_noise_std"]], dtype=np.float32
-        )
-        tts_noise_steps = min(args["eval"]["tts_noise_steps"], tts_steps)
-        tts_discounts = args["train"]["gamma"] ** np.arange(tts_steps + 1, dtype=np.float32)
-
         def infer_candidates(candidate_obs):
-            """Continuation actions and values for candidate rollouts, unpadded since replays never record them."""
+            """Actions and values for observations outside the env batch, unpadded since replays never record them."""
             with torch.no_grad(), eval_amp_context:
                 logits, value = policy_forward_eval(torch.as_tensor(candidate_obs, device=device))
                 *_, continuous_action = eval_sample_logits(
@@ -2636,98 +2629,6 @@ def _run_eval_rollout(
                 continuous_action.float().cpu().numpy(), vecenv.single_action_space.low, vecenv.single_action_space.high
             )
             return action, value.reshape(-1).float().cpu().numpy()
-
-        def tts_plan(nominal_action):
-            """Score the policy (candidate 0) against Gaussian-perturbed rollouts by discounted reward plus value.
-
-            Every (searched agent, candidate) pair rolls out in its own env clone, batched into one policy call per
-            step, with only that agent driving while every other actor holds its speed and steering. Returns the action
-            to execute and the candidates' (agents, candidates, steps, 2) paths, best candidate (-1: not searched) and
-            switch flag.
-            """
-            candidate_count = 1 + args["eval"]["tts_samples"]
-            action_low, action_high = vecenv.single_action_space.low, vecenv.single_action_space.high
-            # Noise on top of the policy's own action for the first noise steps; candidate 0 stays the policy's.
-            candidate_noise = np.zeros((agents_per_batch, candidate_count, tts_noise_steps, 2), dtype=np.float32)
-            candidate_noise[:, 1:] = (
-                tts_rng.standard_normal((agents_per_batch, candidate_count - 1, tts_noise_steps, 2), dtype=np.float32)
-                * tts_noise_std
-            )
-            candidate_actions = np.clip(nominal_action[:, None] + candidate_noise[:, :, 0], action_low, action_high)
-            candidate_returns = np.zeros((agents_per_batch, candidate_count), dtype=np.float32)
-            candidate_xy = np.zeros((agents_per_batch, candidate_count, tts_steps, 2), dtype=np.float32)
-            rollouts = []
-            searched_agent_rows = []
-            for worker_env, start, _ in agent_ranges:
-                active_count = int(worker_env.agent_offsets[-1])
-                searched = np.ones(active_count, dtype=bool)
-                if args["eval"]["ego_agent_id"] is not None:
-                    searched = worker_env.get_active_agent_ids() == args["eval"]["ego_agent_id"]
-                if not searched.any():
-                    continue
-                ego_slots = worker_env.clone_predict_begin(candidate_count, searched)
-                slot_count = int(ego_slots.max()) + 1
-                local_rows = np.flatnonzero(searched)
-                searched_agent_rows.append(start + local_rows)
-                first_action = np.empty((slot_count, candidate_count, active_count, 2), dtype=np.float32)
-                first_action[:] = candidate_actions[start : start + active_count].transpose(1, 0, 2)
-                clone_noise = np.empty(
-                    (tts_noise_steps, slot_count, candidate_count, active_count, 2), dtype=np.float32
-                )
-                clone_noise[:] = candidate_noise[start : start + active_count].transpose(2, 1, 0, 3)[:, None]
-                rollouts.append(
-                    {
-                        "env": worker_env,
-                        "rows": start + local_rows,
-                        "local_rows": local_rows,
-                        # Clone rows are (ego slot, candidate, active row); a searched row reads its own clones only.
-                        "ego_slots": ego_slots[local_rows],
-                        "shape": (slot_count, candidate_count, active_count),
-                        "action": first_action.reshape(-1, 2),
-                        "noise": clone_noise.reshape(tts_noise_steps, -1, 2),
-                        "return": np.zeros(first_action.shape[:3], dtype=np.float32).reshape(-1),
-                        "alive": np.ones(first_action.shape[:3], dtype=np.float32).reshape(-1),
-                        "xy": np.zeros((first_action.shape[0] * candidate_count * active_count, 2), dtype=np.float32),
-                    }
-                )
-            best_candidate = np.full(agents_per_batch, -1, dtype=np.int16)
-            if not rollouts:
-                return nominal_action, candidate_xy, best_candidate, np.zeros(agents_per_batch, dtype=np.uint8)
-            for rollout_step in range(tts_steps):
-                for rollout in rollouts:
-                    rollout["env"].clone_step(rollout["action"])
-                    # A terminal transition keeps its own reward; later rewards and the bootstrap are masked.
-                    rollout["return"] += rollout["alive"] * tts_discounts[rollout_step] * rollout["env"].clone_rewards
-                    rollout["alive"] *= 1.0 - rollout["env"].clone_terminals
-                    rollout["env"].get_clone_agent_xy(rollout["xy"])
-                    step_xy = rollout["xy"].reshape(*rollout["shape"], 2)
-                    candidate_xy[rollout["rows"], :, rollout_step] = step_xy[
-                        rollout["ego_slots"], :, rollout["local_rows"]
-                    ]
-                next_action, value = infer_candidates(
-                    np.concatenate([rollout["env"].clone_observations for rollout in rollouts])
-                )
-                split_points = np.cumsum([len(rollout["action"]) for rollout in rollouts])[:-1]
-                for rollout, action, rollout_value in zip(
-                    rollouts, np.split(next_action, split_points), np.split(value, split_points)
-                ):
-                    if rollout_step + 1 < tts_noise_steps:
-                        action = np.clip(action + rollout["noise"][rollout_step + 1], action_low, action_high)
-                    rollout["action"] = np.ascontiguousarray(action, dtype=np.float32)
-                    rollout["value"] = rollout_value
-            for rollout in rollouts:
-                rollout["return"] += rollout["alive"] * tts_discounts[tts_steps] * rollout["value"]
-                returns = rollout["return"].reshape(rollout["shape"])
-                candidate_returns[rollout["rows"]] = returns[rollout["ego_slots"], :, rollout["local_rows"]]
-            searched_rows = np.concatenate(searched_agent_rows)
-            best_candidate[searched_rows] = 1 + np.argmax(candidate_returns[searched_rows, 1:], axis=1)
-            switched = np.zeros(agents_per_batch, dtype=bool)
-            switched[searched_rows] = candidate_returns[searched_rows, best_candidate[searched_rows]] > (
-                candidate_returns[searched_rows, 0] + args["eval"]["tts_switch_margin"]
-            )
-            agent_rows = np.arange(agents_per_batch)
-            action = np.where(switched[:, None], candidate_actions[agent_rows, best_candidate], nominal_action)
-            return action.astype(np.float32), candidate_xy, best_candidate, switched.astype(np.uint8)
 
         goal_hypothesis_count = args["eval"]["goal_inference_hypotheses"]
         goal_spacing_m = args["eval"]["goal_inference_goal_spacing_m"]
@@ -2971,6 +2872,7 @@ def _run_eval_rollout(
                 worker_env.predict_begin()
             try:
                 for (worker_env, _, _), (goal_list, list_count) in zip(agent_ranges, goal_lists):
+                    worker_env.predict_set_dt(joint_prediction_dt)
                     worker_env.predict_set_goals(goal_list, list_count)
                 for rollout_step in range(joint_prediction_steps):
                     _, rollout_action, *_ = infer(vecenv.observations)
@@ -2989,7 +2891,7 @@ def _run_eval_rollout(
         episode_summaries = []
         scenario_progress = tqdm(total=expected_episodes, desc=desc, unit="scenario")
         for _ in range(total_steps):
-            predicted_xy, mppi_xy, tts_paths, goal_belief, joint_paths = None, None, None, None, None
+            predicted_xy, mppi_xy, goal_belief, joint_paths = None, None, None, None
             if goal_inference:
                 *goal_belief, likeliest_goals, likeliest_count = update_goal_beliefs()
             if joint_prediction_steps:
@@ -2999,16 +2901,11 @@ def _run_eval_rollout(
             raw_action, action, logits, value, logprob, entropy = infer(obs)
             if mppi_samples:
                 action, mppi_xy = mppi_plan(nominal_actions)
-            capture_obs_tensor = policy_obs_tensor
-            if tts_steps:
-                # The search's own inference overwrites the policy input the replay capture reads.
-                capture_obs_tensor = policy_obs_tensor.clone()
-                action, *tts_paths = tts_plan(action)
 
             if replay_capture is not None:
                 replay_capture.capture_frame(
                     obs,
-                    capture_obs_tensor,
+                    policy_obs_tensor,
                     raw_action,
                     action,
                     logits,
@@ -3017,7 +2914,6 @@ def _run_eval_rollout(
                     entropy,
                     predicted_xy,
                     mppi_xy,
-                    tts_paths,
                     goal_belief,
                     joint_paths,
                 )

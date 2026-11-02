@@ -375,7 +375,6 @@ struct PredictState {
     float *obstacle_poses; // [rollout step][collision-order agent][OBSTACLE_POSE_FIELD_COUNT], step 0 = now
     int obstacle_pose_capacity;
     int recorded_step_count;
-    int ego_active_idx; // -1: every policy agent drives; else the other policy agents hold speed and steering too
 };
 
 typedef struct {
@@ -5908,9 +5907,7 @@ void c_step(Drive *env) {
         env->logs[i].episode_length += 1;
         int agent_idx = env->active_agent_indices[i];
         Agent *agent = &env->agents[agent_idx];
-        bool predicted_as_actor = env->predict_mode && env->predict_state->ego_active_idx >= 0
-            && env->predict_state->ego_active_idx != i;
-        if (agent->controller == CONTROLLER_POLICY && !predicted_as_actor) {
+        if (agent->controller == CONTROLLER_POLICY) {
             move_dynamics(env, i, agent_idx);
             if (!agent->stopped && !agent->removed && (env->pose_noise_xy_m > 0.0f || env->pose_noise_yaw_rad > 0.0f)
                 && (!env->eval_mode || env->eval_training_render)) {
@@ -6174,7 +6171,6 @@ int c_predict_begin(Drive *env) {
     }
     write_obstacle_poses(env, ps->obstacle_poses);
     ps->recorded_step_count = 1;
-    ps->ego_active_idx = -1;
     env->predict_mode = 1;
     return 0;
 }
@@ -6215,106 +6211,6 @@ void c_predict_end(Drive *env) {
     memcpy(env->truncations, ps->saved_truncations, active_count * sizeof(unsigned char));
     memcpy(env->masks, ps->saved_masks, active_count * sizeof(unsigned char));
     *env = ps->saved_env; // scalars, rng streams, episode log and clock; predict_mode was 0 when saved
-}
-
-// ── Candidate clones ─────────────────────────────────────────────────────────
-// A clone shares its source's map and scenario data and owns only what a prediction step mutates, so many
-// candidate rollouts of one env can step side by side. Buffers come from the caller; returns NULL on failure.
-Drive *c_clone_create(
-    Drive *src, float *observations, float *actions, float *rewards, unsigned char *terminals) {
-    Drive *clone = (Drive *) calloc(1, sizeof(Drive));
-    if (clone == NULL) {
-        return NULL;
-    }
-    clone->num_total_agents = src->num_total_agents;
-    clone->logs_capacity = src->logs_capacity;
-    clone->active_agent_count = src->active_agent_count;
-    clone->observations = observations;
-    clone->actions = actions;
-    clone->rewards = rewards;
-    clone->terminals = terminals;
-    clone->agents = (Agent *) calloc(src->num_total_agents, sizeof(Agent));
-    clone->logs = (Log *) calloc(src->logs_capacity > 0 ? src->logs_capacity : 1, sizeof(Log));
-    clone->truncations = (unsigned char *) calloc(src->active_agent_count, sizeof(unsigned char));
-    clone->masks = (unsigned char *) calloc(src->active_agent_count, sizeof(unsigned char));
-    if (clone->agents == NULL || clone->logs == NULL || clone->truncations == NULL || clone->masks == NULL) {
-        free(clone->agents);
-        free(clone->logs);
-        free(clone->truncations);
-        free(clone->masks);
-        free(clone);
-        return NULL;
-    }
-    return clone;
-}
-
-void c_clone_close(Drive *clone) {
-    c_predict_end(clone);
-    for (int i = 0; i < clone->num_total_agents; i++) {
-        free(clone->agents[i].route);
-    }
-    free(clone->agents);
-    free(clone->logs);
-    free(clone->truncations);
-    free(clone->masks);
-    free_predict_state(clone);
-    free(clone);
-}
-
-// Overwrites the clone with src's current state and starts a prediction rollout in which only active index
-// ego_active_idx drives. Returns 0 on success, -1 on allocation failure or a source whose sizes changed.
-int c_clone_predict_begin(Drive *clone, Drive *src, int ego_active_idx) {
-    c_predict_end(clone);
-    if (clone->num_total_agents != src->num_total_agents || clone->logs_capacity != src->logs_capacity
-        || clone->active_agent_count != src->active_agent_count) {
-        return -1;
-    }
-    for (int i = 0; i < clone->num_total_agents; i++) {
-        free(clone->agents[i].route);
-    }
-    Drive owned = *clone;
-    *clone = *src;
-    clone->observations = owned.observations;
-    clone->actions = owned.actions;
-    clone->rewards = owned.rewards;
-    clone->terminals = owned.terminals;
-    clone->truncations = owned.truncations;
-    clone->masks = owned.masks;
-    clone->agents = owned.agents;
-    clone->logs = owned.logs;
-    clone->predict_state = owned.predict_state;
-    memcpy(clone->agents, src->agents, src->num_total_agents * sizeof(Agent));
-    int route_failed = 0;
-    for (int i = 0; i < src->num_total_agents; i++) {
-        Agent *agent = &clone->agents[i];
-        if (agent->route == NULL || agent->route_length <= 0 || route_failed) {
-            agent->route = NULL;
-            continue;
-        }
-        agent->route = (int *) malloc(agent->route_length * sizeof(int));
-        if (agent->route == NULL) {
-            route_failed = 1;
-            continue;
-        }
-        memcpy(agent->route, src->agents[i].route, agent->route_length * sizeof(int));
-    }
-    if (route_failed) {
-        return -1;
-    }
-    if (src->logs_capacity > 0) {
-        memcpy(clone->logs, src->logs, src->logs_capacity * sizeof(Log));
-    }
-    int active_count = src->active_agent_count;
-    memcpy(clone->observations, src->observations, active_count * compute_observation_size(src) * sizeof(float));
-    memcpy(clone->rewards, src->rewards, active_count * sizeof(float));
-    memcpy(clone->terminals, src->terminals, active_count * sizeof(unsigned char));
-    memcpy(clone->truncations, src->truncations, active_count * sizeof(unsigned char));
-    memcpy(clone->masks, src->masks, active_count * sizeof(unsigned char));
-    if (c_predict_begin(clone) != 0) {
-        return -1;
-    }
-    clone->predict_state->ego_active_idx = ego_active_idx;
-    return 0;
 }
 
 // ── Goal hypotheses ──────────────────────────────────────────────────────────

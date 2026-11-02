@@ -53,6 +53,7 @@ class EvalReplayCapture:
             self.replay_writer_count = min(num_workers, observation_replay_writer_count)
 
         self.env_config = dict(args["env"])
+        self.joint_prediction_dt = args["eval"]["joint_prediction_dt"]
         self.replay_output_dir = replay_output_dir
         self.num_workers = num_workers
         self.agents_per_batch = agents_per_batch
@@ -85,7 +86,6 @@ class EvalReplayCapture:
         entropy,
         predicted_xy=None,
         mppi_xy=None,
-        tts_paths=None,
         goal_belief=None,
         joint_paths=None,
     ):
@@ -104,11 +104,6 @@ class EvalReplayCapture:
             replay_frame["predicted_xy"] = predicted_xy[: self.agents_per_batch]
         if mppi_xy is not None:
             replay_frame["mppi_xy"] = mppi_xy[: self.agents_per_batch]
-        if tts_paths is not None:
-            tts_xy, tts_best, tts_switched = tts_paths
-            replay_frame["tts_xy"] = tts_xy[: self.agents_per_batch]
-            replay_frame["tts_best"] = tts_best[: self.agents_per_batch]
-            replay_frame["tts_switched"] = tts_switched[: self.agents_per_batch]
         if goal_belief is not None:
             goal_xy, belief = goal_belief
             replay_frame["inferred_goal_xy"] = goal_xy[: self.agents_per_batch]
@@ -173,7 +168,11 @@ class EvalReplayCapture:
         ):
             raise RuntimeError("Replay environment metadata is incompatible with the policy history")
 
-        replay = {"env": self.env_config, **replay_environment["frames"]}
+        replay = {
+            "env": self.env_config,
+            "joint_prediction_dt": self.joint_prediction_dt,
+            **replay_environment["frames"],
+        }
         for replay_key, history_values in self.policy_history.items():
             replay[replay_key] = history_values[:episode_length, global_agent_start:global_agent_end]
         replay_stem = _eval_replay_stem(summary, self.episode_id_offset + episode_id)

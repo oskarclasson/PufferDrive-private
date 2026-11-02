@@ -1,6 +1,5 @@
 import pickle
 import zlib
-import itertools
 
 import numpy as np
 import gymnasium
@@ -475,8 +474,6 @@ class Drive(pufferlib.PufferEnv):
 
         self.num_agents = num_agents
         self.c_envs = None
-        self._clone_envs = None
-        self._clone_key = None
         if config_only:
             return
 
@@ -752,8 +749,6 @@ class Drive(pufferlib.PufferEnv):
                 if self.current_num_eval_scenarios == 0:
                     self._eval_exhausted = True
                     return (self.observations, self.rewards, self.terminals, self.truncations, info)
-                # Clones point into the closing envs' map data, and a new handle may reuse the old address.
-                self.clone_close()
                 binding.vec_close(self.c_envs)
                 # Pairs already replayed this sweep; slice the rest so a deferred
                 # scene resumes exactly where the previous batch stopped.
@@ -824,6 +819,10 @@ class Drive(pufferlib.PufferEnv):
         """Snapshot every env; until predict_end, steps hold non-policy actors at constant speed and steering."""
         binding.vec_predict_begin(self.c_envs)
 
+    def predict_set_dt(self, dt_seconds):
+        """Step the running prediction rollout with dt_seconds instead of the env's dt."""
+        binding.vec_predict_set_dt(self.c_envs, dt_seconds)
+
     def predict_step(self, actions):
         """Step the policy agents inside a prediction rollout, bypassing replay capture and resampling."""
         self.actions[:] = actions
@@ -835,55 +834,6 @@ class Drive(pufferlib.PufferEnv):
     def predict_record_obstacles(self):
         """Record every collision candidate's pose after the latest predict_step, for mppi_rollout_costs."""
         binding.vec_predict_record_obstacles(self.c_envs)
-
-    def clone_predict_begin(self, candidate_count, searched_rows):
-        """Copy every env into candidate_count clones per searched active row and start their rollouts.
-
-        searched_rows is a bool mask over the active rows. Clone buffers are (ego slot, candidate, active row) rows;
-        in each clone only its ego drives, every other actor holds its speed and steering. Returns each active row's
-        ego slot (-1 when not searched). Clones are rebuilt when the envs are resampled or the ego count changes.
-        """
-        env_bounds = list(itertools.pairwise(self.agent_offsets))
-        env_rows = [np.flatnonzero(searched_rows[env_start:env_end]) for env_start, env_end in env_bounds]
-        ego_count = max(len(rows) for rows in env_rows)
-        active_count = int(self.agent_offsets[-1])
-        # Padding slots name an index past the env's agents, so nobody drives in those clones.
-        ego_indices = np.full((len(env_bounds), ego_count), active_count, dtype=np.int32)
-        ego_slots = np.full(active_count, -1)
-        for env_idx, ((env_start, _), rows) in enumerate(zip(env_bounds, env_rows)):
-            ego_indices[env_idx, : len(rows)] = rows
-            ego_slots[env_start + rows] = np.arange(len(rows))
-        if self._clone_key != (self.c_envs, candidate_count, ego_count):
-            self.clone_close()
-            row_count = ego_count * candidate_count * active_count
-            self.clone_observations = np.zeros((row_count, self.observations.shape[1]), dtype=np.float32)
-            self.clone_actions = np.zeros((row_count, 2), dtype=np.float32)
-            self.clone_rewards = np.zeros(row_count, dtype=np.float32)
-            self.clone_terminals = np.zeros(row_count, dtype=np.uint8)
-            self._clone_envs = binding.vec_clone_create(
-                self.c_envs,
-                ego_count * candidate_count,
-                self.clone_observations,
-                self.clone_actions,
-                self.clone_rewards,
-                self.clone_terminals,
-            )
-            self._clone_key = (self.c_envs, candidate_count, ego_count)
-        binding.vec_clone_predict_begin(self._clone_envs, self.c_envs, candidate_count, ego_indices)
-        return ego_slots
-
-    def clone_step(self, actions):
-        self.clone_actions[:] = actions
-        binding.vec_step(self._clone_envs)
-
-    def get_clone_agent_xy(self, out):
-        binding.vec_get_active_agent_xy(self._clone_envs, out)
-
-    def clone_close(self):
-        if self._clone_envs is not None:
-            binding.vec_clone_close(self._clone_envs)
-        self._clone_envs = None
-        self._clone_key = None
 
     def mppi_prepare(self, nominal_actions):
         """Floor speeds at 0 while the (active, steps, 2) policy plan drives forward; lift rested-at stop zones."""
@@ -1262,7 +1212,6 @@ class Drive(pufferlib.PufferEnv):
             self._preloaded_map_cache_kwargs = None
         if self.c_envs is None:
             return
-        self.clone_close()
         binding.vec_close(self.c_envs)
         self.c_envs = None
 
