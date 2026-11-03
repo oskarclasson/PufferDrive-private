@@ -216,6 +216,12 @@ class ActionSelection(Enum):
     mean = 2
 
 
+class GoalInferenceLikelihood(Enum):
+    value = 0
+    action = 1
+    trajectory = 2
+
+
 class ProfileMode(Enum):
     sim = 0
     training = 1
@@ -517,6 +523,13 @@ class EvaluationConfig:
     mppi_obstacle_margin_m: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     mppi_boundary_margin_m: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     goal_inference: bool = MISSING
+    goal_inference_likelihood: GoalInferenceLikelihood = MISSING
+    goal_inference_action_std_long: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_action_std_lat: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_rollout_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_trajectory_std_m: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_trajectory_std_heading_rad: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    goal_inference_trajectory_std_speed_mps: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
     goal_inference_hypotheses: int = _constrained_field(POSITIVE_INT_CONSTRAINT)
     goal_inference_goal_spacing_m: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
     goal_inference_update_s: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
