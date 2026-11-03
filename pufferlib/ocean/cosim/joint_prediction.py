@@ -145,9 +145,10 @@ class GoalInference:
                 new = np.flatnonzero(new_total > 0)
                 new_paths = [np.vstack([xy, new_goals[k, : new_total[k], :2]]) for k in new]
                 old_last_goals = actor.goals[old, actor.goal_total[old] - 1, :2]
+                old_belief = actor.belief[old]
                 actor.belief[:] = 0.0
                 if new_paths:
-                    actor.belief[new] = carry_belief(old_last_goals, actor.belief[old], new_paths)
+                    actor.belief[new] = carry_belief(old_last_goals, old_belief, new_paths)
                 actor.goals, actor.goal_total = new_goals, new_total
                 actor.next_goal[:] = 0
                 actor.has_value[:] = False
@@ -190,10 +191,26 @@ class GoalInference:
     def likeliest_goal_list(self, actor_id):
         """The likeliest window continued along the cheapest way past its last goal so it outlasts the horizon, as an
         (n, 4) goal list."""
+        return self.goal_list(actor_id, int(np.argmax(self.actors[actor_id].belief)))
+
+    def routes(self, actor_id, min_belief, max_routes):
+        """The hypotheses of the actor the robust rollout drives it along, likeliest first: at most max_routes with
+        belief of at least min_belief, and always its likeliest, as the eval's robust prediction keeps them."""
+        actor = self.actors[actor_id]
+        _, window_count = self.windows(actor_id)
+        order = [int(k) for k in np.argsort(-actor.belief, kind="stable") if window_count[k] > 0]
+        kept = [k for k in order[:max_routes] if actor.belief[k] >= min_belief]
+        return kept or order[:1]
+
+    def belief(self, actor_id, hypothesis):
+        return float(self.actors[actor_id].belief[hypothesis])
+
+    def goal_list(self, actor_id, hypothesis):
+        """The window of a hypothesis continued along the cheapest way past its last goal so it outlasts the horizon,
+        as an (n, 4) goal list."""
         actor = self.actors[actor_id]
         windows, window_count = self.windows(actor_id)
-        likeliest = int(np.argmax(actor.belief))
-        window = windows[likeliest, : window_count[likeliest]]
+        window = windows[hypothesis, : window_count[hypothesis]]
         previous_xy = window[-2, :2] if len(window) > 1 else actor.xy
         heading = math.atan2(window[-1, 1] - previous_xy[1], window[-1, 0] - previous_xy[0])
         try:

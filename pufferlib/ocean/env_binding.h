@@ -1678,6 +1678,10 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddObject(m, "AGENT_STOPPED_SPEED_THRESHOLD", PyFloat_FromDouble(AGENT_STOPPED_SPEED_THRESHOLD));
     PyModule_AddObject(m, "CONDITIONING_ACC_MIN", PyFloat_FromDouble(REWARD_BOUNDS[REWARD_COEF_ACC].min_val));
     PyModule_AddObject(m, "CONDITIONING_ACC_MAX", PyFloat_FromDouble(REWARD_BOUNDS[REWARD_COEF_ACC].max_val));
+    PyModule_AddObject(m, "CONDITIONING_THROTTLE_MIN", PyFloat_FromDouble(REWARD_BOUNDS[REWARD_COEF_THROTTLE].min_val));
+    PyModule_AddObject(m, "CONDITIONING_THROTTLE_MAX", PyFloat_FromDouble(REWARD_BOUNDS[REWARD_COEF_THROTTLE].max_val));
+    PyModule_AddObject(m, "CONDITIONING_STEER_MIN", PyFloat_FromDouble(REWARD_BOUNDS[REWARD_COEF_STEER].min_val));
+    PyModule_AddObject(m, "CONDITIONING_STEER_MAX", PyFloat_FromDouble(REWARD_BOUNDS[REWARD_COEF_STEER].max_val));
     PyModule_AddIntConstant(m, "ACTION_TYPE_DISCRETE", ACTION_TYPE_DISCRETE);
     PyModule_AddIntConstant(m, "ACTION_TYPE_CONTINUOUS", ACTION_TYPE_CONTINUOUS);
     PyModule_AddIntConstant(m, "DYNAMICS_MODEL_CLASSIC", DYNAMICS_MODEL_CLASSIC);

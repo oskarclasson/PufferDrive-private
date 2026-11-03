@@ -69,6 +69,8 @@ class Drive(pufferlib.PufferEnv):
         goal_speed=3.0,
         goal_speed_randomization=True,
         conditioning_accel_scale=1.0,
+        conditioning_throttle_scale=1.0,
+        conditioning_steer_scale=1.0,
         conditioning_speed_scale=1.5,
         goal_reach_requires_speed=False,
         scenario_length=None,
@@ -198,6 +200,21 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"conditioning_accel_scale must be within the trained C_acc range "
                 f"[{binding.CONDITIONING_ACC_MIN}, {binding.CONDITIONING_ACC_MAX}]. Got: {conditioning_accel_scale}"
+            )
+        self.conditioning_throttle_scale = float(np.float32(conditioning_throttle_scale))  # bounds are float32
+        if not (
+            binding.CONDITIONING_THROTTLE_MIN <= self.conditioning_throttle_scale <= binding.CONDITIONING_THROTTLE_MAX
+        ):
+            raise ValueError(
+                f"conditioning_throttle_scale must be within the trained C_throttle range "
+                f"[{binding.CONDITIONING_THROTTLE_MIN}, {binding.CONDITIONING_THROTTLE_MAX}]. "
+                f"Got: {conditioning_throttle_scale}"
+            )
+        self.conditioning_steer_scale = float(np.float32(conditioning_steer_scale))  # bounds are float32
+        if not (binding.CONDITIONING_STEER_MIN <= self.conditioning_steer_scale <= binding.CONDITIONING_STEER_MAX):
+            raise ValueError(
+                f"conditioning_steer_scale must be within the trained C_steer range "
+                f"[{binding.CONDITIONING_STEER_MIN}, {binding.CONDITIONING_STEER_MAX}]. Got: {conditioning_steer_scale}"
             )
         self.goal_reach_requires_speed = int(bool(goal_reach_requires_speed))
         self.reward_conditioning = reward_conditioning
@@ -614,6 +631,8 @@ class Drive(pufferlib.PufferEnv):
             "goal_speed": self.goal_speed,
             "goal_speed_randomization": self.goal_speed_randomization,
             "conditioning_accel_scale": self.conditioning_accel_scale,
+            "conditioning_throttle_scale": self.conditioning_throttle_scale,
+            "conditioning_steer_scale": self.conditioning_steer_scale,
             "conditioning_speed_scale": self.conditioning_speed_scale,
             "goal_reach_requires_speed": self.goal_reach_requires_speed,
             "scenario_length": int(self.scenario_length) if self.scenario_length is not None else None,
@@ -896,6 +915,50 @@ class Drive(pufferlib.PufferEnv):
 
     def get_hypothesis_scene_agent_xy(self, out):
         binding.vec_get_active_agent_xy(self._hypothesis_scenes, out)
+
+    def hypothesis_scene_set_agent_states(self, idx, x, y, z, heading, vx, vy, yaw_rate, accel_long, seconds_stopped):
+        """Like set_agent_states, in the hypothesis scenes, where agents keep the env's indices, copies after them."""
+        binding.vec_set_agent_states(
+            self._hypothesis_scenes,
+            np.ascontiguousarray(idx, dtype=np.int32),
+            np.ascontiguousarray(x, dtype=np.float32),
+            np.ascontiguousarray(y, dtype=np.float32),
+            np.ascontiguousarray(z, dtype=np.float32),
+            np.ascontiguousarray(heading, dtype=np.float32),
+            np.ascontiguousarray(vx, dtype=np.float32),
+            np.ascontiguousarray(vy, dtype=np.float32),
+            np.ascontiguousarray(yaw_rate, dtype=np.float32),
+            np.ascontiguousarray(accel_long, dtype=np.float32),
+            np.ascontiguousarray(seconds_stopped, dtype=np.float32),
+            None,
+        )
+
+    def hypothesis_scene_recompute_observations(self):
+        binding.vec_recompute_observations(self._hypothesis_scenes)
+
+    def get_hypothesis_scene_global_agent_state(self, agent_count):
+        """Like get_global_agent_state, for the agent_count active agents of the hypothesis scenes, copies included."""
+        states = {
+            "x": np.zeros(agent_count, dtype=np.float32),
+            "y": np.zeros(agent_count, dtype=np.float32),
+            "z": np.zeros(agent_count, dtype=np.float32),
+            "heading": np.zeros(agent_count, dtype=np.float32),
+            "id": np.zeros(agent_count, dtype=np.int32),
+            "length": np.zeros(agent_count, dtype=np.float32),
+            "width": np.zeros(agent_count, dtype=np.float32),
+        }
+        binding.vec_get_global_agent_state(
+            self._hypothesis_scenes,
+            states["x"],
+            states["y"],
+            states["z"],
+            states["heading"],
+            states["id"],
+            states["length"],
+            states["width"],
+            0,
+        )
+        return states
 
     def hypothesis_scene_close(self):
         if self._hypothesis_scenes is not None:

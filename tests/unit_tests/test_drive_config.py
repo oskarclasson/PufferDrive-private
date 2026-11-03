@@ -74,6 +74,12 @@ class TestDriveConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conditioning_speed_scale"):
             Drive(conditioning_speed_scale=0.9)
 
+    def test_conditioning_jerk_scale_validation(self):
+        with self.assertRaisesRegex(ValueError, "conditioning_throttle_scale"):
+            Drive(conditioning_throttle_scale=0.7)
+        with self.assertRaisesRegex(ValueError, "conditioning_steer_scale"):
+            Drive(conditioning_steer_scale=1.3)
+
     @patch("sys.argv", ["pufferl.py", "env.obs_lane_speed_limit=true"])
     def test_lane_speed_limit_cli_override(self):
         args = load_config("puffer_drive")

@@ -11,9 +11,11 @@ than --min-moving-speed-mps standing still, and returns the rollout and the path
 step debug; GET /reference serves the rollout too. With --actor-prediction joint the nearest moving tracked actors
 are instead driven by the policy too, each to the goals goal inference finds likeliest for it, so the ego rollout
 and the actors' predicted paths come from one joint rollout; the others, and those with a negative id, untracked
-obstacles, are held as without it. In the full stack AD is the client instead of the adapter: it resets and
-steps the policy with its own ego state and tracked obstacles, without a road graph, so --drawn-map is required,
-and the rollout is the reference its trajectory planner tracks.
+obstacles, are held as without it. With --actor-prediction robust each of them drives every likely route at once, a
+copy of it per further route, so the ego rollout clears them all. A second, static rollout is rolled out among the
+actors standing still only, the moving ones taken out. In the full stack AD is the client instead of the
+adapter: it resets and steps the policy with its own ego state and tracked obstacles, without a road graph, so
+--drawn-map is required, and the rollout is the reference its trajectory planner tracks.
 
 All JSON coordinates are in the Simian map frame [m], headings CCW from +x [rad], velocities in that
 frame [m/s], and the ego position is the bounding-box center.
@@ -61,8 +63,18 @@ DEFAULT_GOAL_SPACING_M = 30.0
 DEFAULT_ROLLOUT_HORIZON_S = 0.0
 ACTOR_PREDICTION_CONSTANT_VELOCITY = "constant-velocity"
 ACTOR_PREDICTION_JOINT = "joint"
+ACTOR_PREDICTION_ROBUST = "robust"
+# The eval's robust_prediction_* defaults in puffer_drive.yaml.
+DEFAULT_ROBUST_PREDICTION_MIN_BELIEF = 0.1
+DEFAULT_ROBUST_PREDICTION_MAX_ROUTES = 3
 DEFAULT_JOINT_PREDICTION_ACTORS = 8
 DEFAULT_MIN_MOVING_SPEED_MPS = 0.5
+MIN_REWARD_REVERSE = 2.5e-4  # REWARD_BOUNDS[REWARD_COEF_REVERSE] in drive.h, the range the policy trains with
+MAX_REWARD_REVERSE = 7.5e-3
+MIN_REWARD_COMFORT = 0.0  # REWARD_BOUNDS[REWARD_COEF_COMFORT] in drive.h
+MAX_REWARD_COMFORT = 0.1
+MIN_JERK_SCALE = 0.8  # REWARD_BOUNDS[REWARD_COEF_THROTTLE] and [REWARD_COEF_STEER] in drive.h
+MAX_JERK_SCALE = 1.25
 # The eval's goal_inference_* defaults in puffer_drive.yaml.
 DEFAULT_GOAL_INFERENCE_HYPOTHESES = 8
 DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M = 10.0
@@ -139,7 +151,11 @@ class PolicySession:
         self.ego_length_m = float(args.ego_length_m or ego["length"])
         self.ego_width_m = float(args.ego_width_m or ego["width"])
         scenario_length = int(args.max_steps) + SCENARIO_LENGTH_MARGIN_STEPS
-        joint = args.actor_prediction == ACTOR_PREDICTION_JOINT
+        # robust prediction is the joint prediction with every likely route of the predicted actors at once
+        self.robust = args.actor_prediction == ACTOR_PREDICTION_ROBUST
+        joint = self.robust or args.actor_prediction == ACTOR_PREDICTION_JOINT
+        self.robust_min_belief = float(args.robust_prediction_min_belief)
+        self.robust_max_routes = int(args.robust_prediction_max_routes)
         self.actor_slot_count = int(args.joint_prediction_actors) if joint else 0
         self.min_moving_speed_mps = float(args.min_moving_speed_mps)
         self.static_slot_start = 1 + self.actor_slot_count
@@ -171,6 +187,10 @@ class PolicySession:
             "collision_behavior": "ignore",
             "offroad_behavior": "ignore",
             "traffic_light_behavior": "ignore",
+            "reward_reverse": float(args.reward_reverse),
+            "reward_comfort": float(args.reward_comfort),
+            "conditioning_throttle_scale": float(args.throttle_jerk_scale),
+            "conditioning_steer_scale": float(args.steer_jerk_scale),
         }
         if request.get("dt"):
             overrides["dt"] = float(request["dt"])
@@ -223,7 +243,8 @@ class PolicySession:
         goals = goals_along(route[start_idx:], args.goal_spacing_m)
         if len(goals) == 0:
             raise ValueError("route has no points ahead of the ego")
-        self.goal_window = RouteGoalWindow(self.env, route_goals_from_xy(goals, origin_xy=(ex, ey)))
+        # sliding: the policy always drives towards num_goals goals ahead, not fewer until the window is replaced
+        self.goal_window = RouteGoalWindow(self.env, route_goals_from_xy(goals, origin_xy=(ex, ey)), sliding=True)
         self.goal_count = len(goals)
         self.lane_count = len(self.map.lane_idx_by_id)
         self.scenario_length = scenario_length
@@ -322,19 +343,21 @@ class PolicySession:
             zero = np.zeros_like(far)
             self.env.set_agent_states(surplus, far, far, far, zero, zero, zero, zero, zero)
 
-    def _place_partners(self, elapsed_s):
-        """Write the static partners into their slots, extrapolated elapsed_s ahead at constant velocity."""
+    def _place_partners(self, elapsed_s, in_scene=False):
+        """Write the static partners into their slots, of the hypothesis scene when in_scene, extrapolated elapsed_s
+        ahead at constant velocity."""
         if self.partners is not None:
-            self._place(self.partners, elapsed_s)
+            self._place(self.partners, elapsed_s, in_scene)
 
-    def _place(self, partners, elapsed_s):
+    def _place(self, partners, elapsed_s, in_scene=False):
         # the policy sees the actors as they are now, and in the rollout the slow ones as standing still
         still = ~partners["moving"] & (elapsed_s > 0)
         vx = np.where(still, 0.0, partners["vx"])
         vy = np.where(still, 0.0, partners["vy"])
         stopped = np.hypot(vx, vy) < float(binding.AGENT_STOPPED_SPEED_THRESHOLD)
         zero = np.zeros(len(partners["idx"]), np.float32)
-        self.env.set_agent_states(
+        set_agent_states = self.env.hypothesis_scene_set_agent_states if in_scene else self.env.set_agent_states
+        set_agent_states(
             partners["idx"],
             (partners["x"] + vx * elapsed_s).astype(np.float32),
             (partners["y"] + vy * elapsed_s).astype(np.float32),
@@ -402,14 +425,16 @@ class PolicySession:
                 logits, action_selection=self.action_selection, env_continuous=self.env_continuous, policy=self.policy
             )
         env_action = cont_action if self.env_continuous and cont_action is not None else action
-        act = env_action.cpu().numpy().reshape(self.env.num_agents, -1)
+        act = env_action.cpu().numpy().reshape(len(obs), -1)
         if not self.env_continuous:
             act = act.astype(np.int32)
         return obs_tensor, act, logits, value
 
-    def _ego_motion(self):
-        """Speed [m/s], acceleration [m/s^2], steering angle [rad] and curvature [1/m] of the shadow ego."""
-        ego_obs = np.asarray(self.env.observations)[EGO_SLOT]
+    def _ego_motion(self, ego_obs=None):
+        """Speed [m/s], acceleration [m/s^2], steering angle [rad] and curvature [1/m] of the shadow ego, from its
+        observation ego_obs, by default the env's."""
+        if ego_obs is None:
+            ego_obs = np.asarray(self.env.observations)[EGO_SLOT]
         steering_angle = float(ego_obs[EGO_OBS_STEERING_IDX]) * EGO_OBS_STEERING_NORM_RAD
         return (
             float(ego_obs[EGO_OBS_SPEED_IDX]) * float(self.env.obs_norm_speed_mps),
@@ -418,10 +443,13 @@ class PolicySession:
             math.tan(steering_angle) / (WHEELBASE_LENGTH_RATIO * self.ego_length_m),
         )
 
-    def _rollout_point(self, time_s):
-        state = self.env.get_global_agent_state()
+    def _rollout_point(self, time_s, state=None, ego_obs=None):
+        """The ego at time_s into the rollout, from the global agent state and the ego observation, by default the
+        env's."""
+        if state is None:
+            state = self.env.get_global_agent_state()
         x, y = self.map.from_bin(float(state["x"][EGO_SLOT]), float(state["y"][EGO_SLOT]))
-        speed_mps, accel_mps2, _, curvature_inv_m = self._ego_motion()
+        speed_mps, accel_mps2, _, curvature_inv_m = self._ego_motion(ego_obs)
         return {
             "t": time_s,
             "x": float(x),
@@ -474,6 +502,31 @@ class PolicySession:
             self.env.predict_end()
         return points
 
+    def _static_rollout(self):
+        """The ego poses of the policy rolled ahead from now among the actors standing still, those slower than
+        --min-moving-speed-mps, the moving ones taken out of the scene."""
+        moving_slots = [] if self.predicted is None else list(self.predicted["idx"])
+        if self.partners is not None:
+            moving_slots += list(self.partners["idx"][self.partners["moving"]])
+        points = [self._rollout_point(0.0)]
+        self.env.predict_begin()
+        try:
+            if moving_slots:
+                far = np.full(len(moving_slots), FAR_AWAY, np.float32)
+                zero = np.zeros_like(far)
+                self.env.set_agent_states(np.array(moving_slots, np.int32), far, far, far, zero, zero, zero, zero, zero)
+            observations = self.env.recompute_observations()
+            for step_idx in range(self.rollout_steps):
+                # every policy agent but the ego is parked out of range, so only the ego is inferred
+                ego_action = self._infer(observations[EGO_SLOT : EGO_SLOT + 1])[1]
+                actions = np.zeros((len(observations), ego_action.shape[1]), ego_action.dtype)
+                actions[EGO_SLOT] = ego_action[0]
+                self.env.predict_step(actions)
+                points.append(self._rollout_point((step_idx + 1) * self.dt))
+        finally:
+            self.env.predict_end()
+        return points
+
     def _joint_rollout(self):
         """The ego poses of the policy rolled ahead from now together with the predicted actors, each driving to its
         likeliest inferred goals, the other actors held at constant velocity; and the predicted actors' paths with the
@@ -509,8 +562,62 @@ class PolicySession:
         finally:
             self.env.predict_end()
         return points, [
-            {"id": actor_id, "points": path, "goals": actor_goals[actor_id]} for actor_id, path in actor_paths.items()
+            {"id": actor_id, "driven": True, "belief": 1.0, "points": path, "goals": actor_goals[actor_id]}
+            for actor_id, path in actor_paths.items()
         ]
+
+    def _robust_rollout(self):
+        """The ego poses of the policy rolled ahead from now against every likely route of each predicted actor at
+        once, as the eval's robust prediction does: the actor drives its likeliest route, and per further kept route a
+        copy of it, unseen by and passing through the actor and its other copies, drives that one, so the ego has to
+        clear them all. The other actors are held as in the joint rollout. Runs in a hypothesis scene, leaving the env
+        untouched. Also the paths of the actors and their copies, each with the goals it drives to and the belief in
+        its route."""
+        inference = self.goal_inference
+        predicted = [] if self.predicted is None else list(zip(self.predicted["idx"], self.predicted["ids"]))
+        routes = {
+            actor_id: inference.routes(actor_id, self.robust_min_belief, self.robust_max_routes)
+            for _, actor_id in predicted
+        }
+        drivers = [(row, actor_id, routes[actor_id][0]) for row, actor_id in predicted]
+        copies = [(row, actor_id, hypothesis) for row, actor_id in predicted for hypothesis in routes[actor_id][1:]]
+        # Scene active agents: the env's, the predicted actors at their slots, then one per copy.
+        env_agent_count = 1 + self.actor_slot_count
+        agent_count = env_agent_count + len(copies)
+        scene_slots = [row for row, _, _ in drivers] + list(range(env_agent_count, agent_count))
+        goal_lists = np.zeros((agent_count, binding.MAX_GOALS, GOAL_COLUMNS), np.float32)
+        list_counts = np.zeros(agent_count, np.int32)
+        state = self.env.get_global_agent_state()
+        actor_paths = []
+        for slot, (row, actor_id, hypothesis) in zip(scene_slots, drivers + copies):
+            goal_list = inference.goal_list(actor_id, hypothesis)
+            goals_x, goals_y = self.map.from_bin(goal_list[:, 0].astype(np.float64), goal_list[:, 1].astype(np.float64))
+            actor_paths.append(
+                {
+                    "id": actor_id,
+                    "driven": True,
+                    "belief": inference.belief(actor_id, hypothesis),
+                    "points": [self._actor_point(state, row, 0.0)],
+                    "goals": [{"x": float(x), "y": float(y)} for x, y in zip(goals_x, goals_y)],
+                }
+            )
+            goal_list[:, :2] -= self.world_minus_sim_xy
+            goal_lists[slot, : len(goal_list)] = goal_list
+            list_counts[slot] = len(goal_list)
+        points = [self._rollout_point(0.0, state)]
+        scene_rows = self.env.hypothesis_scene_begin([np.array([row for row, _, _ in copies], np.int32)])
+        self.env.hypothesis_scene_set_goals(goal_lists, list_counts)
+        for step_idx in range(self.rollout_steps):
+            self.env.hypothesis_scene_step(self._infer(self.env.scene_observations[scene_rows])[1], scene_rows)
+            # c_step holds static slots in place, so the streamed actors are moved here
+            self._place_partners(elapsed_s=(step_idx + 1) * self.dt, in_scene=True)
+            self.env.hypothesis_scene_recompute_observations()
+            time_s = (step_idx + 1) * self.dt
+            scene_state = self.env.get_hypothesis_scene_global_agent_state(agent_count)
+            points.append(self._rollout_point(time_s, scene_state, self.env.scene_observations[scene_rows[EGO_SLOT]]))
+            for slot, path in zip(scene_slots, actor_paths):
+                path["points"].append(self._actor_point(scene_state, slot, time_s))
+        return points, actor_paths
 
     def _debug(self, obs_tensor, logits, value):
         """What the policy saw and chose this step: the decoded ego-frame observation, the goal window in the map
@@ -556,6 +663,8 @@ class PolicySession:
         if self.rollout_steps:
             if self.goal_inference is None:
                 points, actor_rollouts = self._rollout(act), []
+            elif self.robust:
+                points, actor_rollouts = self._robust_rollout()
             else:
                 points, actor_rollouts = self._joint_rollout()
             times_s = [point["t"] for point in points]
@@ -564,6 +673,7 @@ class PolicySession:
             ]
             self.reference = {"time_ns": int(request["time_ns"]), "dt": self.dt, "points": points}
             debug["rollout"] = points
+            debug["static_rollout"] = self._static_rollout()
             debug["actor_rollouts"] = actor_rollouts
         self.env.step(act)
 
@@ -723,21 +833,62 @@ def main():
     )
     parser.add_argument(
         "--actor-prediction",
-        choices=(ACTOR_PREDICTION_CONSTANT_VELOCITY, ACTOR_PREDICTION_JOINT),
+        choices=(ACTOR_PREDICTION_CONSTANT_VELOCITY, ACTOR_PREDICTION_JOINT, ACTOR_PREDICTION_ROBUST),
         default=ACTOR_PREDICTION_CONSTANT_VELOCITY,
-        help="how the rollout moves the actors: at constant velocity, or driven by the policy to inferred goals",
+        help="how the rollout moves the actors: at constant velocity, driven by the policy to their likeliest inferred "
+        "goals, or robust: to every likely one at once, the ego clearing them all",
     )
     parser.add_argument(
         "--joint-prediction-actors",
         type=int,
         default=DEFAULT_JOINT_PREDICTION_ACTORS,
-        help="nearest tracked actors the joint rollout drives",
+        help="nearest tracked actors the joint and robust rollouts drive",
+    )
+    parser.add_argument(
+        "--robust-prediction-min-belief",
+        type=float,
+        default=DEFAULT_ROBUST_PREDICTION_MIN_BELIEF,
+        help="belief from which a further route of an actor gets a copy driving it in the robust rollout",
+    )
+    parser.add_argument(
+        "--robust-prediction-max-routes",
+        type=int,
+        default=DEFAULT_ROBUST_PREDICTION_MAX_ROUTES,
+        help="routes per actor, its own included, the robust rollout drives at most",
     )
     parser.add_argument(
         "--min-moving-speed-mps",
         type=float,
         default=DEFAULT_MIN_MOVING_SPEED_MPS,
         help="estimated speed from which an actor moves in the rollout, and a tracked one can be driven by the policy",
+    )
+    parser.add_argument(
+        "--reward-reverse",
+        type=float,
+        default=MAX_REWARD_REVERSE,
+        help="reverse penalty weight the policy is conditioned on, within the range it trains with; the default, the "
+        "highest, makes it reverse least",
+    )
+    parser.add_argument(
+        "--reward-comfort",
+        type=float,
+        default=MAX_REWARD_COMFORT,
+        help="comfort penalty weight the policy is conditioned on, within the range it trains with; the default, the "
+        "highest, makes it brake and accelerate hard least",
+    )
+    parser.add_argument(
+        "--throttle-jerk-scale",
+        type=float,
+        default=MIN_JERK_SCALE,
+        help="factor on the policy's longitudinal jerk, C_throttle, within the range it trains with; the default, the "
+        "lowest, makes it smoothest",
+    )
+    parser.add_argument(
+        "--steer-jerk-scale",
+        type=float,
+        default=MIN_JERK_SCALE,
+        help="factor on the policy's lateral jerk, C_steer, within the range it trains with; the default, the lowest, "
+        "makes it smoothest",
     )
     parser.add_argument("--goal-inference-hypotheses", type=int, default=DEFAULT_GOAL_INFERENCE_HYPOTHESES)
     parser.add_argument("--goal-inference-goal-spacing-m", type=float, default=DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M)
@@ -751,12 +902,24 @@ def main():
         parser.error("--ego-length-m and --ego-width-m must be positive")
     if not args.rollout_horizon_s >= 0:
         parser.error("--rollout-horizon-s must not be negative")
-    if args.actor_prediction == ACTOR_PREDICTION_JOINT and not args.rollout_horizon_s > 0:
-        parser.error("--actor-prediction joint needs --rollout-horizon-s")
+    if args.actor_prediction != ACTOR_PREDICTION_CONSTANT_VELOCITY and not args.rollout_horizon_s > 0:
+        parser.error(f"--actor-prediction {args.actor_prediction} needs --rollout-horizon-s")
+    if not 0 <= args.robust_prediction_min_belief <= 1:
+        parser.error("--robust-prediction-min-belief must be in [0, 1]")
+    if args.robust_prediction_max_routes < 1:
+        parser.error("--robust-prediction-max-routes must be positive")
     if not 0 < args.joint_prediction_actors <= args.max_partners:
         parser.error("--joint-prediction-actors must be in 1..--max-partners")
     if not args.min_moving_speed_mps >= 0:
         parser.error("--min-moving-speed-mps must not be negative")
+    if not MIN_REWARD_REVERSE <= args.reward_reverse <= MAX_REWARD_REVERSE:
+        parser.error(f"--reward-reverse must be in [{MIN_REWARD_REVERSE}, {MAX_REWARD_REVERSE}], the trained range")
+    if not MIN_REWARD_COMFORT <= args.reward_comfort <= MAX_REWARD_COMFORT:
+        parser.error(f"--reward-comfort must be in [{MIN_REWARD_COMFORT}, {MAX_REWARD_COMFORT}], the trained range")
+    if not all(
+        MIN_JERK_SCALE <= scale <= MAX_JERK_SCALE for scale in (args.throttle_jerk_scale, args.steer_jerk_scale)
+    ):
+        parser.error(f"--throttle-jerk-scale and --steer-jerk-scale must be in [{MIN_JERK_SCALE}, {MAX_JERK_SCALE}]")
     if args.goal_inference_hypotheses < 1:
         parser.error("--goal-inference-hypotheses must be positive")
     if not (
