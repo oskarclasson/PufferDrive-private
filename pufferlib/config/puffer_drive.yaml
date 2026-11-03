@@ -459,15 +459,28 @@ eval:
   mppi_obstacle_margin_m: 0.5
   mppi_boundary_margin_m: 0.3
   # Goal inference: every active agent keeps a belief over the ways ahead of it in the editor's route graph (goals spaced
-  # along each branch, junction exits and lane changes included),
-  # updated each step by exp(beta * advantage) with the critic's advantage gamma * V(next) - V(now) under that route;
+  # along each branch, junction exits and lane changes included), Bayes-updated each step by goal_inference_likelihood;
   # the belief mixes back toward uniform by goal_inference_forgetting per step so a change of mind can win.
   goal_inference: false
+  # "action": a Gaussian on the executed action around the policy's mean action under each route (policy agents only).
+  # "value": exp(beta * advantage) with the critic's gamma * V(next) - V(now) under each route.
+  # "trajectory": per route, a ghost driven by the policy's mean action from the agent's real state (every other agent
+  # mirrored to its real state each step) is compared to the agent's real position, heading and speed by a Gaussian;
+  # ghosts restart every goal_inference_rollout_s and whenever the routes are re-placed.
+  # "action" and "trajectory" need a discrete policy on a continuous action env.
+  goal_inference_likelihood: action
+  # Std of that Gaussian per action axis, in the dynamics model's physical units (jerk model: m/s^3).
+  goal_inference_action_std_long: 0.3
+  goal_inference_action_std_lat: 0.3
+  goal_inference_rollout_s: 2.0
+  goal_inference_trajectory_std_m: 1.0
+  goal_inference_trajectory_std_heading_rad: 0.1
+  goal_inference_trajectory_std_speed_mps: 1.0
   goal_inference_hypotheses: 8
-  # Close goals make the critic's value react to a few metres of progress toward each route.
-  goal_inference_goal_spacing_m: 10.0
+  # Like env.min_goal_spacing, so the policy sees goal windows spaced as in training.
+  goal_inference_goal_spacing_m: 20.0
   # Goals are re-placed ahead of every agent this often, carrying the belief over.
-  goal_inference_update_s: 1.0
+  goal_inference_update_s: 2.0
   goal_inference_beta: 10.0
   goal_inference_forgetting: 0.01
   # Joint prediction: every captured frame, all policy agents are rolled out together for joint_prediction_horizon_s,

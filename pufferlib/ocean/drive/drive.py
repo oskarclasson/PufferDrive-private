@@ -493,6 +493,8 @@ class Drive(pufferlib.PufferEnv):
         self.c_envs = None
         self._hypothesis_scenes = None
         self._hypothesis_key = None
+        self._ghost_scenes = None
+        self._ghost_key = None
         if config_only:
             return
 
@@ -772,6 +774,7 @@ class Drive(pufferlib.PufferEnv):
                     return (self.observations, self.rewards, self.terminals, self.truncations, info)
                 # Scenes point into the closing envs' map data, and a new handle may reuse the old address.
                 self.hypothesis_scene_close()
+                self.ghost_scene_close()
                 binding.vec_close(self.c_envs)
                 # Pairs already replayed this sweep; slice the rest so a deferred
                 # scene resumes exactly where the previous batch stopped.
@@ -905,6 +908,77 @@ class Drive(pufferlib.PufferEnv):
     def hypothesis_scene_set_dt(self, dt_seconds):
         binding.vec_predict_set_dt(self._hypothesis_scenes, dt_seconds)
 
+    def ghost_scene_begin(self, hypothesis_count, restart_rows):
+        """Restart from the real state the hypothesis_count policy-driven ghosts of every active row in restart_rows.
+
+        Ghost scene (slot * hypothesis_count + k) * envs + e holds one ghost of env e's active agent slot under
+        hypothesis k (padding slots ghost agent 0 and go unused). Returns the (active rows, hypotheses) ghost rows,
+        which index ghost_observations and the scenes' active agents alike, and whether the scenes were rebuilt, which
+        restarts them all.
+        """
+        active_counts = np.diff(self.agent_offsets).astype(np.int64)
+        env_count = len(active_counts)
+        copy_count = int(active_counts.max()) * hypothesis_count
+        scene_key = (self.c_envs, tuple(active_counts), copy_count)
+        rebuilt = self._ghost_key != scene_key
+        if rebuilt:
+            self.ghost_scene_close()
+            row_count = copy_count * (int(active_counts.sum()) + env_count)
+            self.ghost_observations = np.zeros((row_count, self.observations.shape[1]), dtype=np.float32)
+            self.ghost_actions = np.zeros((row_count, 2), dtype=np.float32)
+            self.ghost_rewards = np.zeros(row_count, dtype=np.float32)
+            self.ghost_terminals = np.zeros(row_count, dtype=np.uint8)
+            self._ghost_scenes = binding.vec_hypothesis_scene_create(
+                self.c_envs,
+                1,
+                self.ghost_observations,
+                self.ghost_actions,
+                self.ghost_rewards,
+                self.ghost_terminals,
+                copy_count,
+            )
+            self._ghost_key = scene_key
+        scene_env = np.tile(np.arange(env_count), copy_count)
+        scene_slot = np.repeat(np.arange(copy_count) // hypothesis_count, env_count)
+        has_ghost = scene_slot < active_counts[scene_env]
+        sources = np.where(has_ghost, scene_slot, 0).astype(np.int32)
+        source_rows = np.asarray(self.agent_offsets[:-1], dtype=np.int64)[scene_env] + sources
+        restart_mask = np.ones(len(sources), dtype=bool) if rebuilt else has_ghost & restart_rows[source_rows]
+        binding.vec_ghost_scene_begin(self._ghost_scenes, self.c_envs, sources, restart_mask)
+        # A scene's rows are its env's active agents, then the ghost.
+        scene_rows = active_counts[scene_env] + 1
+        ghost_row_of_scene = np.cumsum(scene_rows) - 1
+        hypotheses = np.arange(hypothesis_count)
+        row_env = np.repeat(np.arange(env_count), active_counts)
+        row_slot = np.arange(int(active_counts.sum())) - np.asarray(self.agent_offsets[:-1], dtype=np.int64)[row_env]
+        row_scene = (row_slot[:, None] * hypothesis_count + hypotheses) * env_count + row_env[:, None]
+        return ghost_row_of_scene[row_scene], rebuilt
+
+    def ghost_scene_mirror_sources(self):
+        """Put every non-ghost agent and the clock of each ghost scene at its real state; rewrite the ghost obs."""
+        binding.vec_ghost_scene_mirror_sources(self._ghost_scenes, self.c_envs)
+
+    def ghost_scene_set_goals(self, goals, counts):
+        """Like predict_set_goals, over the ghost scenes' active agents."""
+        binding.vec_predict_set_goals(self._ghost_scenes, goals, counts)
+
+    def ghost_scene_step(self, actions):
+        self.ghost_actions[:] = actions
+        binding.vec_step(self._ghost_scenes)
+
+    def get_ghost_scene_agent_kinematics(self, out):
+        binding.vec_get_active_agent_kinematics(self._ghost_scenes, out)
+
+    def get_active_agent_kinematics(self, out):
+        """Fill out[:num_active] with each active agent's sim-frame x, y, heading, signed speed and valid flag."""
+        binding.vec_get_active_agent_kinematics(self.c_envs, out)
+
+    def ghost_scene_close(self):
+        if self._ghost_scenes is not None:
+            binding.vec_hypothesis_scene_close(self._ghost_scenes)
+        self._ghost_scenes = None
+        self._ghost_key = None
+
     def hypothesis_scene_set_goals(self, goals, counts):
         """Like predict_set_goals, over the scene's active agents in hypothesis_scene_begin's order."""
         binding.vec_predict_set_goals(self._hypothesis_scenes, goals, counts)
@@ -987,6 +1061,12 @@ class Drive(pufferlib.PufferEnv):
         active_ids = np.zeros(int(self.agent_offsets[-1]), dtype=np.int32)
         binding.vec_get_active_agent_ids(self.c_envs, active_ids)
         return active_ids
+
+    def get_active_agent_controllers(self):
+        """Controllers (binding.CONTROLLER_*) of the active agents, in active-row order."""
+        controllers = np.zeros(int(self.agent_offsets[-1]), dtype=np.int32)
+        binding.vec_get_active_agent_controllers(self.c_envs, controllers)
+        return controllers
 
     def get_active_agent_xy(self, out):
         """Fill out[:num_active] with active-agent positions in the sim frame the replay viewer draws in."""
@@ -1344,6 +1424,7 @@ class Drive(pufferlib.PufferEnv):
         if self.c_envs is None:
             return
         self.hypothesis_scene_close()
+        self.ghost_scene_close()
         binding.vec_close(self.c_envs)
         self.c_envs = None
 

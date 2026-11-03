@@ -38,6 +38,10 @@ static PyObject *vec_hypothesis_scene_begin_py(PyObject *self __attribute__((unu
 static PyObject *vec_hypothesis_scene_close_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_get_active_agent_xy_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_get_active_agent_ids_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_get_active_agent_controllers_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_get_active_agent_kinematics_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_ghost_scene_begin_py(PyObject *self __attribute__((unused)), PyObject *args);
+static PyObject *vec_ghost_scene_mirror_sources_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_predict_record_obstacles_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_mppi_rollout_costs_py(PyObject *self __attribute__((unused)), PyObject *args);
 static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyObject *args);
@@ -56,7 +60,7 @@ static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyO
     {"vec_predict_set_dt", vec_predict_set_dt_py, METH_VARARGS, \
      "Step a running prediction rollout with timestep dt seconds; vec_predict_end restores the env's own dt."}, \
     {"vec_hypothesis_scene_create", vec_hypothesis_scene_create_py, METH_VARARGS, \
-     "Create a hypothesis scene per env, stepping into buffers of (active agents + ghost_capacity) rows per env."}, \
+     "Create copy_count (default 1) hypothesis scenes per env, each stepping into (active agents + ghost_capacity) rows."}, \
     {"vec_hypothesis_scene_begin", vec_hypothesis_scene_begin_py, METH_VARARGS, \
      "Copy each env into its scene with one copy of active row sources[e, g] per g < counts[e]; start rollouts."}, \
     {"vec_hypothesis_scene_close", vec_hypothesis_scene_close_py, METH_VARARGS, \
@@ -69,6 +73,14 @@ static PyObject *vec_mppi_prepare_py(PyObject *self __attribute__((unused)), PyO
      "Fill an (active agents, 2) float32 array with active-agent sim positions."}, \
     {"vec_get_active_agent_ids", vec_get_active_agent_ids_py, METH_VARARGS, \
      "Fill an (active agents,) int32 array with each active agent's scenario id."}, \
+    {"vec_get_active_agent_controllers", vec_get_active_agent_controllers_py, METH_VARARGS, \
+     "Fill an (active agents,) int32 array with each active agent's CONTROLLER_* value."}, \
+    {"vec_get_active_agent_kinematics", vec_get_active_agent_kinematics_py, METH_VARARGS, \
+     "Fill an (active agents, AGENT_KINEMATICS_FIELD_COUNT) float32 array with x, y, heading, signed speed, valid."}, \
+    {"vec_ghost_scene_begin", vec_ghost_scene_begin_py, METH_VARARGS, \
+     "Restart each one-ghost scene set in restart_mask with a policy-driven copy of active row sources[i]."}, \
+    {"vec_ghost_scene_mirror_sources", vec_ghost_scene_mirror_sources_py, METH_VARARGS, \
+     "Put every agent but the ghost and the clock of each ghost scene at its env's real state; rewrite the ghost obs."}, \
     {"vec_predict_record_obstacles", vec_predict_record_obstacles_py, METH_VARARGS, \
      "Record every collision candidate's pose as the next step of the running prediction rollout."}, \
     {"vec_mppi_rollout_costs", vec_mppi_rollout_costs_py, METH_VARARGS, \
@@ -2212,12 +2224,21 @@ static PyArrayObject *require_byte_array(PyObject *obj, const char *name) {
     return (PyArrayObject *) obj;
 }
 
-// Scene e's rows start after every earlier env's (active agents + ghost_capacity) rows.
+// Scene c * envs + e copies env e; its rows start after every earlier scene's (active agents + ghost_capacity) rows.
 static PyObject *vec_hypothesis_scene_create_py(PyObject *self __attribute__((unused)), PyObject *args) {
     PyObject *src_obj, *observations_obj, *actions_obj, *rewards_obj, *terminals_obj;
     int ghost_capacity;
+    int copy_count = 1;
     if (!PyArg_ParseTuple(
-            args, "OiOOOO", &src_obj, &ghost_capacity, &observations_obj, &actions_obj, &rewards_obj, &terminals_obj)) {
+            args,
+            "OiOOOO|i",
+            &src_obj,
+            &ghost_capacity,
+            &observations_obj,
+            &actions_obj,
+            &rewards_obj,
+            &terminals_obj,
+            &copy_count)) {
         return NULL;
     }
     VecEnv *src_vec = unpack_vecenv(args);
@@ -2228,23 +2249,26 @@ static PyObject *vec_hypothesis_scene_create_py(PyObject *self __attribute__((un
     if (!terminals) {
         return NULL;
     }
-    if (ghost_capacity <= 0) {
-        PyErr_SetString(PyExc_ValueError, "ghost_capacity must be positive");
+    if (ghost_capacity <= 0 || copy_count <= 0) {
+        PyErr_SetString(PyExc_ValueError, "ghost_capacity and copy_count must be positive");
         return NULL;
     }
     int observation_size = compute_observation_size((Drive *) src_vec->envs[0]);
-    npy_intp row_count = (npy_intp) vec_active_agent_count(src_vec) + (npy_intp) ghost_capacity * src_vec->num_envs;
+    npy_intp row_count = (npy_intp) copy_count
+        * ((npy_intp) vec_active_agent_count(src_vec) + (npy_intp) ghost_capacity * src_vec->num_envs);
     if (PyArray_DIM(observations, 0) != row_count || PyArray_DIM(observations, 1) != observation_size
         || PyArray_DIM(actions, 0) != row_count || PyArray_DIM(actions, 1) != 2
         || PyArray_DIM(rewards, 0) != row_count || PyArray_DIM(terminals, 0) != row_count) {
-        PyErr_SetString(PyExc_ValueError, "scene buffers must have active agents + ghost_capacity rows per env");
+        PyErr_SetString(
+            PyExc_ValueError,
+            "scene buffers must have copy_count * (active agents + ghost_capacity per env) rows");
         return NULL;
     }
     VecEnv *scene_vec = (VecEnv *) calloc(1, sizeof(VecEnv));
     if (scene_vec == NULL) {
         return PyErr_NoMemory();
     }
-    scene_vec->envs = (Env **) calloc(src_vec->num_envs, sizeof(Env *));
+    scene_vec->envs = (Env **) calloc((size_t) copy_count * src_vec->num_envs, sizeof(Env *));
     if (scene_vec->envs == NULL) {
         free(scene_vec);
         return PyErr_NoMemory();
@@ -2254,8 +2278,8 @@ static PyObject *vec_hypothesis_scene_create_py(PyObject *self __attribute__((un
     float *reward_data = (float *) PyArray_DATA(rewards);
     unsigned char *terminal_data = (unsigned char *) PyArray_DATA(terminals);
     int row = 0;
-    for (int e = 0; e < src_vec->num_envs; e++) {
-        Drive *src = (Drive *) src_vec->envs[e];
+    for (int scene_idx = 0; scene_idx < copy_count * src_vec->num_envs; scene_idx++) {
+        Drive *src = (Drive *) src_vec->envs[scene_idx % src_vec->num_envs];
         Drive *scene = c_hypothesis_scene_create(
             src,
             ghost_capacity,
@@ -2338,6 +2362,140 @@ static PyObject *vec_hypothesis_scene_close_py(PyObject *self __attribute__((unu
     }
     free(scene_vec->envs);
     free(scene_vec);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_active_agent_controllers_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *env_obj, *out_obj;
+    if (!PyArg_ParseTuple(args, "OO", &env_obj, &out_obj)) {
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    PyArrayObject *out = vec ? require_int32_array(out_obj, 1, "out") : NULL;
+    if (!out) {
+        return NULL;
+    }
+    if (PyArray_DIM(out, 0) < vec_active_agent_count(vec)) {
+        PyErr_SetString(PyExc_ValueError, "out is smaller than the active agent count");
+        return NULL;
+    }
+    int *controllers = (int *) PyArray_DATA(out);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        for (int j = 0; j < drive->active_agent_count; j++) {
+            controllers[row++] = drive->agents[drive->active_agent_indices[j]].controller;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_active_agent_kinematics_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *env_obj, *out_obj;
+    if (!PyArg_ParseTuple(args, "OO", &env_obj, &out_obj)) {
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    PyArrayObject *out = vec ? require_float32_array(out_obj, 2, "out") : NULL;
+    if (!out) {
+        return NULL;
+    }
+    if (PyArray_DIM(out, 0) < vec_active_agent_count(vec) || PyArray_DIM(out, 1) != AGENT_KINEMATICS_FIELD_COUNT) {
+        PyErr_Format(PyExc_ValueError, "out must be (>= active agents, %d)", AGENT_KINEMATICS_FIELD_COUNT);
+        return NULL;
+    }
+    float *kinematics = (float *) PyArray_DATA(out);
+    int row = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *) vec->envs[i];
+        for (int j = 0; j < drive->active_agent_count; j++, row++) {
+            Agent *agent = &drive->agents[drive->active_agent_indices[j]];
+            float *fields = &kinematics[row * AGENT_KINEMATICS_FIELD_COUNT];
+            fields[0] = agent->sim_x;
+            fields[1] = agent->sim_y;
+            fields[2] = agent->sim_heading;
+            fields[3] = agent->sim_speed_signed;
+            fields[4] = (agent->sim_valid && !agent->removed && agent->sim_x != INVALID_POSITION) ? 1.0f : 0.0f;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static VecEnv *unpack_vecenv_object(PyObject *handle_obj) {
+    PyObject *handle_args = PyTuple_Pack(1, handle_obj);
+    if (handle_args == NULL) {
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(handle_args);
+    Py_DECREF(handle_args);
+    return vec;
+}
+
+// Scene i is a copy of env i % envs; only the scenes set in restart_mask restart, each ghosting sources[i].
+static PyObject *vec_ghost_scene_begin_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *scene_obj, *src_obj, *sources_obj, *mask_obj;
+    if (!PyArg_ParseTuple(args, "OOOO", &scene_obj, &src_obj, &sources_obj, &mask_obj)) {
+        return NULL;
+    }
+    VecEnv *scene_vec = unpack_vecenv(args);
+    VecEnv *src_vec = scene_vec ? unpack_vecenv_object(src_obj) : NULL;
+    PyArrayObject *sources = src_vec ? require_int32_array(sources_obj, 1, "sources") : NULL;
+    PyArrayObject *restart_mask = sources ? require_byte_array(mask_obj, "restart_mask") : NULL;
+    if (!restart_mask) {
+        return NULL;
+    }
+    if (scene_vec->num_envs % src_vec->num_envs != 0 || PyArray_DIM(sources, 0) != scene_vec->num_envs
+        || PyArray_DIM(restart_mask, 0) != scene_vec->num_envs) {
+        PyErr_SetString(PyExc_ValueError, "sources and restart_mask need one entry per scene of these envs");
+        return NULL;
+    }
+    int *source_data = (int *) PyArray_DATA(sources);
+    unsigned char *restart_data = (unsigned char *) PyArray_DATA(restart_mask);
+    for (int i = 0; i < scene_vec->num_envs; i++) {
+        Drive *src = (Drive *) src_vec->envs[i % src_vec->num_envs];
+        if (restart_data[i] && (source_data[i] < 0 || source_data[i] >= src->active_agent_count)) {
+            PyErr_SetString(PyExc_ValueError, "ghost source must be an active row of its env");
+            return NULL;
+        }
+    }
+    for (int i = 0; i < scene_vec->num_envs; i++) {
+        if (!restart_data[i]) {
+            continue;
+        }
+        Drive *src = (Drive *) src_vec->envs[i % src_vec->num_envs];
+        if (c_ghost_scene_begin((Drive *) scene_vec->envs[i], src, source_data[i]) != 0) {
+            PyErr_SetString(PyExc_RuntimeError, "vec_ghost_scene_begin failed: allocation or scene too small");
+            return NULL;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_ghost_scene_mirror_sources_py(PyObject *self __attribute__((unused)), PyObject *args) {
+    PyObject *scene_obj, *src_obj;
+    if (!PyArg_ParseTuple(args, "OO", &scene_obj, &src_obj)) {
+        return NULL;
+    }
+    VecEnv *scene_vec = unpack_vecenv(args);
+    VecEnv *src_vec = scene_vec ? unpack_vecenv_object(src_obj) : NULL;
+    if (!src_vec) {
+        return NULL;
+    }
+    if (scene_vec->num_envs % src_vec->num_envs != 0) {
+        PyErr_SetString(PyExc_ValueError, "ghost scenes do not match the source envs");
+        return NULL;
+    }
+    for (int i = 0; i < scene_vec->num_envs; i++) {
+        Drive *scene = (Drive *) scene_vec->envs[i];
+        Drive *src = (Drive *) src_vec->envs[i % src_vec->num_envs];
+        if (!scene->predict_mode || scene->num_total_agents != src->num_total_agents + 1) {
+            PyErr_SetString(PyExc_RuntimeError, "vec_ghost_scene_mirror_sources needs running one-ghost scenes of src");
+            return NULL;
+        }
+    }
+    for (int i = 0; i < scene_vec->num_envs; i++) {
+        c_ghost_scene_mirror_sources((Drive *) scene_vec->envs[i], (Drive *) src_vec->envs[i % src_vec->num_envs]);
+    }
     Py_RETURN_NONE;
 }
 

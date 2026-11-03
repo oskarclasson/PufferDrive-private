@@ -204,7 +204,7 @@ class EditorState:
         goal_radius = request.get("goal_radius", 2.0)
         if not isinstance(goal_radius, (int, float)) or not MIN_GOAL_RADIUS_M <= goal_radius <= MAX_GOAL_RADIUS_M:
             raise scenario_builder.ScenarioSpecError("goal_radius out of range")
-        inferred_goal_spacing_m = request.get("inferred_goal_spacing_m", 10.0)
+        inferred_goal_spacing_m = request.get("inferred_goal_spacing_m", 20.0)
         if (
             not isinstance(inferred_goal_spacing_m, (int, float))
             or not MIN_INFERRED_GOAL_SPACING_M <= inferred_goal_spacing_m <= MAX_INFERRED_GOAL_SPACING_M

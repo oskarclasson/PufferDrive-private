@@ -6391,6 +6391,91 @@ void c_goal_window_observation(
     env->rng_state = saved_rng;
 }
 
+// ── Ghost scenes ─────────────────────────────────────────────────────────────
+// Seeds a replay/IDM/static agent's stale accel and steering from its motion; replay accel never reads the log ahead.
+static void seed_ghost_dynamics(Drive *env, Agent *agent) {
+    int t = env->timestep;
+    if (agent->controller == CONTROLLER_REPLAY) {
+        agent->accel_long = 0.0f;
+    }
+    if (agent->controller == CONTROLLER_REPLAY && t > 0 && t < agent->trajectory_size && agent->log_valid[t - 1] == 1
+        && agent->log_valid[t] == 1) {
+        float speed_prev_mps
+            = agent->log_velocity_x[t - 1] * agent->cos_heading + agent->log_velocity_y[t - 1] * agent->sin_heading;
+        float speed_now_mps
+            = agent->log_velocity_x[t] * agent->cos_heading + agent->log_velocity_y[t] * agent->sin_heading;
+        agent->accel_long
+            = clip((speed_now_mps - speed_prev_mps) / env->log_dt, ACCEL_LONG_LIMIT[0], ACCEL_LONG_LIMIT[1]);
+    }
+    agent->accel_lat = clip(agent->sim_speed_signed * agent->yaw_rate, ACCEL_LAT_LIMIT[0], ACCEL_LAT_LIMIT[1]);
+    float signed_curvature = agent->yaw_rate / fmaxf(fabsf(agent->sim_speed_signed), CURVATURE_MIN_SPEED_MPS);
+    float steering_limit_rad
+        = env->dynamics_model == DYNAMICS_MODEL_JERK ? JERK_MODEL_STEERING_LIMIT_RAD : STEERING_LIMIT;
+    agent->steering_angle = clip(atanf(signed_curvature * agent->wheelbase), -steering_limit_rad, steering_limit_rad);
+    agent->controller = CONTROLLER_POLICY;
+}
+
+// A hypothesis scene whose one copy of active agent source_active_idx, the ghost, is policy-driven; -1 on failure.
+int c_ghost_scene_begin(Drive *scene, Drive *src, int source_active_idx) {
+    if (c_hypothesis_scene_begin(scene, src, &source_active_idx, 1) != 0) {
+        return -1;
+    }
+    Agent *ghost = &scene->agents[src->num_total_agents];
+    if (ghost->controller != CONTROLLER_POLICY) {
+        seed_ghost_dynamics(scene, ghost);
+    }
+    return 0;
+}
+
+static void copy_agent_motion(Agent *dst, const Agent *src) {
+    dst->sim_x = src->sim_x;
+    dst->sim_y = src->sim_y;
+    dst->sim_z = src->sim_z;
+    dst->sim_heading = src->sim_heading;
+    dst->cos_heading = src->cos_heading;
+    dst->sin_heading = src->sin_heading;
+    dst->sim_vx = src->sim_vx;
+    dst->sim_vy = src->sim_vy;
+    dst->yaw_rate = src->yaw_rate;
+    dst->sim_speed = src->sim_speed;
+    dst->sim_speed_signed = src->sim_speed_signed;
+    dst->accel_long = src->accel_long;
+    dst->accel_lat = src->accel_lat;
+    dst->jerk_long = src->jerk_long;
+    dst->jerk_lat = src->jerk_lat;
+    dst->steering_angle = src->steering_angle;
+    dst->prev_x = src->prev_x;
+    dst->prev_y = src->prev_y;
+    dst->prev_cos_heading = src->prev_cos_heading;
+    dst->prev_sin_heading = src->prev_sin_heading;
+    dst->sim_valid = src->sim_valid;
+    dst->removed = src->removed;
+    dst->stopped = src->stopped;
+    dst->seconds_stopped = src->seconds_stopped;
+}
+
+// Puts every agent but the ghost, and the clock, at their real state in src and rewrites the ghost's observation.
+void c_ghost_scene_mirror_sources(Drive *scene, Drive *src) {
+    assert(scene->predict_mode && scene->num_total_agents == src->num_total_agents + 1);
+    int ghost_agent_idx = src->num_total_agents;
+    int ghost_active_idx = src->active_agent_count;
+    for (int i = 0; i < src->num_total_agents; i++) {
+        copy_agent_motion(&scene->agents[i], &src->agents[i]);
+    }
+    scene->timestep = src->timestep;
+    int observation_size = compute_observation_size(scene);
+    float *obs = &scene->observations[ghost_active_idx * observation_size];
+    PartnerScanEntry partner_scan[scene->num_agents];
+    fill_partner_scan(scene, partner_scan);
+    // c_step already advanced the ghost's observation counters and the rng this step.
+    Agent saved_ghost = scene->agents[ghost_agent_idx];
+    Rng saved_rng = scene->rng_state;
+    memset(obs, 0, observation_size * sizeof(float));
+    write_agent_observation(scene, ghost_active_idx, partner_scan, obs);
+    scene->agents[ghost_agent_idx] = saved_ghost;
+    scene->rng_state = saved_rng;
+}
+
 // ── MPPI safety cost ─────────────────────────────────────────────────────────
 typedef struct {
     float cbf_decay_rate; // 1/s: a safe step keeps h(t+1) >= (1 - cbf_decay_rate * dt) * h(t)

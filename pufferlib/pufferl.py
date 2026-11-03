@@ -104,6 +104,8 @@ PROFILE_ACK = b"ack\n\0"
 # Sim-only profiles define a cycle as a fixed number of environment steps.
 PROFILE_SIM_STEPS_PER_CYCLE = 16_384
 GOAL_NEW_BRANCH_MIN_BELIEF = 0.1
+GOAL_INFERENCE_LIKELIHOOD_ACTION = "action"
+GOAL_INFERENCE_LIKELIHOOD_TRAJECTORY = "trajectory"
 GOAL_CONTINUE_M = 3.0
 JOINT_PREDICTION_INVALID_M = 1e4  # magnitude of constants.h INVALID_POSITION
 JOINT_PREDICTION_MAX_SPEED_MPS = 20.0  # sizes the goal list so it lasts the whole horizon
@@ -2475,6 +2477,16 @@ def _run_eval_rollout(
         discrete_policy_on_continuous_env = env_continuous and not uncompiled_policy.is_continuous
         if mppi_samples and not env_continuous:
             raise pufferlib.APIUsageError("eval.mppi_samples requires a continuous action env")
+        action_likelihood = (
+            goal_inference and args["eval"]["goal_inference_likelihood"] == GOAL_INFERENCE_LIKELIHOOD_ACTION
+        )
+        trajectory_likelihood = (
+            goal_inference and args["eval"]["goal_inference_likelihood"] == GOAL_INFERENCE_LIKELIHOOD_TRAJECTORY
+        )
+        if (action_likelihood or trajectory_likelihood) and not discrete_policy_on_continuous_env:
+            raise pufferlib.APIUsageError(
+                "eval.goal_inference_likelihood=action/trajectory needs a discrete policy on a continuous action env"
+            )
         device = torch_device(args["train"]["device"])
         use_bfloat16 = args["train"]["precision"] == "bfloat16" and is_cuda_device(device)
         if use_bfloat16 and not torch.cuda.is_bf16_supported():
@@ -2651,6 +2663,14 @@ def _run_eval_rollout(
         goal_spacing_m = args["eval"]["goal_inference_goal_spacing_m"]
         goal_count = args["env"]["num_goals"]
         goal_update_steps = max(1, round(args["eval"]["goal_inference_update_s"] / args["env"]["dt"]))
+        goal_action_std = np.array(
+            [args["eval"]["goal_inference_action_std_long"], args["eval"]["goal_inference_action_std_lat"]],
+            dtype=np.float32,
+        )
+        ghost_rollout_steps = max(1, round(args["eval"]["goal_inference_rollout_s"] / args["env"]["dt"]))
+        ghost_std_m = args["eval"]["goal_inference_trajectory_std_m"]
+        ghost_std_heading_rad = args["eval"]["goal_inference_trajectory_std_heading_rad"]
+        ghost_std_speed_mps = args["eval"]["goal_inference_trajectory_std_speed_mps"]
         goal_beliefs = {}
         route_graphs = {}
 
@@ -2703,6 +2723,11 @@ def _run_eval_rollout(
                 "belief": np.zeros(shape, dtype=np.float32),
                 "value": np.zeros(shape, dtype=np.float32),
                 "has_value": np.zeros(shape, dtype=bool),
+                "mean_action": np.zeros((*shape, 2), dtype=np.float32),
+                "has_mean_action": np.zeros(shape, dtype=bool),
+                "ghost_age": np.full(active_count, -1, dtype=np.int64),
+                "ghost_scored": np.zeros(shape, dtype=bool),
+                "ghost_rows": np.zeros(shape, dtype=np.int64),
                 "xy": np.zeros((active_count, 2), dtype=np.float32),
                 "steps_since_update": np.zeros(active_count, dtype=np.int64),
                 "has_xy": False,
@@ -2740,11 +2765,101 @@ def _run_eval_rollout(
                     new_total[out_idx, k] = len(goals)
             return new_goals, new_total
 
-        def update_goal_beliefs():
-            """Advance each active agent's belief over the ways ahead of it by the critic advantage of its last move.
+        def hypothesis_action_probs(hypothesis_obs):
+            """The discrete policy's class probabilities per observation."""
+            with torch.no_grad(), eval_amp_context:
+                logits, _ = policy_forward_eval(torch.as_tensor(hypothesis_obs, device=device))
+            return torch.softmax(logits.float(), dim=-1)
+
+        def update_belief(belief, log_likelihood, scored):
+            """Bayes-update each row with any scored hypothesis by its scored log-likelihoods, then mix it back toward
+            uniform over the scored hypotheses by goal_inference_forgetting."""
+            forgetting = args["eval"]["goal_inference_forgetting"]
+            for row in np.flatnonzero(scored.any(axis=1)):
+                row_log_likelihood = np.where(scored[row], log_likelihood[row], -np.inf)
+                posterior = belief[row] * np.exp(row_log_likelihood - row_log_likelihood.max())
+                posterior /= max(posterior.sum(), 1e-12)
+                belief[row] = (1.0 - forgetting) * posterior + forgetting * scored[row] / scored[row].sum()
+
+        def apply_action_evidence(state, worker_env, executed_action):
+            """Bayes-update every policy agent's belief by a Gaussian on its executed action around each hypothesis'
+            mean action, both taken at the previous step and in physical action units."""
+            long_scale = np.where(
+                executed_action[:, 0] < 0.0,
+                uncompiled_policy.action_long_neg_scale,
+                uncompiled_policy.action_long_pos_scale,
+            )
+            executed_physical = np.column_stack(
+                [executed_action[:, 0] * long_scale, executed_action[:, 1] * uncompiled_policy.action_lat_scale]
+            )
+            # Replay and IDM agents ignore their actions, so their moves say nothing about the policy's goal.
+            policy_driven = worker_env.get_active_agent_controllers() == drive_binding.CONTROLLER_POLICY
+            scored = state["has_mean_action"] & policy_driven[:, None] & (state["next_goal"] < state["goal_total"])
+            action_error = (state["mean_action"] - executed_physical[:, None]) / goal_action_std
+            update_belief(state["belief"], -0.5 * np.sum(action_error**2, axis=-1), scored)
+
+        def apply_trajectory_evidence(state, worker_env, active_count):
+            """Bayes-update every agent's belief by a Gaussian on its real position, heading and speed around those of
+            each hypothesis' ghost, which the policy has driven from the agent's real state toward that hypothesis."""
+            alive = state["ghost_age"] >= 1
+            if not alive.any():
+                return
+            real = np.zeros((active_count, drive_binding.AGENT_KINEMATICS_FIELD_COUNT), dtype=np.float32)
+            worker_env.get_active_agent_kinematics(real)
+            ghost = np.zeros(
+                (len(worker_env.ghost_observations), drive_binding.AGENT_KINEMATICS_FIELD_COUNT), dtype=np.float32
+            )
+            worker_env.get_ghost_scene_agent_kinematics(ghost)
+            ghost = ghost[state["ghost_rows"]]
+            position_error_m = np.hypot(ghost[..., 0] - real[:, None, 0], ghost[..., 1] - real[:, None, 1])
+            heading_error_rad = np.angle(np.exp(1j * (ghost[..., 2] - real[:, None, 2])))
+            speed_error_mps = ghost[..., 3] - real[:, None, 3]
+            log_likelihood = -0.5 * (
+                (position_error_m / ghost_std_m) ** 2
+                + (heading_error_rad / ghost_std_heading_rad) ** 2
+                + (speed_error_mps / ghost_std_speed_mps) ** 2
+            )
+            # A ghost removed from the sim has no state to compare, so its hypothesis gets no evidence.
+            scored = state["ghost_scored"] & (ghost[..., 4] == 1.0) & (alive & (real[:, 4] == 1.0))[:, None]
+            scored &= state["next_goal"] < state["goal_total"]
+            update_belief(state["belief"], log_likelihood, scored)
+
+        def advance_ghosts(state, worker_env, valid, active_count):
+            """Restart the ghosts of agents whose hypotheses changed or whose rollout horizon elapsed, put every other
+            agent at its real state, and step each ghost by the policy's mean action toward its hypothesis."""
+            if active_count == 0:
+                return
+            restart = (state["ghost_age"] < 0) | (state["ghost_age"] >= ghost_rollout_steps)
+            if restart.any():
+                state["ghost_rows"], rebuilt = worker_env.ghost_scene_begin(goal_hypothesis_count, restart)
+                restart |= rebuilt
+                goal_lists = np.zeros((len(worker_env.ghost_observations), goal_count, 4), dtype=np.float32)
+                list_counts = np.zeros(len(worker_env.ghost_observations), dtype=np.int32)
+                for row, hypothesis in zip(*np.nonzero(valid & restart[:, None])):
+                    first, total = state["next_goal"][row, hypothesis], state["goal_total"][row, hypothesis]
+                    ghost_row = state["ghost_rows"][row, hypothesis]
+                    goal_lists[ghost_row, : total - first] = state["goals"][row, hypothesis, first:total]
+                    list_counts[ghost_row] = total - first
+                worker_env.ghost_scene_set_goals(goal_lists, list_counts)
+                state["ghost_scored"][restart] = valid[restart]
+                state["ghost_age"][restart] = 0
+            worker_env.ghost_scene_mirror_sources()
+            rows = state["ghost_rows"][state["ghost_scored"]]
+            ghost_actions = np.zeros((len(worker_env.ghost_observations), 2), dtype=np.float32)
+            if len(rows):
+                probs = hypothesis_action_probs(worker_env.ghost_observations[rows])
+                ghost_actions[rows] = uncompiled_policy.discrete_probs_to_continuous_mean(probs).cpu().numpy()
+            worker_env.ghost_scene_step(ghost_actions)
+            state["ghost_age"] += 1
+
+        def update_goal_beliefs(previous_action):
+            """Advance each active agent's belief over the ways ahead of it by the evidence of its last move.
 
             Hypotheses come from the map's route graph: goals spaced along every branch ahead, re-placed every update
             period and once a reached goal leaves no full window. Like the env, reaching a goal pays the goal reward.
+            The evidence is previous_action, the (agents, 2) actions executed last step (None before the first), scored
+            against each hypothesis' mean policy action; or each hypothesis' ghost rollout against the agent's real
+            trajectory; or the critic advantage of the move under each hypothesis.
             Returns the (agents, hypotheses, window goals, 4) goal windows, their (agents, hypotheses) goal counts and
             the (agents, hypotheses) belief.
             """
@@ -2777,6 +2892,11 @@ def _run_eval_rollout(
                     reward[rows[reached], hypotheses[reached]] = worker_env.reward_goal
                     state["next_goal"][rows[reached], hypotheses[reached]] += 1
                 state["has_xy"] = True
+                # Before any replan: the cached mean actions belong to the hypotheses the agent acted under.
+                if action_likelihood and previous_action is not None:
+                    apply_action_evidence(state, worker_env, previous_action[start : start + active_count])
+                if trajectory_likelihood:
+                    apply_trajectory_evidence(state, worker_env, active_count)
                 window_left = np.where(valid, state["goal_total"] - state["next_goal"], 0)
                 periodic = state["steps_since_update"] >= goal_update_steps
                 state["steps_since_update"] += 1
@@ -2803,6 +2923,7 @@ def _run_eval_rollout(
                         state["goal_total"][row] = new_total[out_idx]
                         state["next_goal"][row] = 0
                         state["has_value"][row] = False
+                        state["ghost_age"][row] = -1
                         state["steps_since_update"][row] = 0
                 valid = state["next_goal"] < state["goal_total"]
                 window_count = np.minimum(state["goal_total"] - state["next_goal"], goal_count).astype(np.int32)
@@ -2812,20 +2933,22 @@ def _run_eval_rollout(
                 windows[np.arange(goal_count) >= window_count[..., None]] = 0.0
                 windows = np.ascontiguousarray(windows, dtype=np.float32)
                 worker_env.goal_window_observations(windows, window_count, state["obs"])
-                value = np.zeros(valid.shape, dtype=np.float32)
-                if valid.any():
-                    _, value[valid] = infer_candidates(state["obs"][valid])
-                # Boltzmann-rational driver: a move is as likely under a route as it raised that route's return.
-                compared = valid & state["has_value"]
-                advantage = reward + args["train"]["gamma"] * value - state["value"]
-                forgetting = args["eval"]["goal_inference_forgetting"]
-                for row in np.flatnonzero(compared.any(axis=1)):
-                    row_advantage = np.where(compared[row], advantage[row], -np.inf)
-                    likelihood = np.exp(args["eval"]["goal_inference_beta"] * (row_advantage - row_advantage.max()))
-                    posterior = state["belief"][row] * likelihood
-                    posterior /= max(posterior.sum(), 1e-12)
-                    state["belief"][row] = (1.0 - forgetting) * posterior + forgetting * valid[row] / valid[row].sum()
-                state["value"], state["has_value"] = value, valid
+                if action_likelihood:
+                    if valid.any():
+                        probs = hypothesis_action_probs(state["obs"][valid])
+                        state["mean_action"][valid] = (probs @ uncompiled_policy.action_table_physical).cpu().numpy()
+                    state["has_mean_action"] = valid
+                elif trajectory_likelihood:
+                    advance_ghosts(state, worker_env, valid, active_count)
+                else:
+                    value = np.zeros(valid.shape, dtype=np.float32)
+                    if valid.any():
+                        _, value[valid] = infer_candidates(state["obs"][valid])
+                    # Boltzmann-rational driver: a move is as likely under a route as it raised that route's return.
+                    compared = valid & state["has_value"]
+                    advantage = reward + args["train"]["gamma"] * value - state["value"]
+                    update_belief(state["belief"], args["eval"]["goal_inference_beta"] * advantage, compared)
+                    state["value"], state["has_value"] = value, valid
                 state["belief"][~valid] = 0.0
                 state["belief"] /= np.maximum(state["belief"].sum(axis=1, keepdims=True), 1e-12)
                 belief_out[start : start + active_count] = state["belief"]
@@ -3001,10 +3124,11 @@ def _run_eval_rollout(
 
         episode_summaries = []
         scenario_progress = tqdm(total=expected_episodes, desc=desc, unit="scenario")
+        previous_action = None
         for _ in range(total_steps):
             predicted_xy, mppi_xy, goal_belief, joint_paths, robust_paths = None, None, None, None, None
             if goal_inference:
-                goal_windows, goal_window_count, goal_belief_values = update_goal_beliefs()
+                goal_windows, goal_window_count, goal_belief_values = update_goal_beliefs(previous_action)
                 goal_belief = (goal_windows[..., :2], goal_belief_values)
             if joint_prediction_steps:
                 joint_paths = joint_predict(goal_windows, goal_window_count, goal_belief_values)
@@ -3037,6 +3161,7 @@ def _run_eval_rollout(
                 )
 
             obs, _, terminals, truncations, infos = vecenv.step(action)
+            previous_action = action
             if recurrent_state is not None:
                 finished_agent_mask = torch.as_tensor(
                     np.logical_or(terminals, truncations),

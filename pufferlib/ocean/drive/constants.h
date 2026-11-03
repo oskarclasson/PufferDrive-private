@@ -126,6 +126,9 @@
 
 #define MAX_BACKWARD_SPEED -2.0f
 #define STEERING_LIMIT 0.667f
+#define JERK_MODEL_STEERING_LIMIT_RAD 0.55f
+#define AGENT_KINEMATICS_FIELD_COUNT 5 // x, y, heading, signed speed, valid
+#define CURVATURE_MIN_SPEED_MPS 1.0f
 static const float REAR_AXLE_RATIO = 0.5f;
 static const float ACCEL_LONG_LIMIT[2] = {-5.0f, 2.5f};
 static const float ACCEL_LAT_LIMIT[2] = {-4.0f, 4.0f};
