@@ -64,17 +64,19 @@ DEFAULT_ROLLOUT_HORIZON_S = 0.0
 ACTOR_PREDICTION_CONSTANT_VELOCITY = "constant-velocity"
 ACTOR_PREDICTION_JOINT = "joint"
 ACTOR_PREDICTION_ROBUST = "robust"
+STATIC_ROLLOUT_ACTORS_STANDING = "standing"
+STATIC_ROLLOUT_ACTORS_NONE = "none"
 # The eval's robust_prediction_* defaults in puffer_drive.yaml.
 DEFAULT_ROBUST_PREDICTION_MIN_BELIEF = 0.1
 DEFAULT_ROBUST_PREDICTION_MAX_ROUTES = 3
 DEFAULT_JOINT_PREDICTION_ACTORS = 8
 DEFAULT_MIN_MOVING_SPEED_MPS = 0.5
+DEFAULT_ACTOR_SIZE_MARGIN_M = 0.0
+DEFAULT_STATIC_ROLLOUT_ANCHOR_OFFSET_M = 2.0
+STATIC_ROLLOUT_ANCHOR_MAX_HEADING_RAD = math.radians(90.0)
+STATIC_ROLLOUT_ANCHOR_MOVING_SPEED_MPS = 0.1  # the speed AD splits the rollout at where the policy changes direction
 MIN_REWARD_REVERSE = 2.5e-4  # REWARD_BOUNDS[REWARD_COEF_REVERSE] in drive.h, the range the policy trains with
 MAX_REWARD_REVERSE = 7.5e-3
-MIN_REWARD_COMFORT = 0.0  # REWARD_BOUNDS[REWARD_COEF_COMFORT] in drive.h
-MAX_REWARD_COMFORT = 0.1
-MIN_JERK_SCALE = 0.8  # REWARD_BOUNDS[REWARD_COEF_THROTTLE] and [REWARD_COEF_STEER] in drive.h
-MAX_JERK_SCALE = 1.25
 # The eval's goal_inference_* defaults in puffer_drive.yaml.
 DEFAULT_GOAL_INFERENCE_HYPOTHESES = 8
 DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M = 10.0
@@ -158,6 +160,10 @@ class PolicySession:
         self.robust_max_routes = int(args.robust_prediction_max_routes)
         self.actor_slot_count = int(args.joint_prediction_actors) if joint else 0
         self.min_moving_speed_mps = float(args.min_moving_speed_mps)
+        self.actor_size_margin_m = float(args.actor_size_margin_m)
+        self.static_rollout_anchor_offset_m = float(args.static_rollout_anchor_offset_m)
+        self.static_rollout_keeps_standing = args.static_rollout_actors == STATIC_ROLLOUT_ACTORS_STANDING
+        self.previous_static_rollout = None
         self.static_slot_start = 1 + self.actor_slot_count
         if args.drawn_map:
             bin_path = Path(args.drawn_map)
@@ -188,9 +194,6 @@ class PolicySession:
             "offroad_behavior": "ignore",
             "traffic_light_behavior": "ignore",
             "reward_reverse": float(args.reward_reverse),
-            "reward_comfort": float(args.reward_comfort),
-            "conditioning_throttle_scale": float(args.throttle_jerk_scale),
-            "conditioning_steer_scale": float(args.steer_jerk_scale),
         }
         if request.get("dt"):
             overrides["dt"] = float(request["dt"])
@@ -502,20 +505,107 @@ class PolicySession:
             self.env.predict_end()
         return points
 
+    def _static_rollout_anchor(self):
+        """The pose [map frame], signed speed [m/s], acceleration [m/s^2] and curvature [1/m] of the previous static
+        rollout where the ego is along it, or None to roll out from the ego itself: without one, with the ego off it by
+        more than --static-rollout-anchor-offset-m or STATIC_ROLLOUT_ANCHOR_MAX_HEADING_RAD, outside its first part in
+        one direction, or moving against it."""
+        if self.previous_static_rollout is None or self.static_rollout_anchor_offset_m == 0:
+            return None
+        points = self.previous_static_rollout
+        speeds = np.array([point["speed_mps"] for point in points])
+        moving = np.flatnonzero(np.abs(speeds) > STATIC_ROLLOUT_ANCHOR_MOVING_SPEED_MPS)
+        if len(moving) == 0:
+            return None
+        direction = math.copysign(1.0, speeds[moving[0]])
+        against = np.flatnonzero(speeds * direction < -STATIC_ROLLOUT_ANCHOR_MOVING_SPEED_MPS)
+        part = points[: against[0]] if len(against) else points
+        ego_speed_mps = self._ego_motion()[0]
+        if len(part) < 2 or ego_speed_mps * direction < -STATIC_ROLLOUT_ANCHOR_MOVING_SPEED_MPS:
+            return None
+        state = self.env.get_global_agent_state()
+        ego_x, ego_y = self.map.from_bin(float(state["x"][EGO_SLOT]), float(state["y"][EGO_SLOT]))
+        ego_heading = float(self.map.heading_from_bin(float(state["heading"][EGO_SLOT])))
+        xy = np.array([[point["x"], point["y"]] for point in part])
+        starts, segments = xy[:-1], np.diff(xy, axis=0)
+        segment_lengths_sq = np.einsum("ij,ij->i", segments, segments)
+        valid = segment_lengths_sq > 0
+        if not valid.any():
+            return None
+        along = np.einsum("ij,ij->i", np.array([ego_x, ego_y]) - starts, segments) / np.where(
+            valid, segment_lengths_sq, 1
+        )
+        clamped = np.clip(along, 0.0, 1.0)
+        nearest = starts + clamped[:, None] * segments
+        offsets_m = np.where(valid, np.hypot(*(nearest - [ego_x, ego_y]).T), np.inf)
+        segment_idx = int(np.argmin(offsets_m))
+        fraction = float(clamped[segment_idx])
+        outside = (segment_idx == 0 and along[0] < 0) or (segment_idx == len(segments) - 1 and along[-1] > 1)
+        if outside or offsets_m[segment_idx] > self.static_rollout_anchor_offset_m:
+            return None
+        before, after = part[segment_idx], part[segment_idx + 1]
+        heading_step = math.remainder(after["heading"] - before["heading"], 2 * math.pi)
+        heading = before["heading"] + fraction * heading_step
+        if abs(math.remainder(heading - ego_heading, 2 * math.pi)) > STATIC_ROLLOUT_ANCHOR_MAX_HEADING_RAD:
+            return None
+
+        def interpolated(key):
+            return before[key] + fraction * (after[key] - before[key])
+
+        x, y = nearest[segment_idx]
+        return (
+            float(x),
+            float(y),
+            heading,
+            interpolated("speed_mps"),
+            interpolated("accel_long_mps2"),
+            interpolated("curvature_inv_m"),
+        )
+
+    def _anchor_ego(self, anchor):
+        """Move the ego onto the anchor pose, at the anchor speed and acceleration, steered to the anchor curvature."""
+        x, y, heading, speed_mps, accel_mps2, curvature_inv_m = anchor
+        state = self.env.get_global_agent_state()
+        bx, by = self.map.to_bin(x, y)
+        vx, vy = self.map.velocity_to_bin(speed_mps * math.cos(heading), speed_mps * math.sin(heading))
+        steering_angle = math.atan(curvature_inv_m * WHEELBASE_LENGTH_RATIO * self.ego_length_m)
+        self.env.set_agent_states(
+            np.array([EGO_SLOT], np.int32),
+            np.array([bx], np.float32),
+            np.array([by], np.float32),
+            np.array([float(state["z"][EGO_SLOT])], np.float32),
+            np.array([self.map.heading_to_bin(heading)], np.float32),
+            np.array([vx], np.float32),
+            np.array([vy], np.float32),
+            np.array([speed_mps * curvature_inv_m], np.float32),
+            np.array([accel_mps2], np.float32),
+            np.array([self.ego_stopped_s], np.float32),
+            np.array([steering_angle], np.float32),
+        )
+
     def _static_rollout(self):
         """The ego poses of the policy rolled ahead from now among the actors standing still, those slower than
-        --min-moving-speed-mps, the moving ones taken out of the scene."""
-        moving_slots = [] if self.predicted is None else list(self.predicted["idx"])
+        --min-moving-speed-mps, the moving ones taken out of the scene, or with --static-rollout-actors none among no
+        actors at all. It starts where the ego is along the previous static rollout, in the state that one has there, its
+        steering included, as _static_rollout_anchor finds it, so that neither the path nor its speed drifts with the
+        ego."""
+        removed_slots = [] if self.predicted is None else list(self.predicted["idx"])
         if self.partners is not None:
-            moving_slots += list(self.partners["idx"][self.partners["moving"]])
-        points = [self._rollout_point(0.0)]
+            removed = self.partners["moving"] if self.static_rollout_keeps_standing else slice(None)
+            removed_slots += list(self.partners["idx"][removed])
+        anchor = self._static_rollout_anchor()
         self.env.predict_begin()
         try:
-            if moving_slots:
-                far = np.full(len(moving_slots), FAR_AWAY, np.float32)
+            if anchor is not None:
+                self._anchor_ego(anchor)
+            if removed_slots:
+                far = np.full(len(removed_slots), FAR_AWAY, np.float32)
                 zero = np.zeros_like(far)
-                self.env.set_agent_states(np.array(moving_slots, np.int32), far, far, far, zero, zero, zero, zero, zero)
+                self.env.set_agent_states(
+                    np.array(removed_slots, np.int32), far, far, far, zero, zero, zero, zero, zero
+                )
             observations = self.env.recompute_observations()
+            points = [self._rollout_point(0.0, ego_obs=observations[EGO_SLOT])]
             for step_idx in range(self.rollout_steps):
                 # every policy agent but the ego is parked out of range, so only the ego is inferred
                 ego_action = self._infer(observations[EGO_SLOT : EGO_SLOT + 1])[1]
@@ -525,6 +615,7 @@ class PolicySession:
                 points.append(self._rollout_point((step_idx + 1) * self.dt))
         finally:
             self.env.predict_end()
+        self.previous_static_rollout = points
         return points
 
     def _joint_rollout(self):
@@ -646,9 +737,16 @@ class PolicySession:
         ex, ey = self.map.to_bin(float(ego["x"]), float(ego["y"]))
         self._update_stopped_times(ego, request["actors"])
         self._set_ego(ego, ex, ey, accel_long=float(ego["accel_long"]))
-        actors = sorted(
-            request["actors"], key=lambda a: (a["x"] - float(ego["x"])) ** 2 + (a["y"] - float(ego["y"])) ** 2
-        )[: self.max_partners]
+        actors = [
+            {
+                **actor,
+                "length": float(actor["length"]) + 2 * self.actor_size_margin_m,
+                "width": float(actor["width"]) + 2 * self.actor_size_margin_m,
+            }
+            for actor in sorted(
+                request["actors"], key=lambda a: (a["x"] - float(ego["x"])) ** 2 + (a["y"] - float(ego["y"])) ** 2
+            )[: self.max_partners]
+        ]
         predicted_ids = set() if self.goal_inference is None else self._advance_goal_inference(actors)
         self._set_partners(actors, predicted_ids)
         self._set_lights(request["traffic_light_states"])
@@ -863,32 +961,30 @@ def main():
         help="estimated speed from which an actor moves in the rollout, and a tracked one can be driven by the policy",
     )
     parser.add_argument(
+        "--actor-size-margin-m",
+        type=float,
+        default=DEFAULT_ACTOR_SIZE_MARGIN_M,
+        help="margin every actor's box is grown by on each side before the policy sees it",
+    )
+    parser.add_argument(
+        "--static-rollout-actors",
+        choices=[STATIC_ROLLOUT_ACTORS_STANDING, STATIC_ROLLOUT_ACTORS_NONE],
+        default=STATIC_ROLLOUT_ACTORS_NONE,
+        help="the actors the static rollout keeps: those standing still, or none, so that it drives the map alone",
+    )
+    parser.add_argument(
+        "--static-rollout-anchor-offset-m",
+        type=float,
+        default=DEFAULT_STATIC_ROLLOUT_ANCHOR_OFFSET_M,
+        help="the farthest the ego may be off the previous static rollout for the next to start on it, where the ego is "
+        "along it, rather than from the ego; 0 always starts from the ego",
+    )
+    parser.add_argument(
         "--reward-reverse",
         type=float,
         default=MAX_REWARD_REVERSE,
         help="reverse penalty weight the policy is conditioned on, within the range it trains with; the default, the "
         "highest, makes it reverse least",
-    )
-    parser.add_argument(
-        "--reward-comfort",
-        type=float,
-        default=MAX_REWARD_COMFORT,
-        help="comfort penalty weight the policy is conditioned on, within the range it trains with; the default, the "
-        "highest, makes it brake and accelerate hard least",
-    )
-    parser.add_argument(
-        "--throttle-jerk-scale",
-        type=float,
-        default=MIN_JERK_SCALE,
-        help="factor on the policy's longitudinal jerk, C_throttle, within the range it trains with; the default, the "
-        "lowest, makes it smoothest",
-    )
-    parser.add_argument(
-        "--steer-jerk-scale",
-        type=float,
-        default=MIN_JERK_SCALE,
-        help="factor on the policy's lateral jerk, C_steer, within the range it trains with; the default, the lowest, "
-        "makes it smoothest",
     )
     parser.add_argument("--goal-inference-hypotheses", type=int, default=DEFAULT_GOAL_INFERENCE_HYPOTHESES)
     parser.add_argument("--goal-inference-goal-spacing-m", type=float, default=DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M)
@@ -912,14 +1008,12 @@ def main():
         parser.error("--joint-prediction-actors must be in 1..--max-partners")
     if not args.min_moving_speed_mps >= 0:
         parser.error("--min-moving-speed-mps must not be negative")
+    if not args.actor_size_margin_m >= 0:
+        parser.error("--actor-size-margin-m must not be negative")
+    if not args.static_rollout_anchor_offset_m >= 0:
+        parser.error("--static-rollout-anchor-offset-m must not be negative")
     if not MIN_REWARD_REVERSE <= args.reward_reverse <= MAX_REWARD_REVERSE:
         parser.error(f"--reward-reverse must be in [{MIN_REWARD_REVERSE}, {MAX_REWARD_REVERSE}], the trained range")
-    if not MIN_REWARD_COMFORT <= args.reward_comfort <= MAX_REWARD_COMFORT:
-        parser.error(f"--reward-comfort must be in [{MIN_REWARD_COMFORT}, {MAX_REWARD_COMFORT}], the trained range")
-    if not all(
-        MIN_JERK_SCALE <= scale <= MAX_JERK_SCALE for scale in (args.throttle_jerk_scale, args.steer_jerk_scale)
-    ):
-        parser.error(f"--throttle-jerk-scale and --steer-jerk-scale must be in [{MIN_JERK_SCALE}, {MAX_JERK_SCALE}]")
     if args.goal_inference_hypotheses < 1:
         parser.error("--goal-inference-hypotheses must be positive")
     if not (

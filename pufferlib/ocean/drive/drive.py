@@ -69,8 +69,6 @@ class Drive(pufferlib.PufferEnv):
         goal_speed=3.0,
         goal_speed_randomization=True,
         conditioning_accel_scale=1.0,
-        conditioning_throttle_scale=1.0,
-        conditioning_steer_scale=1.0,
         conditioning_speed_scale=1.5,
         goal_reach_requires_speed=False,
         scenario_length=None,
@@ -200,21 +198,6 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"conditioning_accel_scale must be within the trained C_acc range "
                 f"[{binding.CONDITIONING_ACC_MIN}, {binding.CONDITIONING_ACC_MAX}]. Got: {conditioning_accel_scale}"
-            )
-        self.conditioning_throttle_scale = float(np.float32(conditioning_throttle_scale))  # bounds are float32
-        if not (
-            binding.CONDITIONING_THROTTLE_MIN <= self.conditioning_throttle_scale <= binding.CONDITIONING_THROTTLE_MAX
-        ):
-            raise ValueError(
-                f"conditioning_throttle_scale must be within the trained C_throttle range "
-                f"[{binding.CONDITIONING_THROTTLE_MIN}, {binding.CONDITIONING_THROTTLE_MAX}]. "
-                f"Got: {conditioning_throttle_scale}"
-            )
-        self.conditioning_steer_scale = float(np.float32(conditioning_steer_scale))  # bounds are float32
-        if not (binding.CONDITIONING_STEER_MIN <= self.conditioning_steer_scale <= binding.CONDITIONING_STEER_MAX):
-            raise ValueError(
-                f"conditioning_steer_scale must be within the trained C_steer range "
-                f"[{binding.CONDITIONING_STEER_MIN}, {binding.CONDITIONING_STEER_MAX}]. Got: {conditioning_steer_scale}"
             )
         self.goal_reach_requires_speed = int(bool(goal_reach_requires_speed))
         self.reward_conditioning = reward_conditioning
@@ -633,8 +616,6 @@ class Drive(pufferlib.PufferEnv):
             "goal_speed": self.goal_speed,
             "goal_speed_randomization": self.goal_speed_randomization,
             "conditioning_accel_scale": self.conditioning_accel_scale,
-            "conditioning_throttle_scale": self.conditioning_throttle_scale,
-            "conditioning_steer_scale": self.conditioning_steer_scale,
             "conditioning_speed_scale": self.conditioning_speed_scale,
             "goal_reach_requires_speed": self.goal_reach_requires_speed,
             "scenario_length": int(self.scenario_length) if self.scenario_length is not None else None,

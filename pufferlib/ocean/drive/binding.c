@@ -2831,8 +2831,6 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_speed = (float) unpack(kwargs, "goal_speed");
     env->goal_speed_randomization = (int) unpack(kwargs, "goal_speed_randomization");
     env->conditioning_accel_scale = (float) unpack(kwargs, "conditioning_accel_scale");
-    env->conditioning_throttle_scale = (float) unpack(kwargs, "conditioning_throttle_scale");
-    env->conditioning_steer_scale = (float) unpack(kwargs, "conditioning_steer_scale");
     env->conditioning_speed_scale = (float) unpack(kwargs, "conditioning_speed_scale");
     if (!(env->conditioning_speed_scale >= 1.0f) || !isfinite(env->conditioning_speed_scale)) {
         PyErr_SetString(PyExc_ValueError, "conditioning_speed_scale must be finite and >= 1");

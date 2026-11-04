@@ -283,10 +283,8 @@ struct Drive {
     float goal_heading_max_deg;     // 0 disables the successive-waypoint heading constraint
     int goal_speed_randomization;   // 0 pins the goal-speed coef to goal_speed (paper: v_goal fixed)
     float conditioning_accel_scale; // eval C_acc: scales the positive accel cap (ACCEL_LONG_LIMIT[1]); 1.0 = paper eval
-    float conditioning_throttle_scale; // eval C_throttle: scales the longitudinal jerk; 1.0 = paper eval
-    float conditioning_steer_scale;    // eval C_steer: scales the lateral jerk; 1.0 = paper eval
-    float conditioning_speed_scale;    // training C_vel ~ X(a): speed cap = base_max_speed_mps * [1/a, a]; 1.5 = paper
-    int goal_reach_requires_speed;     // 1: final goal is consumed only below goal speed (paper semantics)
+    float conditioning_speed_scale; // training C_vel ~ X(a): speed cap = base_max_speed_mps * [1/a, a]; 1.5 = paper
+    int goal_reach_requires_speed;  // 1: final goal is consumed only below goal speed (paper semantics)
     int num_goals;
     int goal_regen_mode;
     int goal_source;
@@ -2710,8 +2708,8 @@ static void generate_reward_coefs(Drive *env, Agent *agent) {
         agent->reward_coefs[REWARD_COEF_OVERSPEED] = env->reward_overspeed;
         agent->reward_coefs[REWARD_COEF_TIMESTEP] = env->reward_timestep;
         agent->reward_coefs[REWARD_COEF_REVERSE] = env->reward_reverse;
-        agent->reward_coefs[REWARD_COEF_THROTTLE] = env->conditioning_throttle_scale;
-        agent->reward_coefs[REWARD_COEF_STEER] = env->conditioning_steer_scale;
+        agent->reward_coefs[REWARD_COEF_THROTTLE] = 1.0f;
+        agent->reward_coefs[REWARD_COEF_STEER] = 1.0f;
         agent->reward_coefs[REWARD_COEF_ACC] = env->conditioning_accel_scale;
         agent->reward_coefs[REWARD_COEF_SPEED] = env->max_speed_mps / env->base_max_speed_mps;
     }
