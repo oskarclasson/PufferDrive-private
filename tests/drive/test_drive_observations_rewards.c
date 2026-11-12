@@ -428,6 +428,50 @@ static int test_partner_obs_blindness_corridor_toggle(void) {
     return 0;
 }
 
+static int test_partner_obs_blindness_facing_away(void) {
+    // Blind ego heading +x; cars 20 m ahead driving away, oncoming, crossing, and one behind driving away
+    Drive env = {0};
+    env.obs_norm_speed_mps = 10.0f;
+    env.obs_norm_xy_offset_m = 100.0f;
+    env.obs_norm_z_m = 10.0f;
+    env.obs_norm_veh_length_m = 10.0f;
+    env.obs_norm_veh_width_m = 5.0f;
+    env.obs_range_partner_m = 100.0f;
+    env.obs_slots_partners_n = 4;
+    env.num_agents = 5;
+    env.active_agent_count = 5;
+    env.partner_blindness_facing_away = 1;
+    int active[5] = {0, 1, 2, 3, 4};
+    env.active_agent_indices = active;
+    Agent agents[5];
+    agents[0] = drive_test_agent(0.0f, 0.0f, 0.0f);
+    agents[1] = drive_test_agent(20.0f, 0.0f, 0.0f);
+    agents[2] = drive_test_agent(20.0f, 3.5f, (float) M_PI);
+    agents[3] = drive_test_agent(20.0f, -5.0f, 0.5f * (float) M_PI);
+    agents[4] = drive_test_agent(-20.0f, 0.0f, (float) M_PI);
+    PartnerScanEntry partner_scan[5];
+    for (int agent_idx = 0; agent_idx < 5; agent_idx++) {
+        update_agent_speed(&agents[agent_idx]);
+        partner_scan[agent_idx]
+            = (PartnerScanEntry) {agents[agent_idx].sim_x, agents[agent_idx].sim_y, agents[agent_idx].sim_z, agent_idx};
+    }
+    env.agents = agents;
+    float obs[4 * PARTNER_FEATURES];
+    int partner_count = 0;
+
+    agents[0].partner_blindness_counter = 2;
+    memset(obs, 0, sizeof(obs));
+    write_partner_obs(&env, &agents[0], 0, partner_scan, obs, 0, &partner_count);
+    EXPECT_EQ_INT(partner_count, 1);
+    EXPECT_NEAR(obs[0], 0.2f, 1e-6f);
+    EXPECT_NEAR(obs[1], 0.0f, 1e-6f);
+
+    agents[0].partner_blindness_counter = 0;
+    write_partner_obs(&env, &agents[0], 0, partner_scan, obs, 0, &partner_count);
+    EXPECT_EQ_INT(partner_count, 4);
+    return 0;
+}
+
 static int test_partner_blindness_episode_rate_floor(void) {
     Drive env = {0};
     env.init_seed = 7;
@@ -542,6 +586,359 @@ static int test_reward_lane_align_wrong_way(void) {
     return 0;
 }
 
+static int test_reward_reverse_fixed_penalty(void) {
+    Drive env;
+    Agent agent;
+    Log log;
+    int active[1];
+    float reward[1] = {0};
+
+    init_reward_env(&env, &agent, &log, active, reward);
+    agent.sim_speed_signed = -1.0f;
+    agent.reward_coefs[REWARD_COEF_REVERSE] = 0.01f;
+    env.reward_reverse_fixed_per_second = 0.2f;
+    compute_rewards(&env, 0);
+    EXPECT_NEAR(log.reward_reverse, -0.021f, 1e-6f);
+
+    init_reward_env(&env, &agent, &log, active, reward);
+    agent.sim_speed_signed = 1.0f;
+    env.reward_reverse_fixed_per_second = 0.2f;
+    compute_rewards(&env, 0);
+    EXPECT_NEAR(log.reward_reverse, 0.0f, 0.0f);
+    return 0;
+}
+
+static RoadMapElement straight_test_lane(float *xs, float *ys, float *cum_lengths, float length_m) {
+    RoadMapElement lane = {0};
+    lane.segment_size = 2;
+    lane.x = xs;
+    lane.y = ys;
+    lane.cum_lengths = cum_lengths;
+    lane.length = length_m;
+    return lane;
+}
+
+static int test_induced_braking_crossing_ego(void) {
+    // Yielder routes east along y=0 at 10 m/s; ego routes north along x=15 and is 6 m short of the crossing at 5 m/s
+    Drive env;
+    Agent agents[2];
+    Log logs[2];
+    int active[2] = {0, 1};
+    float reward[2] = {0};
+    float path_xy[2 * ROUTE_PATH_MAX_POINTS * 2];
+    int path_point_count[2];
+    float junction_turn_rad[2];
+    float junction_approach_heading[2];
+    float east_x[2] = {-50.0f, 100.0f}, east_y[2] = {0.0f, 0.0f};
+    float north_x[2] = {15.0f, 15.0f}, north_y[2] = {-50.0f, 100.0f};
+    float cum_lengths[2] = {0.0f, 150.0f};
+    RoadMapElement lanes[2] = {
+        straight_test_lane(north_x, north_y, cum_lengths, 150.0f),
+        straight_test_lane(east_x, east_y, cum_lengths, 150.0f),
+    };
+    int ego_route[1] = {0}, yielder_route[1] = {1};
+
+    init_reward_env(&env, &agents[0], &logs[0], active, reward);
+    memset(&logs[1], 0, sizeof(logs[1]));
+    env.agents = agents;
+    env.active_agent_count = 2;
+    env.road_elements = lanes;
+    env.route_path_xy = path_xy;
+    env.route_path_point_count = path_point_count;
+    env.route_junction_turn_rad = junction_turn_rad;
+    env.route_junction_approach_heading = junction_approach_heading;
+    env.reward_induced_braking = 0.5f;
+    env.induced_braking_must_yield_scale = 3.0f;
+    env.induced_braking_has_priority_scale = 0.0f;
+    env.induced_braking_min_heading_cos = cosf(50.0f * (float) M_PI / 180.0f);
+    env.induced_braking_threshold_mps2 = 1.0f;
+    env.induced_braking_sample_count = 12;
+    agents[0] = drive_test_agent(15.0f, -6.0f, (float) M_PI / 2.0f);
+    agents[0].sim_speed = 5.0f;
+    agents[0].route = ego_route;
+    agents[0].route_length = 1;
+    agents[1] = drive_test_agent(0.0f, 0.0f, 0.0f);
+    agents[1].sim_speed = 10.0f;
+    agents[1].route = yielder_route;
+    agents[1].route_length = 1;
+    predict_route_path(&env, 0);
+    predict_route_path(&env, 1);
+    predict_route_junction(&env, 0);
+    predict_route_junction(&env, 1);
+    EXPECT_EQ_INT(path_point_count[1], ROUTE_PATH_MAX_POINTS);
+    EXPECT_EQ_INT(right_of_way(&env, 0, 1), RIGHT_OF_WAY_EQUAL);
+
+    // worst sample is t = 1.75 s: 17.5 m of travel against 10 m of free road
+    float must_yield_excess_mps2;
+    EXPECT_NEAR(required_yield_decel_mps2(&env, 0, agents[0].sim_speed, 1, agents[1].sim_speed), 15.0f / 3.0625f, 1e-3f);
+    EXPECT_NEAR(compute_induced_braking_excess_mps2(&env, 0, &must_yield_excess_mps2), 15.0f / 3.0625f - 1.0f, 1e-3f);
+    EXPECT_NEAR(must_yield_excess_mps2, 0.0f, 0.0f);
+    compute_rewards(&env, 0);
+    EXPECT_NEAR(logs[0].reward_induced_braking, -0.5f * (15.0f / 3.0625f - 1.0f) * 0.1f, 1e-4f);
+    EXPECT_NEAR(logs[0].induced_braking_seconds, 0.1f, 1e-6f);
+
+    // a turning ego must yield to the straight car: scaled up; with the roles swapped ego has priority: free
+    junction_turn_rad[0] = (float) M_PI / 2.0f;
+    EXPECT_NEAR(
+        compute_induced_braking_excess_mps2(&env, 0, &must_yield_excess_mps2), 3.0f * (15.0f / 3.0625f - 1.0f), 1e-3f);
+    EXPECT_NEAR(must_yield_excess_mps2, 15.0f / 3.0625f - 1.0f, 1e-3f);
+    junction_turn_rad[0] = 0.0f;
+    junction_turn_rad[1] = -(float) M_PI / 2.0f;
+    EXPECT_NEAR(compute_induced_braking_excess_mps2(&env, 0, &must_yield_excess_mps2), 0.0f, 0.0f);
+    junction_turn_rad[1] = 0.0f;
+
+    // yielder 3 m short of the crossing has its nose through it when ego arrives: ego cuts behind it
+    agents[1].sim_x = 12.0f;
+    predict_route_path(&env, 1);
+    EXPECT_NEAR(required_yield_decel_mps2(&env, 0, agents[0].sim_speed, 1, agents[1].sim_speed), 0.0f, 0.0f);
+    agents[1].sim_x = 0.0f;
+    predict_route_path(&env, 1);
+
+    // ego reaches the crossing after the horizon
+    agents[0].sim_y = -30.0f;
+    predict_route_path(&env, 0);
+    EXPECT_NEAR(required_yield_decel_mps2(&env, 0, agents[0].sim_speed, 1, agents[1].sim_speed), 0.0f, 0.0f);
+
+    // oncoming car in the opposite lane 3.5 m over never shares the path
+    float west_x[2] = {100.0f, -50.0f}, west_y[2] = {3.5f, 3.5f};
+    lanes[0] = straight_test_lane(west_x, west_y, cum_lengths, 150.0f);
+    agents[0] = drive_test_agent(40.0f, 3.5f, (float) M_PI);
+    agents[0].sim_speed = 10.0f;
+    agents[0].route = ego_route;
+    agents[0].route_length = 1;
+    predict_route_path(&env, 0);
+    EXPECT_NEAR(compute_induced_braking_excess_mps2(&env, 0, &must_yield_excess_mps2), 0.0f, 0.0f);
+    return 0;
+}
+
+static int test_hesitation_only_when_clear(void) {
+    // Ego drives east at 2 m/s on a straight 10 m/s lane; a second car and a red light take turns blocking it
+    Drive env;
+    Agent agents[2];
+    Log logs[2];
+    int active[2] = {0, 1};
+    float reward[2] = {0};
+    float path_xy[2 * ROUTE_PATH_MAX_POINTS * 2];
+    int path_point_count[2];
+    float lane_speed_limit_mps[2] = {10.0f, 10.0f};
+    float east_x[2] = {-50.0f, 150.0f}, east_y[2] = {0.0f, 0.0f};
+    float east_cum_lengths[2] = {0.0f, 200.0f};
+    float north_x[2] = {500.0f, 500.0f}, north_y[2] = {-100.0f, 100.0f};
+    RoadMapElement lanes[2] = {
+        straight_test_lane(east_x, east_y, east_cum_lengths, 200.0f),
+        straight_test_lane(north_x, north_y, east_cum_lengths, 200.0f),
+    };
+    int ego_route[1] = {0}, other_route[1] = {1};
+    int light_states[1] = {TRAFFIC_CONTROL_STATE_RED};
+    TrafficControlElement light = {0};
+    light.type = TRAFFIC_CONTROL_TYPE_TRAFFIC_LIGHT;
+    light.state_size = 1;
+    light.states = light_states;
+    float light_line[6] = {25.0f, -2.0f, 0.0f, 25.0f, 2.0f, 0.0f};
+    memcpy(light.stop_line, light_line, sizeof(light_line));
+
+    init_reward_env(&env, &agents[0], &logs[0], active, reward);
+    memset(&logs[1], 0, sizeof(logs[1]));
+    env.agents = agents;
+    env.active_agent_count = 2;
+    env.road_elements = lanes;
+    env.lane_speed_limit_mps = lane_speed_limit_mps;
+    env.route_path_xy = path_xy;
+    env.route_path_point_count = path_point_count;
+    env.base_max_speed_mps = 20.0f;
+    env.reward_hesitation = 0.4f;
+    env.induced_braking_min_heading_cos = cosf(50.0f * (float) M_PI / 180.0f);
+    env.induced_braking_threshold_mps2 = 1.0f;
+    env.induced_braking_sample_count = 12;
+    env.traffic_lights_enabled = 1;
+    agents[0] = drive_test_agent(0.0f, 0.0f, 0.0f);
+    agents[0].sim_speed = 2.0f;
+    agents[0].sim_speed_signed = 2.0f;
+    agents[0].current_lane_idx = 0;
+    agents[0].reward_coefs[REWARD_COEF_SPEED] = 1.0f;
+    agents[0].route = ego_route;
+    agents[0].route_length = 1;
+    agents[1] = drive_test_agent(500.0f, 0.0f, (float) M_PI / 2.0f);
+    agents[1].route = other_route;
+    agents[1].route_length = 1;
+    predict_route_path(&env, 0);
+    predict_route_path(&env, 1);
+
+    EXPECT_NEAR(compute_clear_target_speed_mps(&env, 0), 10.0f, 1e-4f);
+    compute_rewards(&env, 0);
+    EXPECT_NEAR(logs[0].reward_hesitation, -0.4f * (1.0f - 2.0f / 4.0f) * 0.1f, 1e-6f);
+    EXPECT_NEAR(logs[0].hesitation_seconds, 0.1f, 1e-6f);
+
+    // a stopped car 20 m ahead on ego's lane: ego at 10 m/s would have to brake for it
+    agents[1] = drive_test_agent(20.0f, 0.0f, 0.0f);
+    agents[1].route = ego_route;
+    agents[1].route_length = 1;
+    predict_route_path(&env, 1);
+    EXPECT_EQ_INT(is_way_clear(&env, 0, 10.0f), 0);
+    agents[1].sim_x = 200.0f;
+    predict_route_path(&env, 1);
+    EXPECT_EQ_INT(is_way_clear(&env, 0, 10.0f), 1);
+
+    // red light 25 m ahead is within 3 s plus stopping distance at 10 m/s; green is not a block
+    env.num_traffic_elements = 1;
+    env.traffic_elements = &light;
+    EXPECT_EQ_INT(is_way_clear(&env, 0, 10.0f), 0);
+    light_states[0] = TRAFFIC_CONTROL_STATE_GREEN;
+    EXPECT_EQ_INT(is_way_clear(&env, 0, 10.0f), 1);
+    env.num_traffic_elements = 0;
+
+    // a 12 m radius curve ahead caps the target at the comfortable cornering speed sqrt(3 * 12)
+    float arc_x[41], arc_y[41], arc_cum_lengths[41];
+    for (int point_idx = 0; point_idx <= 40; point_idx++) {
+        float angle_rad = 0.5f * (float) M_PI * point_idx / 40.0f;
+        arc_x[point_idx] = 12.0f * sinf(angle_rad);
+        arc_y[point_idx] = 12.0f - 12.0f * cosf(angle_rad);
+        arc_cum_lengths[point_idx] = 12.0f * angle_rad;
+    }
+    lanes[0].segment_size = 41;
+    lanes[0].x = arc_x;
+    lanes[0].y = arc_y;
+    lanes[0].cum_lengths = arc_cum_lengths;
+    lanes[0].length = 6.0f * (float) M_PI;
+    predict_route_path(&env, 0);
+    EXPECT_NEAR(compute_clear_target_speed_mps(&env, 0), 6.0f, 0.1f);
+    return 0;
+}
+
+static int test_right_of_way_at_junction(void) {
+    // Ego approaches east and turns left on a connector; the oncoming car approaches west 3.5 m to ego's left
+    Drive env;
+    Agent agents[2];
+    Log logs[2];
+    int active[2] = {0, 1};
+    float reward[2] = {0};
+    float junction_turn_rad[2];
+    float junction_approach_heading[2];
+    float approach_x[2] = {-50.0f, 0.0f}, approach_y[2] = {0.0f, 0.0f};
+    float connector_x[3] = {0.0f, 10.0f, 10.0f}, connector_y[3] = {0.0f, 0.0f, 10.0f};
+    float connector_headings[3] = {0.0f, (float) M_PI / 2.0f, (float) M_PI / 2.0f};
+    float approach_cum_lengths[2] = {0.0f, 50.0f}, connector_cum_lengths[3] = {0.0f, 10.0f, 20.0f};
+    int approach_exits[2] = {1, 1};
+    int connector_entries[1] = {0};
+    RoadMapElement lanes[2] = {
+        straight_test_lane(approach_x, approach_y, approach_cum_lengths, 50.0f),
+        straight_test_lane(connector_x, connector_y, connector_cum_lengths, 20.0f),
+    };
+    lanes[0].num_exits = 2;
+    lanes[0].exit_lanes = approach_exits;
+    lanes[1].segment_size = 3;
+    lanes[1].headings = connector_headings;
+    lanes[1].num_entries = 1;
+    lanes[1].entry_lanes = connector_entries;
+    int ego_route[2] = {0, 1};
+
+    init_reward_env(&env, &agents[0], &logs[0], active, reward);
+    memset(&logs[1], 0, sizeof(logs[1]));
+    env.agents = agents;
+    env.active_agent_count = 2;
+    env.road_elements = lanes;
+    env.route_junction_turn_rad = junction_turn_rad;
+    env.route_junction_approach_heading = junction_approach_heading;
+    env.induced_braking_min_heading_cos = cosf(50.0f * (float) M_PI / 180.0f);
+    env.reward_collision_must_yield = 1.5f;
+    agents[0] = drive_test_agent(-5.0f, 0.0f, 0.0f);
+    agents[0].route = ego_route;
+    agents[0].route_length = 2;
+    agents[1] = drive_test_agent(30.0f, 3.5f, (float) M_PI);
+    predict_route_junction(&env, 0);
+    predict_route_junction(&env, 1);
+    EXPECT_NEAR(junction_turn_rad[0], (float) M_PI / 2.0f, 1e-5f);
+    EXPECT_NEAR(junction_approach_heading[0], 0.0f, 0.0f);
+    EXPECT_NEAR(junction_turn_rad[1], 0.0f, 0.0f);
+
+    EXPECT_EQ_INT(right_of_way(&env, 0, 1), RIGHT_OF_WAY_EGO_YIELDS);
+    EXPECT_EQ_INT(right_of_way(&env, 1, 0), RIGHT_OF_WAY_EGO_PRIORITY);
+
+    // oncoming right-turner merges into ego's exit: the left-turner turns across it and still yields
+    junction_turn_rad[1] = -(float) M_PI / 2.0f;
+    EXPECT_EQ_INT(right_of_way(&env, 0, 1), RIGHT_OF_WAY_EGO_YIELDS);
+    EXPECT_EQ_INT(right_of_way(&env, 1, 0), RIGHT_OF_WAY_EGO_PRIORITY);
+
+    // two oncoming left-turners, or two straight cars, have no rule between them
+    junction_turn_rad[1] = (float) M_PI / 2.0f;
+    EXPECT_EQ_INT(right_of_way(&env, 0, 1), RIGHT_OF_WAY_EQUAL);
+    junction_turn_rad[0] = 0.0f;
+    junction_turn_rad[1] = 0.0f;
+    EXPECT_EQ_INT(right_of_way(&env, 0, 1), RIGHT_OF_WAY_EQUAL);
+
+    // moving left-turner hits the oncoming car mid-turn: extra penalty; the oncoming car pays none
+    predict_route_junction(&env, 0);
+    agents[0].sim_heading = (float) M_PI / 4.0f;
+    agents[0].cos_heading = cosf(agents[0].sim_heading);
+    agents[0].sin_heading = sinf(agents[0].sim_heading);
+    agents[0].sim_speed = 4.0f;
+    agents[0].first_collision_partner_idx = 1;
+    agents[0].metrics_array[COLLISION_IDX] = 1.0f;
+    compute_rewards(&env, 0);
+    EXPECT_NEAR(logs[0].reward_collision_must_yield, -1.5f, 1e-6f);
+    EXPECT_NEAR(logs[0].must_yield_collision_rate, 1.0f, 0.0f);
+    agents[1].sim_speed = 4.0f;
+    agents[1].first_collision_partner_idx = 0;
+    EXPECT_EQ_INT(is_must_yield_collision(&env, 1), 0);
+    agents[0].sim_speed = 0.0f;
+    EXPECT_EQ_INT(is_must_yield_collision(&env, 0), 0);
+    return 0;
+}
+
+static int test_off_route_fires_once_per_departure(void) {
+    // Route = one straight 100 m lane along +x; off route beyond 5 m for 3 steps
+    Drive env;
+    Agent agent;
+    Log log;
+    int active[1];
+    float reward[1] = {0};
+    float lane_x[2] = {0.0f, 100.0f};
+    float lane_y[2] = {0.0f, 0.0f};
+    float lane_cum_lengths[2] = {0.0f, 100.0f};
+    RoadMapElement lane = {0};
+    lane.segment_size = 2;
+    lane.x = lane_x;
+    lane.y = lane_y;
+    lane.cum_lengths = lane_cum_lengths;
+    lane.length = 100.0f;
+    int route[1] = {0};
+
+    init_reward_env(&env, &agent, &log, active, reward);
+    env.road_elements = &lane;
+    env.goal_source = GOAL_SOURCE_ROUTE;
+    env.reward_off_route = 1.0f;
+    env.off_route_distance_m = 5.0f;
+    env.off_route_steps = 3;
+    agent.route = route;
+    agent.route_length = 1;
+    agent.sim_x = 50.0f;
+
+    agent.sim_y = 3.0f;
+    update_off_route(&env, &agent);
+    EXPECT_EQ_INT(agent.off_route_step_count, 0);
+    agent.sim_y = 8.0f;
+    for (int step = 0; step < 5; step++) {
+        agent.off_route_triggered = 0;
+        update_off_route(&env, &agent);
+        EXPECT_EQ_INT(agent.off_route_triggered, step == 2);
+        if (agent.off_route_triggered) {
+            compute_rewards(&env, 0);
+        }
+    }
+    EXPECT_NEAR(log.reward_off_route, -1.0f, 1e-6f);
+    EXPECT_NEAR(log.off_route_count, 1.0f, 0.0f);
+
+    agent.sim_y = 1.0f;
+    update_off_route(&env, &agent);
+    EXPECT_EQ_INT(agent.off_route_step_count, 0);
+    agent.sim_y = -9.0f;
+    for (int step = 0; step < 3; step++) {
+        update_off_route(&env, &agent);
+    }
+    EXPECT_EQ_INT(agent.off_route_triggered, 1);
+    return 0;
+}
+
 static int test_lane_goal_distance_obs_unreachable_reads_far(void) {
     const float norm_m = LANE_GRAPH_DISTANCE_NORM_M;
     float dest[2];
@@ -606,9 +1003,15 @@ int main(void) {
     RUN_TEST(test_partner_obs_relative_velocity);
     RUN_TEST(test_partner_obs_split_long_partner);
     RUN_TEST(test_partner_obs_blindness_corridor_toggle);
+    RUN_TEST(test_partner_obs_blindness_facing_away);
     RUN_TEST(test_partner_blindness_episode_rate_floor);
     RUN_TEST(test_partner_blindness_time_fraction_scales_trigger_prob);
     RUN_TEST(test_partner_blindness_full_time_fraction_blinds_every_frame);
     RUN_TEST(test_reward_lane_align_wrong_way);
+    RUN_TEST(test_reward_reverse_fixed_penalty);
+    RUN_TEST(test_off_route_fires_once_per_departure);
+    RUN_TEST(test_induced_braking_crossing_ego);
+    RUN_TEST(test_right_of_way_at_junction);
+    RUN_TEST(test_hesitation_only_when_clear);
     return test_summary(failures);
 }

@@ -239,7 +239,8 @@ setup(
     packages=["pufferlib"]
     + ["pufferlib." + pkg for pkg in find_namespace_packages(where="pufferlib")]
     + c_extension_paths
-    + ["pufferlib/extensions"],
+    + ["pufferlib/extensions"]
+    + ["data_utils"],
     include_package_data=True,
     install_requires=install_requires,
     ext_modules=c_extensions + torch_extensions,

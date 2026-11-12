@@ -324,6 +324,18 @@ class DriveEnvConfig:
     reward_center_bias: float = _constrained_field(FINITE_NUMBER_CONSTRAINT)
     reward_velocity: float = _constrained_field(FINITE_NUMBER_CONSTRAINT)
     reward_reverse: float = _constrained_field(FINITE_NUMBER_CONSTRAINT)
+    reward_reverse_fixed_per_second: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    reward_off_route: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    off_route_distance_m: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    off_route_seconds: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    reward_induced_braking: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    induced_braking_min_heading_deg: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    induced_braking_threshold_mps2: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    induced_braking_horizon_seconds: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
+    induced_braking_must_yield_scale: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    induced_braking_has_priority_scale: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    reward_collision_must_yield: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
+    reward_hesitation: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
     reward_timestep: float = _constrained_field(FINITE_NUMBER_CONSTRAINT)
     reward_overspeed: float = _constrained_field(FINITE_NUMBER_CONSTRAINT)
     overspeed_tolerance_mps: float = _constrained_field(NONNEGATIVE_NUMBER_CONSTRAINT)
@@ -364,6 +376,8 @@ class DriveEnvConfig:
     partner_blindness_trigger_prob: float = _constrained_field(PROBABILITY_CONSTRAINT)
     partner_blindness_duration_seconds: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
     partner_blindness_corridor: bool = MISSING
+    partner_blindness_facing_away: bool = MISSING
+    partner_blindness_ghosting: bool = MISSING
     partner_blindness_time_fraction_max: float = _constrained_field(PROBABILITY_CONSTRAINT)
     phantom_braking_prob: float = _constrained_field(PROBABILITY_CONSTRAINT)
     phantom_braking_trigger_prob: float = _constrained_field(PROBABILITY_CONSTRAINT)
@@ -662,6 +676,8 @@ def _validate_cross_field_constraints(config, context):
         _raise_config_error(context, "env.min_goal_spacing", "must not exceed env.max_goal_spacing")
     if env["partner_blindness_prob_min"] > env["partner_blindness_prob"]:
         _raise_config_error(context, "env.partner_blindness_prob_min", "must not exceed env.partner_blindness_prob")
+    if env["partner_blindness_corridor"] and env["partner_blindness_facing_away"]:
+        _raise_config_error(context, "env.partner_blindness_facing_away", "is exclusive with env.partner_blindness_corridor")
     if env["preload_map_cache"] and not env["use_map_cache"]:
         _raise_config_error(context, "env.preload_map_cache", "requires env.use_map_cache to be true")
 

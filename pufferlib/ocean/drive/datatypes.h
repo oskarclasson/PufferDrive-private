@@ -120,6 +120,9 @@ struct Agent {
     float gt_goal_x;               // Last valid ground-truth goal position x
     float gt_goal_y;               // Last valid ground-truth goal position y
     float gt_goal_z;               // Last valid ground-truth goal position z
+    int off_route_cursor_idx;          // route slot nearest the agent, searched in a window around it
+    int off_route_step_count;          // consecutive steps farther than off_route_distance_m from the route
+    unsigned char off_route_triggered; // penalty fires this step
 
     int stopped;                     // 0/1 -> freeze if set
     int removed;                     // 0/1 -> remove from sim if set

@@ -2742,6 +2742,11 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->reward_center_bias = (float) unpack(kwargs, "reward_center_bias");
     env->reward_velocity = (float) unpack(kwargs, "reward_velocity");
     env->reward_reverse = (float) unpack(kwargs, "reward_reverse");
+    env->reward_reverse_fixed_per_second = (float) unpack(kwargs, "reward_reverse_fixed_per_second");
+    if (!(env->reward_reverse_fixed_per_second >= 0.0f) || !isfinite(env->reward_reverse_fixed_per_second)) {
+        PyErr_SetString(PyExc_ValueError, "reward_reverse_fixed_per_second must be finite and >= 0");
+        return -1;
+    }
     env->reward_stop_line = (float) unpack(kwargs, "reward_stop_line");
     env->reward_timestep = (float) unpack(kwargs, "reward_timestep");
     env->reward_overspeed = (float) unpack(kwargs, "reward_overspeed");
@@ -2800,6 +2805,71 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->obs_boundary_stride = (int) unpack(kwargs, "obs_boundary_stride");
     env->obs_stride_merge_segments = (int) unpack(kwargs, "obs_stride_merge_segments");
     env->dt = (float) unpack(kwargs, "dt");
+    env->reward_off_route = (float) unpack(kwargs, "reward_off_route");
+    if (!(env->reward_off_route >= 0.0f) || !isfinite(env->reward_off_route)) {
+        PyErr_SetString(PyExc_ValueError, "reward_off_route must be finite and >= 0");
+        return -1;
+    }
+    if (env->reward_off_route > 0.0f && env->goal_source != GOAL_SOURCE_ROUTE) {
+        PyErr_SetString(PyExc_ValueError, "reward_off_route requires goal_source=route");
+        return -1;
+    }
+    env->off_route_distance_m = (float) unpack(kwargs, "off_route_distance_m");
+    float off_route_seconds = (float) unpack(kwargs, "off_route_seconds");
+    if (!(env->off_route_distance_m > 0.0f) || !isfinite(env->off_route_distance_m) || !(off_route_seconds > 0.0f)
+        || !isfinite(off_route_seconds)) {
+        PyErr_SetString(PyExc_ValueError, "off_route_distance_m and off_route_seconds must be finite and > 0");
+        return -1;
+    }
+    env->off_route_steps = (int) ceilf(off_route_seconds / env->dt);
+    env->reward_induced_braking = (float) unpack(kwargs, "reward_induced_braking");
+    float induced_braking_min_heading_deg = (float) unpack(kwargs, "induced_braking_min_heading_deg");
+    env->induced_braking_threshold_mps2 = (float) unpack(kwargs, "induced_braking_threshold_mps2");
+    float induced_braking_horizon_seconds = (float) unpack(kwargs, "induced_braking_horizon_seconds");
+    if (!(env->reward_induced_braking >= 0.0f) || !isfinite(env->reward_induced_braking)
+        || !(env->induced_braking_threshold_mps2 >= 0.0f) || !isfinite(env->induced_braking_threshold_mps2)) {
+        PyErr_SetString(PyExc_ValueError, "reward_induced_braking and induced_braking_threshold_mps2 must be finite and >= 0");
+        return -1;
+    }
+    if (!(induced_braking_min_heading_deg >= 0.0f && induced_braking_min_heading_deg <= 180.0f)) {
+        PyErr_SetString(PyExc_ValueError, "induced_braking_min_heading_deg must be in [0, 180]");
+        return -1;
+    }
+    env->induced_braking_min_heading_cos = cosf(induced_braking_min_heading_deg * (float) M_PI / 180.0f);
+    if (!(induced_braking_horizon_seconds > 0.0f)
+        || !(induced_braking_horizon_seconds <= INDUCED_BRAKING_MAX_SAMPLES * INDUCED_BRAKING_SAMPLE_SECONDS)) {
+        PyErr_SetString(PyExc_ValueError, "induced_braking_horizon_seconds must be in (0, 16]");
+        return -1;
+    }
+    env->induced_braking_sample_count = (int) ceilf(induced_braking_horizon_seconds / INDUCED_BRAKING_SAMPLE_SECONDS);
+    if (env->reward_induced_braking > 0.0f && env->goal_source != GOAL_SOURCE_ROUTE) {
+        PyErr_SetString(PyExc_ValueError, "reward_induced_braking requires goal_source=route");
+        return -1;
+    }
+    env->induced_braking_must_yield_scale = (float) unpack(kwargs, "induced_braking_must_yield_scale");
+    env->induced_braking_has_priority_scale = (float) unpack(kwargs, "induced_braking_has_priority_scale");
+    env->reward_collision_must_yield = (float) unpack(kwargs, "reward_collision_must_yield");
+    if (!(env->induced_braking_must_yield_scale >= 0.0f) || !isfinite(env->induced_braking_must_yield_scale)
+        || !(env->induced_braking_has_priority_scale >= 0.0f) || !isfinite(env->induced_braking_has_priority_scale)
+        || !(env->reward_collision_must_yield >= 0.0f) || !isfinite(env->reward_collision_must_yield)) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "induced_braking_must_yield_scale, induced_braking_has_priority_scale and reward_collision_must_yield must be finite and >= 0");
+        return -1;
+    }
+    env->reward_hesitation = (float) unpack(kwargs, "reward_hesitation");
+    if (!(env->reward_hesitation >= 0.0f) || !isfinite(env->reward_hesitation)) {
+        PyErr_SetString(PyExc_ValueError, "reward_hesitation must be finite and >= 0");
+        return -1;
+    }
+    if (env->reward_hesitation > 0.0f && env->goal_source != GOAL_SOURCE_ROUTE) {
+        PyErr_SetString(PyExc_ValueError, "reward_hesitation requires goal_source=route");
+        return -1;
+    }
+    if (env->reward_collision_must_yield > 0.0f && env->goal_source != GOAL_SOURCE_ROUTE) {
+        PyErr_SetString(PyExc_ValueError, "reward_collision_must_yield requires goal_source=route");
+        return -1;
+    }
     env->base_max_speed_mps = (float) unpack(kwargs, "base_max_speed_mps");
     env->max_speed_mps = (float) unpack(kwargs, "max_speed_mps");
     if (!(env->max_speed_mps > 0.0f) || !isfinite(env->max_speed_mps)) {
@@ -2904,6 +2974,12 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->partner_blindness_duration
         = (int) ceilf((float) unpack(kwargs, "partner_blindness_duration_seconds") / env->dt);
     env->partner_blindness_corridor = (int) unpack(kwargs, "partner_blindness_corridor");
+    env->partner_blindness_facing_away = (int) unpack(kwargs, "partner_blindness_facing_away");
+    env->partner_blindness_ghosting = (int) unpack(kwargs, "partner_blindness_ghosting");
+    if (env->partner_blindness_corridor && env->partner_blindness_facing_away) {
+        PyErr_SetString(PyExc_ValueError, "partner_blindness_corridor and partner_blindness_facing_away are exclusive");
+        return -1;
+    }
     env->partner_blindness_time_fraction_max = (float) unpack(kwargs, "partner_blindness_time_fraction_max");
     if (!(env->partner_blindness_time_fraction_max >= 0.0f && env->partner_blindness_time_fraction_max <= 1.0f)) {
         PyErr_SetString(PyExc_ValueError, "partner_blindness_time_fraction_max must be within [0, 1]");
@@ -3016,6 +3092,15 @@ static int my_log(PyObject *dict, Env *env, Log *log, float n) {
     assign_to_dict(dict, "reward_components/reverse", log->reward_reverse);
     assign_to_dict(dict, "reward_components/overspeed", log->reward_overspeed);
     assign_to_dict(dict, "reward_components/ade", log->reward_ade);
+    assign_to_dict(dict, "reward_components/off_route", log->reward_off_route);
+    assign_to_dict(dict, "off_route_count", log->off_route_count);
+    assign_to_dict(dict, "reward_components/induced_braking", log->reward_induced_braking);
+    assign_to_dict(dict, "induced_braking_seconds", log->induced_braking_seconds);
+    assign_to_dict(dict, "induced_braking_must_yield_seconds", log->induced_braking_must_yield_seconds);
+    assign_to_dict(dict, "reward_components/collision_must_yield", log->reward_collision_must_yield);
+    assign_to_dict(dict, "must_yield_collision_rate", log->must_yield_collision_rate);
+    assign_to_dict(dict, "reward_components/hesitation", log->reward_hesitation);
+    assign_to_dict(dict, "hesitation_seconds", log->hesitation_seconds);
 
     if (env->compute_eval_metrics) {
         // Puffer score components

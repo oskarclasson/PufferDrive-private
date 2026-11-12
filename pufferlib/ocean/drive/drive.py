@@ -32,6 +32,18 @@ class Drive(pufferlib.PufferEnv):
         reward_center_bias=0.0,
         reward_velocity=0.0025,
         reward_reverse=0.005,
+        reward_reverse_fixed_per_second=0.0,
+        reward_off_route=0.0,
+        off_route_distance_m=5.0,
+        off_route_seconds=3.0,
+        reward_induced_braking=0.0,
+        induced_braking_min_heading_deg=50.0,
+        induced_braking_threshold_mps2=1.0,
+        induced_braking_horizon_seconds=3.0,
+        induced_braking_must_yield_scale=1.0,
+        induced_braking_has_priority_scale=1.0,
+        reward_collision_must_yield=0.0,
+        reward_hesitation=0.0,
         reward_stop_line=1.0,
         reward_timestep=0.000025,
         reward_overspeed=0.005,
@@ -152,6 +164,8 @@ class Drive(pufferlib.PufferEnv):
         partner_blindness_trigger_prob=0.1,
         partner_blindness_duration_seconds=1.0,
         partner_blindness_corridor=True,
+        partner_blindness_facing_away=False,
+        partner_blindness_ghosting=False,
         partner_blindness_time_fraction_max=0.0,
         phantom_braking_prob=0.0,
         phantom_braking_trigger_prob=0.0,
@@ -218,6 +232,18 @@ class Drive(pufferlib.PufferEnv):
         self.reward_center_bias = reward_center_bias
         self.reward_velocity = reward_velocity
         self.reward_reverse = reward_reverse
+        self.reward_reverse_fixed_per_second = float(reward_reverse_fixed_per_second)
+        self.reward_off_route = float(reward_off_route)
+        self.off_route_distance_m = float(off_route_distance_m)
+        self.off_route_seconds = float(off_route_seconds)
+        self.reward_induced_braking = float(reward_induced_braking)
+        self.induced_braking_min_heading_deg = float(induced_braking_min_heading_deg)
+        self.induced_braking_threshold_mps2 = float(induced_braking_threshold_mps2)
+        self.induced_braking_horizon_seconds = float(induced_braking_horizon_seconds)
+        self.induced_braking_must_yield_scale = float(induced_braking_must_yield_scale)
+        self.induced_braking_has_priority_scale = float(induced_braking_has_priority_scale)
+        self.reward_collision_must_yield = float(reward_collision_must_yield)
+        self.reward_hesitation = float(reward_hesitation)
         self.reward_stop_line = reward_stop_line
         self.reward_timestep = reward_timestep
         self.reward_overspeed = reward_overspeed
@@ -358,6 +384,8 @@ class Drive(pufferlib.PufferEnv):
         self.partner_blindness_trigger_prob = float(partner_blindness_trigger_prob)
         self.partner_blindness_duration_seconds = float(partner_blindness_duration_seconds)
         self.partner_blindness_corridor = int(bool(partner_blindness_corridor))
+        self.partner_blindness_facing_away = int(bool(partner_blindness_facing_away))
+        self.partner_blindness_ghosting = int(bool(partner_blindness_ghosting))
         self.partner_blindness_time_fraction_max = float(partner_blindness_time_fraction_max)
         self.phantom_braking_prob = float(phantom_braking_prob)
         self.phantom_braking_trigger_prob = float(phantom_braking_trigger_prob)
@@ -566,6 +594,18 @@ class Drive(pufferlib.PufferEnv):
             "reward_center_bias": self.reward_center_bias,
             "reward_velocity": self.reward_velocity,
             "reward_reverse": self.reward_reverse,
+            "reward_reverse_fixed_per_second": self.reward_reverse_fixed_per_second,
+            "reward_off_route": self.reward_off_route,
+            "off_route_distance_m": self.off_route_distance_m,
+            "off_route_seconds": self.off_route_seconds,
+            "reward_induced_braking": self.reward_induced_braking,
+            "induced_braking_min_heading_deg": self.induced_braking_min_heading_deg,
+            "induced_braking_threshold_mps2": self.induced_braking_threshold_mps2,
+            "induced_braking_horizon_seconds": self.induced_braking_horizon_seconds,
+            "induced_braking_must_yield_scale": self.induced_braking_must_yield_scale,
+            "induced_braking_has_priority_scale": self.induced_braking_has_priority_scale,
+            "reward_collision_must_yield": self.reward_collision_must_yield,
+            "reward_hesitation": self.reward_hesitation,
             "reward_stop_line": self.reward_stop_line,
             "reward_timestep": self.reward_timestep,
             "reward_overspeed": self.reward_overspeed,
@@ -667,6 +707,8 @@ class Drive(pufferlib.PufferEnv):
             "partner_blindness_trigger_prob": self.partner_blindness_trigger_prob,
             "partner_blindness_duration_seconds": self.partner_blindness_duration_seconds,
             "partner_blindness_corridor": self.partner_blindness_corridor,
+            "partner_blindness_facing_away": self.partner_blindness_facing_away,
+            "partner_blindness_ghosting": self.partner_blindness_ghosting,
             "partner_blindness_time_fraction_max": self.partner_blindness_time_fraction_max,
             "phantom_braking_prob": self.phantom_braking_prob,
             "phantom_braking_trigger_prob": self.phantom_braking_trigger_prob,

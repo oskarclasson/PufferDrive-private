@@ -291,6 +291,30 @@ static const int ROAD_OFFSETS[25][2]
 #define OBS_STRIDE_HEADING_THRESHOLD 0.2618f
 // Lateral slack beyond the ego's half width on each side of a blind partner's forward corridor
 #define PARTNER_BLINDNESS_CORRIDOR_MARGIN_M 1.0f
+// Min cos between a partner's heading and the blind agent->partner direction for it to count as driving away
+#define PARTNER_BLINDNESS_FACING_AWAY_COS 0.5f
+// Route slots searched ahead of the off-route cursor; a 0.3 s step never crosses more than this many lanes
+#define OFF_ROUTE_LANE_WINDOW 4
+#define INDUCED_BRAKING_SAMPLE_SECONDS 0.25f
+#define INDUCED_BRAKING_LATERAL_MARGIN_M 0.5f // added to the yielding car's half width
+#define INDUCED_BRAKING_STOP_GAP_M 2.0f // the yielding car must stop this far short of the ego footprint
+#define INDUCED_BRAKING_MIN_SPEED_MPS 1.0f
+#define INDUCED_BRAKING_MAX_DECEL_MPS2 8.0f
+#define INDUCED_BRAKING_MAX_SAMPLES 64
+#define ROUTE_PATH_SPACING_M 1.0f
+#define ROUTE_PATH_MAX_POINTS 64
+#define RIGHT_OF_WAY_TURN_MIN_RAD ((float) M_PI / 6.0f) // junction connectors turning less than this count as straight
+#define RIGHT_OF_WAY_OPPOSING_COS (-0.7071f) // junction approach headings over 135 deg apart are oncoming
+#define HESITATION_LATERAL_ACCEL_MPS2 3.0f // comfort metric's acceleration limit
+#define HESITATION_COMFORT_DECEL_MPS2 3.0f
+#define HESITATION_TARGET_FRACTION 0.5f // only crawling below this share of the clear target speed is charged
+#define HESITATION_MAX_FLOOR_SPEED_MPS 4.0f // ... and below this speed, since the lane limit is randomized and unobserved
+#define HESITATION_CURVE_LOOKAHEAD_M 20.0f
+#define HESITATION_CURVATURE_BASELINE_POINTS 3
+#define HESITATION_STOP_LINE_LATERAL_MARGIN_M 1.0f
+#define RIGHT_OF_WAY_EGO_YIELDS 0
+#define RIGHT_OF_WAY_EQUAL 1
+#define RIGHT_OF_WAY_EGO_PRIORITY 2
 
 // =====================================================================================
 // 9. REWARDS

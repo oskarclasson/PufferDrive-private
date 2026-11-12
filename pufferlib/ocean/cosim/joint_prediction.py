@@ -1,8 +1,10 @@
 """Goal inference over the ways ahead of co-sim actors, for the joint prediction of the policy server.
 
 The eval's eval.goal_inference, keyed by the external sim's actor ids instead of env rows: every tracked actor keeps
-a belief over the branches of the map's route graph ahead of it, updated each step by exp(beta * advantage) with the
-critic's advantage gamma * V(next) - V(now) under that branch. All positions are in the bin frame.
+a belief over the branches of the map's route graph ahead of it, Bayes-updated each step by the likelihood of its last
+move under that branch: with LIKELIHOOD_ACTION a Gaussian on the jerk it drove around the policy's mean jerk under the
+branch, with LIKELIHOOD_VALUE exp(beta * advantage) with the critic's advantage gamma * V(next) - V(now). All positions
+are in the bin frame.
 """
 
 import math
@@ -16,6 +18,9 @@ GOAL_COLUMNS = 4  # x, y, z, lane
 GOAL_NEW_BRANCH_MIN_BELIEF = 0.1
 GOAL_CONTINUE_M = 3.0
 MAX_SPEED_MPS = 20.0  # sizes the goal list so it lasts the whole horizon
+LIKELIHOOD_VALUE = "value"
+LIKELIHOOD_ACTION = "action"
+LATERAL_ACCEL_MIN_SPEED_MPS = 1.0  # drive.h's v_eff floor turning lateral acceleration into curvature
 
 
 def distance_to_path_m(point, path):
@@ -59,7 +64,13 @@ class ActorGoals:
         self.value = np.zeros(shape, dtype=np.float32)
         self.has_value = np.zeros(shape, dtype=bool)
         self.reward = np.zeros(shape, dtype=np.float32)
+        self.mean_jerk = np.zeros((hypothesis_count, 2), dtype=np.float32)
+        self.has_mean_jerk = np.zeros(shape, dtype=bool)
         self.xy = None
+        self.heading = None
+        self.speed_mps = None
+        self.time_s = None
+        self.accel = None  # (longitudinal, lateral) [m/s^2]
         self.steps_since_update = 0
 
     @property
@@ -81,8 +92,13 @@ class GoalInference:
         goal_radius_m,
         reward_goal,
         horizon_s,
+        likelihood,
+        jerk_std,
     ):
         from data_utils import mirror_map_bin
+
+        if likelihood not in (LIKELIHOOD_VALUE, LIKELIHOOD_ACTION):
+            raise ValueError(f"unknown goal inference likelihood {likelihood!r}")
 
         self.graph = drive_route_graph.RouteGraph(mirror_map_bin.read_bin(bin_path)["roads"])
         self.num_goals = int(num_goals)
@@ -94,6 +110,8 @@ class GoalInference:
         self.gamma = float(gamma)
         self.goal_radius_m = float(goal_radius_m)
         self.reward_goal = float(reward_goal)
+        self.likelihood = likelihood
+        self.jerk_std = np.asarray(jerk_std, dtype=np.float32)  # (longitudinal, lateral) [m/s^3]
         self.extension_goal_count = min(
             binding.MAX_GOALS - self.num_goals, math.ceil(horizon_s * MAX_SPEED_MPS / self.goal_spacing_m)
         )
@@ -113,15 +131,18 @@ class GoalInference:
             total[k] = len(branch)
         return goals, total
 
-    def advance(self, actor_id, x, y, heading):
-        """Score the goals the actor reached since the last step and re-place its hypotheses when due; returns whether
-        it has any way ahead."""
+    def advance(self, actor_id, x, y, heading, speed_mps, time_s):
+        """Score the goals the actor reached since the last step, score its hypotheses by the jerk it drove with
+        LIKELIHOOD_ACTION, and re-place them when due; returns whether it has any way ahead. speed_mps is signed along
+        heading."""
         actor = self.actors.get(actor_id)
         if actor is None:
             actor = ActorGoals(self.hypothesis_count, self.num_goals)
             self.actors[actor_id] = actor
         xy = np.array([x, y], dtype=np.float32)
         valid = actor.valid
+        # Before any replan: the cached mean jerks belong to the hypotheses the actor drove under.
+        self._observe_motion(actor, heading, speed_mps, time_s, valid)
         actor.reward[:] = 0.0
         # The env's reach test: the goal lies within the goal radius of the segment driven this step.
         if actor.xy is not None:
@@ -152,8 +173,42 @@ class GoalInference:
                 actor.goals, actor.goal_total = new_goals, new_total
                 actor.next_goal[:] = 0
                 actor.has_value[:] = False
+                actor.has_mean_jerk[:] = False
                 actor.steps_since_update = 0
         return bool(actor.valid.any())
+
+    def _observe_motion(self, actor, heading, speed_mps, time_s, valid):
+        """Estimate the actor's acceleration from its speed and heading since the last step and, with
+        LIKELIHOOD_ACTION, Bayes-update its belief by a Gaussian on the jerk since then around each hypothesis' mean
+        jerk."""
+        if actor.time_s is not None:
+            dt_s = time_s - actor.time_s
+            if not dt_s > 0:
+                raise ValueError(f"actor seen at {time_s} s after {actor.time_s} s")
+            yaw_rate = math.remainder(heading - actor.heading, 2 * math.pi) / dt_s
+            curvature = yaw_rate / math.copysign(max(abs(speed_mps), LATERAL_ACCEL_MIN_SPEED_MPS), speed_mps)
+            accel = np.array(
+                [
+                    (speed_mps - actor.speed_mps) / dt_s,
+                    curvature * max(abs(speed_mps), LATERAL_ACCEL_MIN_SPEED_MPS) ** 2,
+                ],
+                dtype=np.float32,
+            )
+            scored = valid & actor.has_mean_jerk
+            if self.likelihood == LIKELIHOOD_ACTION and actor.accel is not None and scored.any():
+                jerk = (accel - actor.accel) / dt_s
+                jerk_error = (actor.mean_jerk - jerk) / self.jerk_std
+                self._bayes_update(actor, -0.5 * np.sum(jerk_error**2, axis=-1), scored, valid)
+            actor.accel = accel
+        actor.heading, actor.speed_mps, actor.time_s = heading, speed_mps, time_s
+
+    def _bayes_update(self, actor, log_likelihood, scored, valid):
+        """Bayes-update the belief over the scored hypotheses, then mix it back toward uniform over the valid ones by
+        forgetting."""
+        log_likelihood = np.where(scored, log_likelihood, -np.inf)
+        posterior = actor.belief * np.exp(log_likelihood - log_likelihood.max())
+        posterior /= max(posterior.sum(), 1e-12)
+        actor.belief = ((1.0 - self.forgetting) * posterior + self.forgetting * valid / valid.sum()).astype(np.float32)
 
     def retain(self, actor_ids):
         """Forget the actors no longer tracked."""
@@ -170,21 +225,21 @@ class GoalInference:
         windows[np.arange(self.num_goals) >= window_count[:, None]] = 0.0
         return windows, window_count
 
-    def update(self, actor_id, value):
-        """Bayes update of the actor's belief with the critic values of its (hypotheses,) goal windows."""
+    def update(self, actor_id, value, mean_jerk):
+        """Take the critic values and the policy's (hypotheses, 2) mean jerks [m/s^3] of the actor's (hypotheses,)
+        goal windows: with LIKELIHOOD_VALUE Bayes-update its belief by the values, with LIKELIHOOD_ACTION keep the
+        mean jerks to score its next move against."""
         actor = self.actors[actor_id]
         valid = actor.valid
-        compared = valid & actor.has_value
-        # Boltzmann-rational driver: a move is as likely under a route as it raised that route's return.
-        if compared.any():
-            advantage = np.where(compared, actor.reward + self.gamma * value - actor.value, -np.inf)
-            likelihood = np.exp(self.beta * (advantage - advantage.max()))
-            posterior = actor.belief * likelihood
-            posterior /= max(posterior.sum(), 1e-12)
-            actor.belief = ((1.0 - self.forgetting) * posterior + self.forgetting * valid / valid.sum()).astype(
-                np.float32
-            )
-        actor.value, actor.has_value = value.astype(np.float32), valid
+        if self.likelihood == LIKELIHOOD_ACTION:
+            actor.mean_jerk, actor.has_mean_jerk = mean_jerk.astype(np.float32), valid
+        else:
+            compared = valid & actor.has_value
+            # Boltzmann-rational driver: a move is as likely under a route as it raised that route's return.
+            if compared.any():
+                advantage = actor.reward + self.gamma * value - actor.value
+                self._bayes_update(actor, self.beta * advantage, compared, valid)
+            actor.value, actor.has_value = value.astype(np.float32), valid
         actor.belief[~valid] = 0.0
         actor.belief /= max(actor.belief.sum(), 1e-12)
 

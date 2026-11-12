@@ -88,6 +88,15 @@ struct Log {
     float reward_reverse;
     float reward_overspeed;
     float reward_ade;
+    float reward_off_route;
+    float off_route_count;
+    float reward_induced_braking;
+    float induced_braking_seconds;
+    float induced_braking_must_yield_seconds;
+    float reward_collision_must_yield;
+    float must_yield_collision_rate;
+    float reward_hesitation;
+    float hesitation_seconds;
     float spawn_failed;
     float spawn_reject_collision;
     float spawn_reject_offroad;
@@ -267,6 +276,22 @@ struct Drive {
     float reward_center_bias;
     float reward_velocity;
     float reward_reverse;
+    float reward_reverse_fixed_per_second;
+    float reward_off_route;
+    float off_route_distance_m;
+    int off_route_steps;
+    float reward_induced_braking;
+    float induced_braking_min_heading_cos;
+    float induced_braking_threshold_mps2;
+    int induced_braking_sample_count;
+    float *route_path_xy; // per active agent: ROUTE_PATH_MAX_POINTS route-centreline points ahead, world frame
+    int *route_path_point_count;
+    float induced_braking_must_yield_scale;
+    float induced_braking_has_priority_scale;
+    float reward_collision_must_yield;
+    float reward_hesitation;
+    float *route_junction_turn_rad; // per active agent: signed heading change over the next junction connector on its route, 0 if none
+    float *route_junction_approach_heading; // per active agent: heading entering that connector, own heading if none
     float reward_stop_line;
     float reward_timestep;
     float reward_overspeed;
@@ -329,6 +354,8 @@ struct Drive {
     float partner_blindness_trigger_prob;
     int partner_blindness_duration;
     int partner_blindness_corridor;
+    int partner_blindness_facing_away;
+    int partner_blindness_ghosting;
     float partner_blindness_time_fraction_max;
     float phantom_braking_prob;
     float phantom_braking_trigger_prob;
@@ -478,6 +505,10 @@ static float compute_heading_diff(float heading1, float heading2) {
     return normalize_heading(heading1 - heading2);
 }
 
+static int route_prediction_enabled(Drive *env) {
+    return env->reward_induced_braking > 0.0f || env->reward_collision_must_yield > 0.0f || env->reward_hesitation > 0.0f;
+}
+
 static float compute_lane_curvature(RoadMapElement *element, int seg_idx) {
     int num_segments = element->segment_size - 1;
     if (num_segments < 2) {
@@ -552,6 +583,7 @@ static void reset_agent_metrics(Drive *env, int agent_idx) {
     for (int i = 0; i < NUM_METRICS; i++) {
         agent->metrics_array[i] = 0.0f;
     }
+    agent->off_route_triggered = 0;
 }
 
 static void reset_agent_state(Agent *agent) {
@@ -561,6 +593,9 @@ static void reset_agent_state(Agent *agent) {
     agent->removed = 0;
     agent->first_collision_partner_idx = -1;
     agent->stop_sign_target_idx = -1;
+    agent->off_route_cursor_idx = 0;
+    agent->off_route_step_count = 0;
+    agent->off_route_triggered = 0;
     agent->stop_sign_stop_completed = 0;
     agent->stop_sign_last_failed_idx = -1;
     agent->stop_sign_standstill_idx = -1;
@@ -1164,6 +1199,7 @@ static bool compute_new_route(Drive *env, Agent *agent, int current_lane_idx) {
         agent->route[i] = candidate_route[i];
     }
     agent->current_route_idx = 0;
+    agent->off_route_cursor_idx = 0;
 
     return true;
 }
@@ -2230,6 +2266,9 @@ static int collision_check(Drive *env, int agent_idx) {
             || same_vehicle(agent, other_agent)) {
             continue;
         }
+        if (env->partner_blindness_ghosting && agent->is_blind_partner && other_agent->is_blind_partner) {
+            continue;
+        }
 
         float other_disp = compute_euclidean_distance(
             other_agent->sim_x,
@@ -2583,6 +2622,15 @@ static void add_log(Drive *env) {
         episode_log.reward_reverse += env->logs[i].reward_reverse;
         episode_log.reward_overspeed += env->logs[i].reward_overspeed;
         episode_log.reward_ade += env->logs[i].reward_ade;
+        episode_log.reward_off_route += env->logs[i].reward_off_route;
+        episode_log.off_route_count += env->logs[i].off_route_count;
+        episode_log.reward_induced_braking += env->logs[i].reward_induced_braking;
+        episode_log.induced_braking_seconds += env->logs[i].induced_braking_seconds;
+        episode_log.induced_braking_must_yield_seconds += env->logs[i].induced_braking_must_yield_seconds;
+        episode_log.reward_collision_must_yield += env->logs[i].reward_collision_must_yield;
+        episode_log.must_yield_collision_rate += env->logs[i].must_yield_collision_rate;
+        episode_log.reward_hesitation += env->logs[i].reward_hesitation;
+        episode_log.hesitation_seconds += env->logs[i].hesitation_seconds;
         // Comfort and velocity metrics (normalized per timestep)
         episode_log.comfort_violation_count += env->logs[i].comfort_violation_count / safe_timestep;
         episode_log.velocity_progress_sum += env->logs[i].velocity_progress_sum / safe_timestep;
@@ -3794,6 +3842,12 @@ void init(Drive *env) {
     }
     set_start_position(env);
     env->logs = (Log *) calloc(env->active_agent_count, sizeof(Log));
+    if (route_prediction_enabled(env)) {
+        env->route_path_xy = (float *) calloc(env->active_agent_count * ROUTE_PATH_MAX_POINTS * 2, sizeof(float));
+        env->route_path_point_count = (int *) calloc(env->active_agent_count, sizeof(int));
+        env->route_junction_turn_rad = (float *) calloc(env->active_agent_count, sizeof(float));
+        env->route_junction_approach_heading = (float *) calloc(env->active_agent_count, sizeof(float));
+    }
 
     if (env->goal_source == GOAL_SOURCE_GT || env->goal_source == GOAL_SOURCE_GT_MAP) {
         for (int i = 0; i < env->active_agent_count; i++) {
@@ -3836,6 +3890,10 @@ void c_close(Drive *env) {
     free_predict_state(env);
     free(env->active_agent_indices);
     free(env->logs);
+    free(env->route_path_xy);
+    free(env->route_path_point_count);
+    free(env->route_junction_turn_rad);
+    free(env->route_junction_approach_heading);
     free(env->lane_speed_limit_mps);
     free(env->speed_zone_offset_mps);
     free(env->lane_limit_resolved);
@@ -4542,6 +4600,39 @@ static void gather_road_observation_rows(
 // Core Simulation Functions
 // ========================================
 
+static void update_off_route(Drive *env, Agent *agent) {
+    if (env->goal_source != GOAL_SOURCE_ROUTE || agent->route == NULL) {
+        return;
+    }
+    int first_route_idx = agent->off_route_cursor_idx > 0 ? agent->off_route_cursor_idx - 1 : 0;
+    int last_route_idx = agent->off_route_cursor_idx + OFF_ROUTE_LANE_WINDOW;
+    if (last_route_idx > agent->route_length) {
+        last_route_idx = agent->route_length;
+    }
+    float best_distance_sq = 1e30f;
+    for (int route_idx = first_route_idx; route_idx < last_route_idx; route_idx++) {
+        float lane_distance_sq;
+        compute_lane_progress(
+            &env->road_elements[agent->route[route_idx]],
+            agent->sim_x,
+            agent->sim_y,
+            agent->cos_heading,
+            agent->sin_heading,
+            false,
+            &lane_distance_sq);
+        if (lane_distance_sq < best_distance_sq) {
+            best_distance_sq = lane_distance_sq;
+            agent->off_route_cursor_idx = route_idx;
+        }
+    }
+    if (best_distance_sq <= env->off_route_distance_m * env->off_route_distance_m) {
+        agent->off_route_step_count = 0;
+        return;
+    }
+    agent->off_route_step_count++;
+    agent->off_route_triggered = agent->off_route_step_count == env->off_route_steps;
+}
+
 static void compute_metrics(Drive *env, int agent_idx, int log_idx) {
     Agent *agent = &env->agents[agent_idx];
     Log *agent_log = &env->logs[log_idx];
@@ -4707,6 +4798,7 @@ static void compute_metrics(Drive *env, int agent_idx, int log_idx) {
             agent->current_goal_z = agent->list_goal_z[agent->current_goal_idx];
         }
     }
+    update_off_route(env, agent);
 
     float distance_to_goal_gt = compute_point_to_segment_distance(
         agent->gt_goal_x,
@@ -4719,6 +4811,351 @@ static void compute_metrics(Drive *env, int agent_idx, int log_idx) {
     if (distance_to_goal_gt < GT_GOAL_RADIUS_M && goal_gt_z_dist < Z_BUFFER) {
         agent_log->reached_goal_gt = 1.0f;
     }
+}
+
+// Appends points every ROUTE_PATH_SPACING_M from start_s_m; returns where sampling resumes on the next lane
+static float sample_lane_path(RoadMapElement *lane, float start_s_m, float *path_xy, int *point_count) {
+    float target_s_m = start_s_m;
+    int end_vertex_idx = 1;
+    for (int sample_idx = 0; sample_idx < ROUTE_PATH_MAX_POINTS; sample_idx++) {
+        if (*point_count >= ROUTE_PATH_MAX_POINTS || target_s_m > lane->length) {
+            break;
+        }
+        for (; end_vertex_idx < lane->segment_size - 1 && lane->cum_lengths[end_vertex_idx] < target_s_m;
+             end_vertex_idx++) {
+        }
+        int start_vertex_idx = end_vertex_idx - 1;
+        float span_m = lane->cum_lengths[end_vertex_idx] - lane->cum_lengths[start_vertex_idx];
+        float frac = span_m > 0.0f ? clip((target_s_m - lane->cum_lengths[start_vertex_idx]) / span_m, 0.0f, 1.0f) : 0.0f;
+        path_xy[2 * *point_count] = lane->x[start_vertex_idx] + frac * (lane->x[end_vertex_idx] - lane->x[start_vertex_idx]);
+        path_xy[2 * *point_count + 1]
+            = lane->y[start_vertex_idx] + frac * (lane->y[end_vertex_idx] - lane->y[start_vertex_idx]);
+        (*point_count)++;
+        target_s_m += ROUTE_PATH_SPACING_M;
+    }
+    return target_s_m - lane->length;
+}
+
+// Route centreline ahead of the agent's projection onto its off-route cursor lane
+static void predict_route_path(Drive *env, int active_idx) {
+    Agent *agent = &env->agents[env->active_agent_indices[active_idx]];
+    float *path_xy = &env->route_path_xy[active_idx * ROUTE_PATH_MAX_POINTS * 2];
+    int point_count = 0;
+    env->route_path_point_count[active_idx] = 0;
+    if (agent->route == NULL || agent->route_length <= 0) {
+        return;
+    }
+    float lane_dist_sq;
+    float start_s_m = compute_lane_progress(
+        &env->road_elements[agent->route[agent->off_route_cursor_idx]],
+        agent->sim_x,
+        agent->sim_y,
+        agent->cos_heading,
+        agent->sin_heading,
+        false,
+        &lane_dist_sq);
+    for (int route_idx = agent->off_route_cursor_idx; route_idx < agent->route_length; route_idx++) {
+        if (point_count >= ROUTE_PATH_MAX_POINTS) {
+            break;
+        }
+        start_s_m = sample_lane_path(&env->road_elements[agent->route[route_idx]], start_s_m, path_xy, &point_count);
+    }
+    env->route_path_point_count[active_idx] = point_count;
+}
+
+// First junction connector (a lane whose predecessor branches) within the predicted route path
+static void predict_route_junction(Drive *env, int active_idx) {
+    Agent *agent = &env->agents[env->active_agent_indices[active_idx]];
+    env->route_junction_turn_rad[active_idx] = 0.0f;
+    env->route_junction_approach_heading[active_idx] = agent->sim_heading;
+    if (agent->route == NULL || agent->route_length <= 0) {
+        return;
+    }
+    float route_s_m = 0.0f;
+    for (int route_idx = agent->off_route_cursor_idx; route_idx < agent->route_length; route_idx++) {
+        if (route_s_m > ROUTE_PATH_MAX_POINTS * ROUTE_PATH_SPACING_M) {
+            return;
+        }
+        RoadMapElement *lane = &env->road_elements[agent->route[route_idx]];
+        route_s_m += lane->length;
+        if (lane->num_entries == 0 || env->road_elements[lane->entry_lanes[0]].num_exits < 2) {
+            continue;
+        }
+        int last_heading_idx = lane->segment_size > 2 ? lane->segment_size - 2 : 0;
+        env->route_junction_turn_rad[active_idx] = compute_heading_diff(lane->headings[last_heading_idx], lane->headings[0]);
+        env->route_junction_approach_heading[active_idx] = lane->headings[0];
+        return;
+    }
+}
+
+// Turning cars yield to straight ones; of two oncoming turners, the one turning across the other yields
+static int right_of_way(Drive *env, int ego_active_idx, int other_active_idx) {
+    Agent *ego = &env->agents[env->active_agent_indices[ego_active_idx]];
+    Agent *other = &env->agents[env->active_agent_indices[other_active_idx]];
+    float ego_turn_rad = env->route_junction_turn_rad[ego_active_idx];
+    float other_turn_rad = env->route_junction_turn_rad[other_active_idx];
+    int ego_turning = fabsf(ego_turn_rad) > RIGHT_OF_WAY_TURN_MIN_RAD;
+    int other_turning = fabsf(other_turn_rad) > RIGHT_OF_WAY_TURN_MIN_RAD;
+    if (ego_turning != other_turning) {
+        return ego_turning ? RIGHT_OF_WAY_EGO_YIELDS : RIGHT_OF_WAY_EGO_PRIORITY;
+    }
+    float ego_approach_heading = env->route_junction_approach_heading[ego_active_idx];
+    float other_approach_heading = env->route_junction_approach_heading[other_active_idx];
+    if (!ego_turning || cosf(ego_approach_heading - other_approach_heading) > RIGHT_OF_WAY_OPPOSING_COS) {
+        return RIGHT_OF_WAY_EQUAL;
+    }
+    float dx_m = other->sim_x - ego->sim_x;
+    float dy_m = other->sim_y - ego->sim_y;
+    // positive cross product: the other car lies to the left of the approach direction
+    float other_side = cosf(ego_approach_heading) * dy_m - sinf(ego_approach_heading) * dx_m;
+    float ego_side = sinf(other_approach_heading) * dx_m - cosf(other_approach_heading) * dy_m;
+    int ego_turns_across = ego_turn_rad * other_side > 0.0f;
+    int other_turns_across = other_turn_rad * ego_side > 0.0f;
+    if (ego_turns_across == other_turns_across) {
+        return RIGHT_OF_WAY_EQUAL;
+    }
+    return ego_turns_across ? RIGHT_OF_WAY_EGO_YIELDS : RIGHT_OF_WAY_EGO_PRIORITY;
+}
+
+static void route_path_pose_at(const float *path_xy, int point_count, float s_m, float *x, float *y, float *dir_x, float *dir_y) {
+    int point_idx = (int) (s_m / ROUTE_PATH_SPACING_M);
+    point_idx = point_idx < point_count - 2 ? point_idx : point_count - 2;
+    float frac = clip(s_m / ROUTE_PATH_SPACING_M - point_idx, 0.0f, 1.0f);
+    float seg_x = path_xy[2 * point_idx + 2] - path_xy[2 * point_idx];
+    float seg_y = path_xy[2 * point_idx + 3] - path_xy[2 * point_idx + 1];
+    float seg_len = fmaxf(sqrtf(seg_x * seg_x + seg_y * seg_y), 1e-6f);
+    *x = path_xy[2 * point_idx] + frac * seg_x;
+    *y = path_xy[2 * point_idx + 1] + frac * seg_y;
+    *dir_x = seg_x / seg_len;
+    *dir_y = seg_y / seg_len;
+}
+
+// Both cars hold the given speeds along their routes; the yielder must stay INDUCED_BRAKING_STOP_GAP_M behind ego on its own route
+static float required_yield_decel_mps2(
+    Drive *env, int ego_active_idx, float ego_speed_mps, int yielder_active_idx, float yielder_speed_mps) {
+    Agent *ego = &env->agents[env->active_agent_indices[ego_active_idx]];
+    Agent *yielder = &env->agents[env->active_agent_indices[yielder_active_idx]];
+    const float *ego_path = &env->route_path_xy[ego_active_idx * ROUTE_PATH_MAX_POINTS * 2];
+    const float *yielder_path = &env->route_path_xy[yielder_active_idx * ROUTE_PATH_MAX_POINTS * 2];
+    int ego_point_count = env->route_path_point_count[ego_active_idx];
+    int yielder_point_count = env->route_path_point_count[yielder_active_idx];
+    if (ego_point_count < 2 || yielder_point_count < 2) {
+        return 0.0f;
+    }
+    float yielder_front_m = 0.5f * yielder->sim_length;
+    float required_decel_mps2 = 0.0f;
+    int ego_entered_path = 0;
+    for (int sample_idx = 1; sample_idx <= env->induced_braking_sample_count; sample_idx++) {
+        float t_seconds = sample_idx * INDUCED_BRAKING_SAMPLE_SECONDS;
+        float ego_x, ego_y, ego_dir_x, ego_dir_y;
+        route_path_pose_at(ego_path, ego_point_count, ego_speed_mps * t_seconds, &ego_x, &ego_y, &ego_dir_x, &ego_dir_y);
+        int nearest_point_idx = 0;
+        float nearest_dist_sq = 1e30f;
+        for (int point_idx = 0; point_idx < yielder_point_count; point_idx++) {
+            float dx_m = yielder_path[2 * point_idx] - ego_x;
+            float dy_m = yielder_path[2 * point_idx + 1] - ego_y;
+            float dist_sq = dx_m * dx_m + dy_m * dy_m;
+            nearest_point_idx = dist_sq < nearest_dist_sq ? point_idx : nearest_point_idx;
+            nearest_dist_sq = fminf(dist_sq, nearest_dist_sq);
+        }
+        float path_x, path_y, path_dir_x, path_dir_y;
+        float path_s_m = nearest_point_idx * ROUTE_PATH_SPACING_M;
+        route_path_pose_at(yielder_path, yielder_point_count, path_s_m, &path_x, &path_y, &path_dir_x, &path_dir_y);
+        float rel_cos = fabsf(ego_dir_x * path_dir_x + ego_dir_y * path_dir_y);
+        float rel_sin = fabsf(ego_dir_y * path_dir_x - ego_dir_x * path_dir_y);
+        float ego_half_fwd_m = 0.5f * (rel_cos * ego->sim_length + rel_sin * ego->sim_width);
+        float ego_half_lat_m = 0.5f * (rel_sin * ego->sim_length + rel_cos * ego->sim_width);
+        float path_half_width_m = 0.5f * yielder->sim_width + INDUCED_BRAKING_LATERAL_MARGIN_M + ego_half_lat_m;
+        float ego_rear_m = path_s_m - ego_half_fwd_m;
+        float free_m = ego_rear_m - yielder_front_m - INDUCED_BRAKING_STOP_GAP_M;
+        float travel_m = yielder_speed_mps * t_seconds;
+        int ego_in_path = nearest_dist_sq <= path_half_width_m * path_half_width_m
+            && ego_rear_m + 2.0f * ego_half_fwd_m >= yielder_front_m;
+        if (!ego_in_path) {
+            continue;
+        }
+        // yielder nose already beyond ego's far side when ego first enters: ego cuts behind, nothing is forced
+        if (!ego_entered_path && yielder_front_m + travel_m > path_s_m + ego_half_fwd_m) {
+            return 0.0f;
+        }
+        ego_entered_path = 1;
+        if (travel_m <= free_m) {
+            continue;
+        }
+        float decel_mps2 = INDUCED_BRAKING_MAX_DECEL_MPS2;
+        float decel_by_t_mps2 = 2.0f * (travel_m - free_m) / (t_seconds * t_seconds);
+        if (free_m > 0.0f) {
+            // braking that ends before t must stop within free_m instead
+            decel_mps2 = decel_by_t_mps2 * t_seconds <= yielder_speed_mps
+                ? decel_by_t_mps2
+                : yielder_speed_mps * yielder_speed_mps / (2.0f * free_m);
+        }
+        required_decel_mps2 = fmaxf(required_decel_mps2, fminf(decel_mps2, INDUCED_BRAKING_MAX_DECEL_MPS2));
+    }
+    return required_decel_mps2;
+}
+
+// Summed braking above threshold that ego forces on moving cars crossing or opposing its heading, scaled by right of way
+static float compute_induced_braking_excess_mps2(Drive *env, int ego_active_idx, float *must_yield_excess_mps2) {
+    Agent *ego = &env->agents[env->active_agent_indices[ego_active_idx]];
+    float reach_m = ego->sim_speed * env->induced_braking_sample_count * INDUCED_BRAKING_SAMPLE_SECONDS
+        + ROUTE_PATH_MAX_POINTS * ROUTE_PATH_SPACING_M;
+    float excess_mps2 = 0.0f;
+    *must_yield_excess_mps2 = 0.0f;
+    for (int other_active_idx = 0; other_active_idx < env->active_agent_count; other_active_idx++) {
+        Agent *other = &env->agents[env->active_agent_indices[other_active_idx]];
+        float heading_cos = ego->cos_heading * other->cos_heading + ego->sin_heading * other->sin_heading;
+        float dx_m = other->sim_x - ego->sim_x;
+        float dy_m = other->sim_y - ego->sim_y;
+        if (other_active_idx == ego_active_idx || other->removed || other->sim_speed < INDUCED_BRAKING_MIN_SPEED_MPS
+            || heading_cos > env->induced_braking_min_heading_cos || dx_m * dx_m + dy_m * dy_m > reach_m * reach_m) {
+            continue;
+        }
+        float required_decel_mps2
+            = required_yield_decel_mps2(env, ego_active_idx, ego->sim_speed, other_active_idx, other->sim_speed);
+        float pair_excess_mps2 = fmaxf(required_decel_mps2 - env->induced_braking_threshold_mps2, 0.0f);
+        int right_of_way_mode = right_of_way(env, ego_active_idx, other_active_idx);
+        if (right_of_way_mode == RIGHT_OF_WAY_EGO_YIELDS) {
+            *must_yield_excess_mps2 += pair_excess_mps2;
+            pair_excess_mps2 *= env->induced_braking_must_yield_scale;
+        } else if (right_of_way_mode == RIGHT_OF_WAY_EGO_PRIORITY) {
+            pair_excess_mps2 *= env->induced_braking_has_priority_scale;
+        }
+        excess_mps2 += pair_excess_mps2;
+    }
+    return excess_mps2;
+}
+
+// Lowest of the lane limit, the conditioned speed cap and the comfortable cornering speed over the route ahead
+static float compute_clear_target_speed_mps(Drive *env, int active_idx) {
+    Agent *agent = &env->agents[env->active_agent_indices[active_idx]];
+    const float *path_xy = &env->route_path_xy[active_idx * ROUTE_PATH_MAX_POINTS * 2];
+    int point_count = env->route_path_point_count[active_idx];
+    if (point_count < 2) {
+        return 0.0f;
+    }
+    float target_speed_mps = env->base_max_speed_mps * agent->reward_coefs[REWARD_COEF_SPEED];
+    if (agent->current_lane_idx != -1 && env->lane_speed_limit_mps[agent->current_lane_idx] > 0.0f) {
+        target_speed_mps = fminf(target_speed_mps, env->lane_speed_limit_mps[agent->current_lane_idx]);
+    }
+    int baseline = HESITATION_CURVATURE_BASELINE_POINTS;
+    float baseline_m = baseline * ROUTE_PATH_SPACING_M;
+    float max_curvature_per_m = 0.0f;
+    for (int point_idx = 0; point_idx + 2 * baseline < point_count; point_idx++) {
+        if (point_idx * ROUTE_PATH_SPACING_M > HESITATION_CURVE_LOOKAHEAD_M) {
+            break;
+        }
+        const float *p0 = &path_xy[2 * point_idx];
+        const float *p1 = &path_xy[2 * (point_idx + baseline)];
+        const float *p2 = &path_xy[2 * (point_idx + 2 * baseline)];
+        float turn_rad = compute_heading_diff(atan2f(p2[1] - p1[1], p2[0] - p1[0]), atan2f(p1[1] - p0[1], p1[0] - p0[0]));
+        max_curvature_per_m = fmaxf(max_curvature_per_m, fabsf(turn_rad) / baseline_m);
+    }
+    if (max_curvature_per_m > 0.0f) {
+        target_speed_mps = fminf(target_speed_mps, sqrtf(HESITATION_LATERAL_ACCEL_MPS2 / max_curvature_per_m));
+    }
+    return target_speed_mps;
+}
+
+// The path's first last_point_idx segments cross the stop line in its travel direction
+static int route_path_crosses_stop_line(const float *path_xy, int last_point_idx, const StopLineFrame *frame) {
+    for (int point_idx = 0; point_idx < last_point_idx; point_idx++) {
+        const float *p0 = &path_xy[2 * point_idx];
+        const float *p1 = &path_xy[2 * point_idx + 2];
+        float s0_m = (p0[0] - frame->mid_x) * frame->along_x + (p0[1] - frame->mid_y) * frame->along_y;
+        float s1_m = (p1[0] - frame->mid_x) * frame->along_x + (p1[1] - frame->mid_y) * frame->along_y;
+        if (!(s0_m < 0.0f && s1_m >= 0.0f)) {
+            continue;
+        }
+        float crossing_frac = s0_m / (s0_m - s1_m);
+        float cross_x = p0[0] + crossing_frac * (p1[0] - p0[0]);
+        float cross_y = p0[1] + crossing_frac * (p1[1] - p0[1]);
+        float lateral_m = -(cross_x - frame->mid_x) * frame->along_y + (cross_y - frame->mid_y) * frame->along_x;
+        return fabsf(lateral_m) <= frame->half_len + HESITATION_STOP_LINE_LATERAL_MARGIN_M;
+    }
+    return 0;
+}
+
+// A red or yellow light, or an enabled stop or yield sign, lies on the route within reach
+static int is_route_blocked_by_control(Drive *env, int active_idx, float reach_m) {
+    Agent *agent = &env->agents[env->active_agent_indices[active_idx]];
+    const float *path_xy = &env->route_path_xy[active_idx * ROUTE_PATH_MAX_POINTS * 2];
+    int last_point_idx = (int) (reach_m / ROUTE_PATH_SPACING_M);
+    last_point_idx = last_point_idx < env->route_path_point_count[active_idx] - 1
+        ? last_point_idx
+        : env->route_path_point_count[active_idx] - 1;
+    for (int tc_idx = 0; tc_idx < env->num_traffic_elements; tc_idx++) {
+        TrafficControlElement *tc = &env->traffic_elements[tc_idx];
+        int light_stopping = tc->type == TRAFFIC_CONTROL_TYPE_TRAFFIC_LIGHT && env->traffic_lights_enabled
+            && env->timestep < tc->state_size
+            && (tc->states[env->timestep] == TRAFFIC_CONTROL_STATE_RED
+                || tc->states[env->timestep] == TRAFFIC_CONTROL_STATE_YELLOW);
+        int sign_stopping = (tc->type == TRAFFIC_CONTROL_TYPE_STOP_SIGN && env->stop_signs_enabled)
+            || (tc->type == TRAFFIC_CONTROL_TYPE_YIELD_SIGN && env->yield_signs_enabled);
+        StopLineFrame frame;
+        if (!(light_stopping || sign_stopping) || !compute_stop_line_frame(tc, &frame)
+            || fabsf(agent->sim_z - 0.5f * (tc->stop_line[2] + tc->stop_line[5])) > Z_BUFFER) {
+            continue;
+        }
+        float dx_m = frame.mid_x - agent->sim_x;
+        float dy_m = frame.mid_y - agent->sim_y;
+        float reach_with_line_m = reach_m + frame.half_len;
+        if (dx_m * dx_m + dy_m * dy_m > reach_with_line_m * reach_with_line_m) {
+            continue;
+        }
+        if (route_path_crosses_stop_line(path_xy, last_point_idx, &frame)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// At ego_speed_mps nobody would brake for ego, ego would not brake for anybody, and no stop line is ahead
+static int is_way_clear(Drive *env, int ego_active_idx, float ego_speed_mps) {
+    Agent *ego = &env->agents[env->active_agent_indices[ego_active_idx]];
+    float horizon_seconds = env->induced_braking_sample_count * INDUCED_BRAKING_SAMPLE_SECONDS;
+    float reach_m = ego_speed_mps * horizon_seconds + ROUTE_PATH_MAX_POINTS * ROUTE_PATH_SPACING_M;
+    for (int other_active_idx = 0; other_active_idx < env->active_agent_count; other_active_idx++) {
+        Agent *other = &env->agents[env->active_agent_indices[other_active_idx]];
+        float dx_m = other->sim_x - ego->sim_x;
+        float dy_m = other->sim_y - ego->sim_y;
+        if (other_active_idx == ego_active_idx || other->removed || dx_m * dx_m + dy_m * dy_m > reach_m * reach_m) {
+            continue;
+        }
+        float heading_cos = ego->cos_heading * other->cos_heading + ego->sin_heading * other->sin_heading;
+        int other_could_yield = other->sim_speed >= INDUCED_BRAKING_MIN_SPEED_MPS && heading_cos <= env->induced_braking_min_heading_cos;
+        if (other_could_yield
+            && required_yield_decel_mps2(env, ego_active_idx, ego_speed_mps, other_active_idx, other->sim_speed)
+                > env->induced_braking_threshold_mps2) {
+            return 0;
+        }
+        if (required_yield_decel_mps2(env, other_active_idx, other->sim_speed, ego_active_idx, ego_speed_mps)
+            > env->induced_braking_threshold_mps2) {
+            return 0;
+        }
+    }
+    float stopping_reach_m = ego_speed_mps * horizon_seconds
+        + ego_speed_mps * ego_speed_mps / (2.0f * HESITATION_COMFORT_DECEL_MPS2);
+    return !is_route_blocked_by_control(env, ego_active_idx, stopping_reach_m);
+}
+
+// Ego, moving, hit a crossing or oncoming active car it should have yielded to
+static int is_must_yield_collision(Drive *env, int ego_active_idx) {
+    Agent *ego = &env->agents[env->active_agent_indices[ego_active_idx]];
+    int partner_idx = ego->first_collision_partner_idx;
+    if (ego->sim_speed <= AGENT_STOPPED_SPEED_THRESHOLD) {
+        return 0;
+    }
+    for (int other_active_idx = 0; other_active_idx < env->active_agent_count; other_active_idx++) {
+        if (env->active_agent_indices[other_active_idx] != partner_idx) {
+            continue;
+        }
+        Agent *other = &env->agents[partner_idx];
+        float heading_cos = ego->cos_heading * other->cos_heading + ego->sin_heading * other->sin_heading;
+        return heading_cos <= env->induced_braking_min_heading_cos
+            && right_of_way(env, ego_active_idx, other_active_idx) == RIGHT_OF_WAY_EGO_YIELDS;
+    }
+    return 0;
 }
 
 static void compute_rewards(Drive *env, int i) {
@@ -4734,6 +5171,11 @@ static void compute_rewards(Drive *env, int i) {
         env->rewards[i] += reward_collision;
         agent_log->collision_rate = 1.0f;
         agent_log->reward_collision += reward_collision;
+        if (env->reward_collision_must_yield > 0.0f && is_must_yield_collision(env, i)) {
+            env->rewards[i] -= env->reward_collision_must_yield;
+            agent_log->reward_collision_must_yield -= env->reward_collision_must_yield;
+            agent_log->must_yield_collision_rate = 1.0f;
+        }
     }
 
     // Offroad reward
@@ -4818,9 +5260,42 @@ static void compute_rewards(Drive *env, int i) {
 
     // Reverse reward
     if (agent->sim_speed_signed < -0.01f) {
-        float reverse_penalty = -agent->reward_coefs[REWARD_COEF_REVERSE] * env->dt;
+        // fixed part is outside the conditioned coefs, so the policy cannot be told to ignore it
+        float reverse_penalty
+            = -(agent->reward_coefs[REWARD_COEF_REVERSE] + env->reward_reverse_fixed_per_second) * env->dt;
         env->rewards[i] += reverse_penalty;
         agent_log->reward_reverse += reverse_penalty;
+    }
+
+    if (agent->off_route_triggered) {
+        float off_route_penalty = -env->reward_off_route;
+        env->rewards[i] += off_route_penalty;
+        agent_log->off_route_count += 1.0f;
+        agent_log->reward_off_route += off_route_penalty;
+    }
+
+    // blind and phantom agents are masked out of training, so their penalty would be wasted work
+    if (env->reward_induced_braking > 0.0f && !agent->is_blind_partner && !agent->is_phantom_braker
+        && agent->sim_speed >= INDUCED_BRAKING_MIN_SPEED_MPS) {
+        float must_yield_excess_mps2;
+        float induced_braking_excess_mps2 = compute_induced_braking_excess_mps2(env, i, &must_yield_excess_mps2);
+        float induced_braking_penalty = -env->reward_induced_braking * induced_braking_excess_mps2 * env->dt;
+        env->rewards[i] += induced_braking_penalty;
+        agent_log->reward_induced_braking += induced_braking_penalty;
+        agent_log->induced_braking_seconds += induced_braking_excess_mps2 > 0.0f ? env->dt : 0.0f;
+        agent_log->induced_braking_must_yield_seconds += must_yield_excess_mps2 > 0.0f ? env->dt : 0.0f;
+    }
+
+    if (env->reward_hesitation > 0.0f && !agent->is_blind_partner && !agent->is_phantom_braker) {
+        float target_speed_mps = compute_clear_target_speed_mps(env, i);
+        float floor_speed_mps = fminf(HESITATION_TARGET_FRACTION * target_speed_mps, HESITATION_MAX_FLOOR_SPEED_MPS);
+        float forward_speed_mps = fmaxf(agent->sim_speed_signed, 0.0f);
+        if (forward_speed_mps < floor_speed_mps && is_way_clear(env, i, target_speed_mps)) {
+            float hesitation_penalty = -env->reward_hesitation * (1.0f - forward_speed_mps / floor_speed_mps) * env->dt;
+            env->rewards[i] += hesitation_penalty;
+            agent_log->reward_hesitation += hesitation_penalty;
+            agent_log->hesitation_seconds += env->dt;
+        }
     }
 
     // Speed limit reward
@@ -4970,6 +5445,23 @@ typedef struct {
     int agent_idx;
 } PartnerScanEntry;
 
+static int is_partner_visible_while_blind(Drive *env, Agent *ego, Agent *other) {
+    float rel_x, rel_y;
+    project_point_to_ego_frame(ego, other->sim_x, other->sim_y, &rel_x, &rel_y);
+    if (env->partner_blindness_facing_away) {
+        float away_projection_m
+            = (other->sim_x - ego->sim_x) * other->cos_heading + (other->sim_y - ego->sim_y) * other->sin_heading;
+        float distance_m = sqrtf(rel_x * rel_x + rel_y * rel_y);
+        return rel_x > 0.0f && away_projection_m >= PARTNER_BLINDNESS_FACING_AWAY_COS * distance_m;
+    }
+    float rel_heading_x, rel_heading_y;
+    project_vector_to_ego_frame(ego, other->cos_heading, other->sin_heading, &rel_heading_x, &rel_heading_y);
+    float lateral_half_extent_m
+        = 0.5f * (fabsf(rel_heading_y) * other->sim_length + fabsf(rel_heading_x) * other->sim_width);
+    return rel_x > 0.0f
+        && fabsf(rel_y) <= lateral_half_extent_m + 0.5f * ego->sim_width + PARTNER_BLINDNESS_CORRIDOR_MARGIN_M;
+}
+
 static int write_partner_obs(
     Drive *env,
     Agent *ego,
@@ -4978,7 +5470,7 @@ static int write_partner_obs(
     float *obs,
     int obs_idx,
     int *partner_count) {
-    // Blind steps hide all partners, or with partner_blindness_corridor only those outside the forward corridor
+    // Blind steps hide all partners, or only those outside the forward corridor / not driving away ahead
     if (ego->partner_blindness_counter > 0) {
         ego->partner_blindness_counter--;
     }
@@ -4987,13 +5479,12 @@ static int write_partner_obs(
         ego->partner_blindness_counter = env->partner_blindness_duration;
     }
     int blind = ego->partner_blindness_counter > 0;
-    if (blind && !env->partner_blindness_corridor) {
+    if (blind && !env->partner_blindness_corridor && !env->partner_blindness_facing_away) {
         int partner_obs_stride = env->obs_slots_partners_n * partner_feature_count(env);
         memset(&obs[obs_idx], 0, partner_obs_stride * sizeof(float));
         *partner_count = 0;
         return obs_idx + partner_obs_stride;
     }
-    int corridor_only = blind;
 
     typedef struct {
         int index;
@@ -5008,17 +5499,8 @@ static int write_partner_obs(
         float dy = partner_scan[j].y - ego->sim_y;
         float dz = partner_scan[j].z - ego->sim_z;
         float dist_sq = dx * dx + dy * dy + dz * dz;
-        int partner_visible = 1;
-        if (corridor_only) {
-            Agent *other = &env->agents[partner_scan[j].agent_idx];
-            float rel_x, rel_y, rel_heading_x, rel_heading_y;
-            project_point_to_ego_frame(ego, other->sim_x, other->sim_y, &rel_x, &rel_y);
-            project_vector_to_ego_frame(ego, other->cos_heading, other->sin_heading, &rel_heading_x, &rel_heading_y);
-            float lateral_half_extent_m
-                = 0.5f * (fabsf(rel_heading_y) * other->sim_length + fabsf(rel_heading_x) * other->sim_width);
-            partner_visible = rel_x > 0.0f
-                && fabsf(rel_y) <= lateral_half_extent_m + 0.5f * ego->sim_width + PARTNER_BLINDNESS_CORRIDOR_MARGIN_M;
-        }
+        Agent *partner = &env->agents[partner_scan[j].agent_idx];
+        int partner_visible = !blind || is_partner_visible_while_blind(env, ego, partner);
         nearby_agents[nearby_count].index = partner_scan[j].agent_idx;
         nearby_agents[nearby_count].dist_sq = dist_sq;
         nearby_agents[nearby_count].dz = dz;
@@ -5946,6 +6428,13 @@ void c_step(Drive *env) {
         }
     }
 
+    if (route_prediction_enabled(env)) {
+        for (int i = 0; i < env->active_agent_count; i++) {
+            predict_route_path(env, i);
+            predict_route_junction(env, i);
+        }
+    }
+
     // -> 2. Compute metrics and rewards
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
@@ -6296,6 +6785,14 @@ int c_hypothesis_scene_begin(Drive *scene, Drive *src, const int *ghost_sources,
     scene->predict_state = owned.predict_state;
     scene->hypothesis_agent_capacity = owned.hypothesis_agent_capacity;
     scene->hypothesis_active_capacity = owned.hypothesis_active_capacity;
+    // src's route path buffers are sized without ghosts, and hypothesis rewards are never read
+    scene->reward_induced_braking = 0.0f;
+    scene->reward_collision_must_yield = 0.0f;
+    scene->reward_hesitation = 0.0f;
+    scene->route_path_xy = NULL;
+    scene->route_path_point_count = NULL;
+    scene->route_junction_turn_rad = NULL;
+    scene->route_junction_approach_heading = NULL;
     int src_active_count = src->active_agent_count;
     scene->num_total_agents = src->num_total_agents + ghost_count;
     scene->active_agent_count = src_active_count + ghost_count;

@@ -40,7 +40,12 @@ import pufferlib.pytorch
 import pufferlib.spaces
 from pufferlib.ocean.cosim.arch import checkpoint_config_path, shadow_env_kwargs
 from pufferlib.ocean.cosim.goals import RouteGoalWindow, route_goals_from_xy
-from pufferlib.ocean.cosim.joint_prediction import GOAL_COLUMNS, GoalInference
+from pufferlib.ocean.cosim.joint_prediction import (
+    GOAL_COLUMNS,
+    LIKELIHOOD_ACTION,
+    LIKELIHOOD_VALUE,
+    GoalInference,
+)
 from pufferlib.ocean.cosim.nuplan_bridge import DEFAULT_ARCH, FAR_AWAY, LIGHT_STATE_GREEN, goals_along
 from pufferlib.ocean.cosim.simian.debug import POOL_NAMES, decode_observation
 from pufferlib.ocean.cosim.simian.drawn_map import DrawnMap
@@ -61,11 +66,15 @@ DEFAULT_MAX_STEPS = 6000
 DEFAULT_MAX_PARTNERS = 63
 DEFAULT_GOAL_SPACING_M = 30.0
 DEFAULT_ROLLOUT_HORIZON_S = 0.0
+# Training-only rewards the env refuses without goal_source=route, which co-sim cannot use
+ROUTE_ONLY_REWARDS = ("reward_off_route", "reward_induced_braking", "reward_hesitation", "reward_collision_must_yield")
 ACTOR_PREDICTION_CONSTANT_VELOCITY = "constant-velocity"
 ACTOR_PREDICTION_JOINT = "joint"
 ACTOR_PREDICTION_ROBUST = "robust"
 STATIC_ROLLOUT_ACTORS_STANDING = "standing"
 STATIC_ROLLOUT_ACTORS_NONE = "none"
+ACTOR_WIDTH_MEASURED = "measured"
+ACTOR_WIDTH_MAX = "max"
 # The eval's robust_prediction_* defaults in puffer_drive.yaml.
 DEFAULT_ROBUST_PREDICTION_MIN_BELIEF = 0.1
 DEFAULT_ROBUST_PREDICTION_MAX_ROUTES = 3
@@ -79,8 +88,10 @@ MIN_REWARD_REVERSE = 2.5e-4  # REWARD_BOUNDS[REWARD_COEF_REVERSE] in drive.h, th
 MAX_REWARD_REVERSE = 7.5e-3
 # The eval's goal_inference_* defaults in puffer_drive.yaml.
 DEFAULT_GOAL_INFERENCE_HYPOTHESES = 8
-DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M = 10.0
-DEFAULT_GOAL_INFERENCE_UPDATE_S = 1.0
+DEFAULT_GOAL_INFERENCE_GOAL_SPACING_M = 20.0
+DEFAULT_GOAL_INFERENCE_UPDATE_S = 2.0
+DEFAULT_GOAL_INFERENCE_LIKELIHOOD = LIKELIHOOD_ACTION
+DEFAULT_GOAL_INFERENCE_JERK_STD_MPS3 = 0.3
 DEFAULT_GOAL_INFERENCE_BETA = 10.0
 DEFAULT_GOAL_INFERENCE_FORGETTING = 0.01
 STEP_LOG_INTERVAL_STEPS = 10
@@ -161,6 +172,7 @@ class PolicySession:
         self.actor_slot_count = int(args.joint_prediction_actors) if joint else 0
         self.min_moving_speed_mps = float(args.min_moving_speed_mps)
         self.actor_size_margin_m = float(args.actor_size_margin_m)
+        self.actor_width = args.actor_width
         self.static_rollout_anchor_offset_m = float(args.static_rollout_anchor_offset_m)
         self.static_rollout_keeps_standing = args.static_rollout_actors == STATIC_ROLLOUT_ACTORS_STANDING
         self.previous_static_rollout = None
@@ -194,6 +206,7 @@ class PolicySession:
             "offroad_behavior": "ignore",
             "traffic_light_behavior": "ignore",
             "reward_reverse": float(args.reward_reverse),
+            **{reward: 0.0 for reward in ROUTE_ONLY_REWARDS},
         }
         if request.get("dt"):
             overrides["dt"] = float(request["dt"])
@@ -230,6 +243,8 @@ class PolicySession:
         )
 
         cfg["policy"].setdefault("action_type", cfg["env"]["action_type"])
+        # The fused encoder is a CUDA bf16 training kernel over the same weights; inference takes the dense path.
+        cfg["policy"]["fused_slot_encoder"] = False
         policy = getattr(drive_torch, cfg.get("policy_name", "Drive"))(self.env, **cfg["policy"])
         policy.load_state_dict(clean_policy_state_dict(torch.load(checkpoint, map_location=device, weights_only=False)))
         self.policy = policy.to(device).eval()
@@ -255,6 +270,10 @@ class PolicySession:
         self.reference = None
         self.goal_inference = None
         if joint:
+            if args.goal_inference_likelihood == LIKELIHOOD_ACTION and not (
+                self.env_continuous and not self.policy.is_continuous
+            ):
+                raise ValueError("--goal-inference-likelihood action needs a discrete policy on a continuous env")
             self.goal_inference = GoalInference(
                 bin_path,
                 num_goals=self.env.num_goals,
@@ -267,6 +286,8 @@ class PolicySession:
                 goal_radius_m=self.env.goal_radius,
                 reward_goal=self.env.reward_goal,
                 horizon_s=args.rollout_horizon_s,
+                likelihood=args.goal_inference_likelihood,
+                jerk_std=(args.goal_inference_jerk_std_long_mps3, args.goal_inference_jerk_std_lat_mps3),
             )
 
     def _set_ego(self, ego, ex, ey, accel_long):
@@ -373,9 +394,10 @@ class PolicySession:
             (partners["stopped_s"] + stopped * elapsed_s).astype(np.float32),
         )
 
-    def _advance_goal_inference(self, actors):
+    def _advance_goal_inference(self, actors, time_s):
         """Advance goal inference for the nearest moving tracked actors no larger than the policy was trained with
-        until the actor slots are full; returns the ids of those with a way ahead, which the joint rollout drives."""
+        until the actor slots are full, seen at time_s; returns the ids of those with a way ahead, which the joint
+        rollout drives."""
         predicted_ids, advanced_ids = [], []
         for actor in actors:
             if len(predicted_ids) == self.actor_slot_count:
@@ -384,14 +406,16 @@ class PolicySession:
                 continue
             bx, by = self.map.to_bin(float(actor["x"]), float(actor["y"]))
             heading = self.map.heading_to_bin(float(actor["heading"]))
+            along_heading = actor["vx"] * math.cos(actor["heading"]) + actor["vy"] * math.sin(actor["heading"])
+            speed_mps = math.copysign(math.hypot(actor["vx"], actor["vy"]), along_heading)
             advanced_ids.append(actor["id"])
-            if self.goal_inference.advance(actor["id"], float(bx), float(by), float(heading)):
+            if self.goal_inference.advance(actor["id"], float(bx), float(by), float(heading), speed_mps, time_s):
                 predicted_ids.append(actor["id"])
         self.goal_inference.retain(advanced_ids)
         return set(predicted_ids)
 
     def _update_goal_beliefs(self):
-        """Update the predicted actors' beliefs with the critic values of their goal windows."""
+        """Update the predicted actors' beliefs with the critic values and mean jerks of their goal windows."""
         if self.predicted is None:
             return
         inference = self.goal_inference
@@ -404,13 +428,18 @@ class PolicySession:
         obs = np.zeros((*counts.shape, self.env.observations.shape[1]), np.float32)
         self.env.goal_window_observations(windows, counts, obs)
         values = np.zeros(counts.shape, np.float32)
+        mean_jerks = np.zeros((*counts.shape, 2), np.float32)
         valid = counts > 0
         if valid.any():
             with torch.no_grad():
-                _, value = self.policy.forward_eval(torch.as_tensor(obs[valid]).to(self.device))
+                logits, value = self.policy.forward_eval(torch.as_tensor(obs[valid]).to(self.device))
+                if inference.likelihood == LIKELIHOOD_ACTION:
+                    # The env decode is piecewise, so the mean is taken over the physical jerks.
+                    probs = torch.softmax(logits.float(), dim=-1)
+                    mean_jerks[valid] = (probs @ self.policy.action_table_physical.float()).cpu().numpy()
             values[valid] = value.reshape(-1).float().cpu().numpy()
         for row, actor_id in zip(self.predicted["idx"], self.predicted["ids"]):
-            inference.update(actor_id, values[row])
+            inference.update(actor_id, values[row], mean_jerks[row])
 
     def _set_lights(self, light_states):
         if not self.map.num_traffic:
@@ -557,6 +586,34 @@ class PolicySession:
             float(x),
             float(y),
             heading,
+            interpolated("speed_mps"),
+            interpolated("accel_long_mps2"),
+            interpolated("curvature_inv_m"),
+        )
+
+    def _open_loop_anchor(self, time_ns):
+        """The pose [map frame], signed speed [m/s], acceleration [m/s^2] and curvature [1/m] of the previous rollout
+        at time_ns, linear between its points, for the policy to step open loop from; None without one."""
+        if self.reference is None:
+            return None
+        points = self.reference["points"]
+        elapsed_s = (time_ns - self.reference["time_ns"]) / NS_PER_S
+        if not points[0]["t"] <= elapsed_s <= points[-1]["t"]:
+            raise ValueError(
+                f"open loop step {elapsed_s:.3f} s after the previous rollout, outside its {points[-1]['t']} s"
+            )
+        after_idx = next(i for i in range(1, len(points)) if elapsed_s <= points[i]["t"])
+        before, after = points[after_idx - 1], points[after_idx]
+        fraction = (elapsed_s - before["t"]) / (after["t"] - before["t"])
+
+        def interpolated(key):
+            return before[key] + fraction * (after[key] - before[key])
+
+        heading_step = math.remainder(after["heading"] - before["heading"], 2 * math.pi)
+        return (
+            interpolated("x"),
+            interpolated("y"),
+            before["heading"] + fraction * heading_step,
             interpolated("speed_mps"),
             interpolated("accel_long_mps2"),
             interpolated("curvature_inv_m"),
@@ -730,24 +787,50 @@ class PolicySession:
             "value": float(value.reshape(-1)[EGO_SLOT]),
         }
 
+    def _actor_width_m(self, actor):
+        width_m = float(actor["width"]) + 2 * self.actor_size_margin_m
+        if self.actor_width == ACTOR_WIDTH_MAX:
+            return max(width_m, MAX_PARTNER_WIDTH_M)
+        return width_m
+
     def step(self, request):
         if self.env.tick >= self.scenario_length - 1:
             raise RuntimeError(f"shadow env reached scenario_length {self.scenario_length}; raise --max-steps")
         ego = request["ego"]
+        anchor = self._open_loop_anchor(int(request["time_ns"])) if request.get("open_loop", False) else None
+        if anchor is not None:
+            x, y, heading, speed_mps, accel_mps2, curvature_inv_m = anchor
+            ego = {
+                **ego,
+                "x": x,
+                "y": y,
+                "heading": heading,
+                "vx": speed_mps * math.cos(heading),
+                "vy": speed_mps * math.sin(heading),
+                "yaw_rate": speed_mps * curvature_inv_m,
+                "accel_long": accel_mps2,
+            }
         ex, ey = self.map.to_bin(float(ego["x"]), float(ego["y"]))
         self._update_stopped_times(ego, request["actors"])
-        self._set_ego(ego, ex, ey, accel_long=float(ego["accel_long"]))
+        if anchor is None:
+            self._set_ego(ego, ex, ey, accel_long=float(ego["accel_long"]))
+        else:
+            self._anchor_ego(anchor)
         actors = [
             {
                 **actor,
                 "length": float(actor["length"]) + 2 * self.actor_size_margin_m,
-                "width": float(actor["width"]) + 2 * self.actor_size_margin_m,
+                "width": self._actor_width_m(actor),
             }
             for actor in sorted(
                 request["actors"], key=lambda a: (a["x"] - float(ego["x"])) ** 2 + (a["y"] - float(ego["y"])) ** 2
             )[: self.max_partners]
         ]
-        predicted_ids = set() if self.goal_inference is None else self._advance_goal_inference(actors)
+        predicted_ids = (
+            set()
+            if self.goal_inference is None
+            else self._advance_goal_inference(actors, int(request["time_ns"]) / NS_PER_S)
+        )
         self._set_partners(actors, predicted_ids)
         self._set_lights(request["traffic_light_states"])
         self.goal_window.sync(ex, ey, self.map.heading_to_bin(float(ego["heading"])))
@@ -967,6 +1050,13 @@ def main():
         help="margin every actor's box is grown by on each side before the policy sees it",
     )
     parser.add_argument(
+        "--actor-width",
+        choices=[ACTOR_WIDTH_MEASURED, ACTOR_WIDTH_MAX],
+        default=ACTOR_WIDTH_MAX,
+        help="the width of every actor's box the policy sees, after the margin: as measured, or at least the widest "
+        "it trains with",
+    )
+    parser.add_argument(
         "--static-rollout-actors",
         choices=[STATIC_ROLLOUT_ACTORS_STANDING, STATIC_ROLLOUT_ACTORS_NONE],
         default=STATIC_ROLLOUT_ACTORS_NONE,
@@ -991,6 +1081,15 @@ def main():
     parser.add_argument("--goal-inference-update-s", type=float, default=DEFAULT_GOAL_INFERENCE_UPDATE_S)
     parser.add_argument("--goal-inference-beta", type=float, default=DEFAULT_GOAL_INFERENCE_BETA)
     parser.add_argument("--goal-inference-forgetting", type=float, default=DEFAULT_GOAL_INFERENCE_FORGETTING)
+    parser.add_argument(
+        "--goal-inference-likelihood",
+        choices=(LIKELIHOOD_ACTION, LIKELIHOOD_VALUE),
+        default=DEFAULT_GOAL_INFERENCE_LIKELIHOOD,
+        help="how a route is scored by the actor's last move: action, a Gaussian on the jerk it drove around the "
+        "policy's mean jerk toward that route; value, the critic's advantage under that route",
+    )
+    parser.add_argument("--goal-inference-jerk-std-long-mps3", type=float, default=DEFAULT_GOAL_INFERENCE_JERK_STD_MPS3)
+    parser.add_argument("--goal-inference-jerk-std-lat-mps3", type=float, default=DEFAULT_GOAL_INFERENCE_JERK_STD_MPS3)
     args = parser.parse_args()
     if bool(args.drawn_map) != bool(args.drawn_map_spec):
         parser.error("--drawn-map and --drawn-map-spec go together")
@@ -1022,6 +1121,8 @@ def main():
         parser.error("--goal-inference-goal-spacing-m and -update-s must be positive and -beta not negative")
     if not 0 <= args.goal_inference_forgetting <= 1:
         parser.error("--goal-inference-forgetting must be in [0, 1]")
+    if not (args.goal_inference_jerk_std_long_mps3 > 0 and args.goal_inference_jerk_std_lat_mps3 > 0):
+        parser.error("--goal-inference-jerk-std-long-mps3 and -lat-mps3 must be positive")
     torch.set_num_threads(1)
     server = PolicyServer((args.host, args.port), args)
     log(

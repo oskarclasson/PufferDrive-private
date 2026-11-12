@@ -4,7 +4,9 @@ Usage (from the repo root, venv active):
     python scripts/scenario_editor/server.py --map-dir data/nuplan_mini_val --drawn-map-dir data/drawn_maps \\
         --model weights/k_scaled_0036_1000/final_model.pt --port 8090
 Then open http://localhost:8090 (forward the port over ssh when running remotely). The Map tab draws road
-layouts into --drawn-map-dir; the Scenario tab places traffic on any map from either directory.
+layouts into --drawn-map-dir; the Scenario tab places traffic on any map from either directory. Each evaluation
+picks its policy from the snapshots in --models-dir or the newest checkpoint of a run in --experiments-dir;
+--model is only the preselected one.
 """
 
 import argparse
@@ -49,6 +51,9 @@ EVAL_AGENT_SLOTS = 300
 MIN_GOAL_RADIUS_M = 0.5
 MAX_GOAL_RADIUS_M = 20.0
 MIN_INFERRED_GOAL_SPACING_M = 2.0
+POLICY_FILE_NAME = "final_model.pt"
+RUN_POLICY_PREFIX = "run:"  # policy id of a training run's newest checkpoint, snapshotted when evaluated
+SNAPSHOT_COPY_ATTEMPTS = 3  # training rotates checkpoints, so the newest one can vanish mid-copy
 MAX_INFERRED_GOAL_SPACING_M = 50.0
 SUMMARY_METRIC_KEYS = (
     "active_agent_count",
@@ -99,7 +104,8 @@ class EditorState:
         self.map_dirs = [Path(args.drawn_map_dir).resolve(), Path(args.map_dir).resolve()]  # drawn maps list first
         self.scenario_dir = Path(args.scenario_dir).resolve()
         self.model_path = Path(args.model).resolve()
-        self.eval_root = self.model_path.parent / "eval"
+        self.models_dir = Path(args.models_dir).resolve()
+        self.experiments_dir = Path(args.experiments_dir).resolve()
         self.puffer_executable = shutil.which("puffer") or str(Path(sys.executable).parent / "puffer")
         self.map_cache = {}
         self.lock = threading.Lock()
@@ -174,6 +180,76 @@ class EditorState:
             return None
         return {"lat": float(origin["lat"]), "lon": float(origin["lon"])}
 
+    def policy_id(self, model_path):
+        """Repo-relative checkpoint path, the id a policy is listed, requested and recorded under."""
+        return model_path.relative_to(REPO_ROOT).as_posix() if REPO_ROOT in model_path.parents else str(model_path)
+
+    def list_policies(self):
+        """Newest checkpoint of every training run, then every snapshot, newest first; the default is always listed."""
+        policies = []
+        run_dirs = sorted(p.parent for p in self.experiments_dir.glob("*/config.yaml")) if self.experiments_dir.exists() else []
+        for run_dir in run_dirs:
+            checkpoint = self.newest_run_checkpoint(run_dir)
+            if checkpoint is None:
+                continue
+            stage = "final" if checkpoint.name == POLICY_FILE_NAME else f"epoch {int(checkpoint.stem.split('_')[-1])}"
+            try:
+                checkpoint_mtime = checkpoint.stat().st_mtime
+            except FileNotFoundError:  # rotated away since the glob; the run is listed again on the next request
+                continue
+            policies.append({
+                "id": RUN_POLICY_PREFIX + run_dir.name,
+                "label": f"{run_dir.name} (training run, newest: {stage})",
+                "mtime": checkpoint_mtime,
+            })
+        snapshot_paths = {p.resolve() for p in self.models_dir.glob(f"*/{POLICY_FILE_NAME}")} if self.models_dir.exists() else set()
+        snapshot_paths.add(self.model_path)
+        snapshots = [
+            {"id": self.policy_id(path), "label": path.parent.name, "mtime": path.stat().st_mtime}
+            for path in snapshot_paths
+            if (path.parent / "config.yaml").is_file()
+        ]
+        snapshots.sort(key=lambda policy: policy["mtime"], reverse=True)
+        return policies + snapshots
+
+    def newest_run_checkpoint(self, run_dir):
+        final_path = run_dir / POLICY_FILE_NAME
+        if final_path.is_file():
+            return final_path
+        checkpoints = sorted((run_dir / "models").glob("*.pt"))
+        return checkpoints[-1] if checkpoints else None
+
+    def snapshot_run(self, run_name):
+        """Copy a run's newest checkpoint and config into --models-dir so training cannot rotate it away mid-eval."""
+        run_dir = self.experiments_dir / run_name
+        for _ in range(SNAPSHOT_COPY_ATTEMPTS):
+            checkpoint = self.newest_run_checkpoint(run_dir)
+            if checkpoint is None:
+                raise scenario_builder.ScenarioSpecError(f"training run {run_name} has no checkpoint yet")
+            stage = "final" if checkpoint.name == POLICY_FILE_NAME else f"ep{checkpoint.stem.split('_')[-1]}"
+            snapshot_dir = self.models_dir / f"{run_name}_{stage}"
+            snapshot_path = snapshot_dir / POLICY_FILE_NAME
+            if snapshot_path.is_file():
+                return snapshot_path
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            partial_path = snapshot_dir / (POLICY_FILE_NAME + ".part")
+            try:
+                shutil.copyfile(checkpoint, partial_path)
+            except FileNotFoundError:
+                continue
+            shutil.copyfile(run_dir / "config.yaml", snapshot_dir / "config.yaml")
+            partial_path.rename(snapshot_path)
+            return snapshot_path
+        raise scenario_builder.ScenarioSpecError(f"could not copy a checkpoint of {run_name}; try again")
+
+    def resolve_policy(self, policy_id):
+        """Checkpoint path for a listed policy id; anything not listed is rejected."""
+        if not any(policy["id"] == policy_id for policy in self.list_policies()):
+            raise scenario_builder.ScenarioSpecError(f"unknown policy {policy_id!r}")
+        if policy_id.startswith(RUN_POLICY_PREFIX):
+            return self.snapshot_run(policy_id[len(RUN_POLICY_PREFIX) :])
+        return (REPO_ROOT / policy_id).resolve()
+
     def scenario_paths(self, scenario_name):
         if not SCENARIO_NAME_PATTERN.match(scenario_name):
             raise scenario_builder.ScenarioSpecError("name must be 1-64 characters of letters, digits, _ or -")
@@ -212,8 +288,9 @@ class EditorState:
             raise scenario_builder.ScenarioSpecError(
                 f"inferred goal spacing must be {MIN_INFERRED_GOAL_SPACING_M:g}-{MAX_INFERRED_GOAL_SPACING_M:g} m"
             )
-        if request.get("robust_control") and request.get("mppi", True):
+        if request.get("robust_control") and request.get("mppi", False):
             raise scenario_builder.ScenarioSpecError("the ego follows MPPI or the robust plan, not both")
+        model_path = self.resolve_policy(str(request.get("policy") or self.policy_id(self.model_path)))
         with self.lock:
             if any(run["status"] == "running" for run in self.list_runs()):
                 raise scenario_builder.ScenarioSpecError("an evaluation is already running (see Results)")
@@ -232,7 +309,8 @@ class EditorState:
 
             run_label = f"{scenario_name}_{datetime.datetime.now():{RUN_STAMP_FORMAT}}"
             settings = {
-                "mppi": bool(request.get("mppi", True)),
+                "policy": self.policy_id(model_path),
+                "mppi": bool(request.get("mppi", False)),
                 "ego_actor": "none" if ego_actor_idx is None else f"A{ego_actor_idx + 1}",
                 "goal_inference": bool(
                     request.get("goal_inference", False)
@@ -245,8 +323,8 @@ class EditorState:
                     request.get("robust_prediction", False) or request.get("robust_control", False)
                 ),
                 "robust_control": bool(request.get("robust_control", False)),
-                "prediction": bool(request.get("prediction", True)),
-                "capture_observations": bool(request.get("capture_observations", True)),
+                "prediction": bool(request.get("prediction", False)),
+                "capture_observations": bool(request.get("capture_observations", False)),
                 "goal_radius": float(goal_radius),
                 "inferred_goal_spacing_m": float(inferred_goal_spacing_m),
                 "duration_s": float(spec["duration_s"]),
@@ -259,7 +337,7 @@ class EditorState:
                 "eval",
                 "puffer_drive",
                 BENCHMARK_NAME,
-                f"load_model_path={self.model_path}",
+                f"load_model_path={model_path}",
                 f"eval.benchmark_config={benchmark_path}",
                 f"eval.map_dir={bin_path.parent}",
                 "eval.num_scenarios=1",
@@ -296,12 +374,28 @@ class EditorState:
         root = self.scenario_dir / match["scenario"]
         return root / f"eval_{run_label}.log", root / f"eval_{run_label}.json"
 
-    def run_result_dir(self, run_label):
-        output_root = self.eval_root / f"{BENCHMARK_NAME}_{run_label}"
+    def run_output_root(self, run_label, settings):
+        """Where `puffer eval` wrote this run: next to its policy, or found by search for runs that predate the record."""
+        output_name = f"{BENCHMARK_NAME}_{run_label}"
+        if "policy" in settings:
+            return (REPO_ROOT / settings["policy"]).resolve().parent / "eval" / output_name
+        candidates = sorted(self.models_dir.glob(f"*/eval/{output_name}")) + [self.model_path.parent / "eval" / output_name]
+        return next((path for path in candidates if path.exists()), candidates[-1])
+
+    def run_result_dir(self, output_root):
         if not output_root.exists():
             return None
         finished = sorted(p.parent for p in output_root.glob("*/evaluation_summary.json"))
         return finished[-1] if finished else None
+
+    def is_result_file(self, target):
+        """Only files inside some policy's eval/ directory are served."""
+        eval_dirs = [parent for parent in target.parents if parent.name == "eval"]
+        return target.is_file() and any(
+            (eval_dir.parent / "config.yaml").is_file()
+            and (self.models_dir in eval_dir.parents or eval_dir.parent == self.model_path.parent)
+            for eval_dir in eval_dirs
+        )
 
     def describe_run(self, log_path):
         run_label = log_path.stem[len("eval_") :]
@@ -311,7 +405,9 @@ class EditorState:
         settings_path = log_path.with_suffix(".json")
         settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
         started = datetime.datetime.strptime(match["stamp"], RUN_STAMP_FORMAT)
-        result_dir = self.run_result_dir(run_label)
+        output_root = self.run_output_root(run_label, settings)
+        settings.setdefault("policy", self.policy_id(output_root.parent.parent / POLICY_FILE_NAME))
+        result_dir = self.run_result_dir(output_root)
         pid = None if result_dir else find_eval_pid(run_label)
         status = "done" if result_dir else ("running" if pid else "failed")
         if status == "failed" and log_path.with_suffix(".stopped").exists():
@@ -333,7 +429,7 @@ class EditorState:
         run["metrics"] = summary
         replays = sorted((result_dir / "rendered_replays").glob("custom__*.html"))
         if replays:
-            run["replay_url"] = "/results/" + replays[0].relative_to(self.eval_root).as_posix()
+            run["replay_url"] = "/results/" + replays[0].relative_to(REPO_ROOT).as_posix()
         return run
 
     def list_runs(self):
@@ -412,13 +508,16 @@ def make_handler(state, map_editor_state, map_spec_error):
                 if url.path == "/api/scenario":
                     _, spec_path, _ = state.scenario_paths(query.get("name", ""))
                     return self._send(200, json.loads(spec_path.read_text()))
+                if url.path == "/api/policies":
+                    policies = [{"id": p["id"], "label": p["label"]} for p in state.list_policies()]
+                    return self._send(200, {"policies": policies, "default": state.policy_id(state.model_path)})
                 if url.path == "/api/runs":
                     return self._send(200, {"runs": state.list_runs()})
                 if url.path == "/api/run":
                     return self._send(200, state.run_detail(query.get("label", "")))
                 if url.path.startswith("/results/"):
-                    target = (state.eval_root / unquote(url.path[len("/results/") :])).resolve()
-                    if state.eval_root not in target.parents or not target.is_file():
+                    target = (REPO_ROOT / unquote(url.path[len("/results/") :])).resolve()
+                    if REPO_ROOT not in target.parents or not state.is_result_file(target):
                         return self._send(404, {"error": "not found"})
                     return self._send_file(target)
             except (KeyError, FileNotFoundError):
@@ -459,7 +558,9 @@ def main():
     parser.add_argument("--map-dir", default="data/nuplan_mini_val", help="Directory of base map .bin files")
     parser.add_argument("--drawn-map-dir", default="data/drawn_maps", help="Where the Map tab saves drawn maps")
     parser.add_argument("--scenario-dir", default="data/editor_scenarios", help="Where authored scenarios are saved")
-    parser.add_argument("--model", default="weights/k_scaled_0036_1000/final_model.pt", help="Policy checkpoint")
+    parser.add_argument("--model", default="weights/k_scaled_0036_1000/final_model.pt", help="Preselected policy")
+    parser.add_argument("--models-dir", default="weights", help="Policy snapshots: <dir>/<name>/final_model.pt")
+    parser.add_argument("--experiments-dir", default="experiments", help="Training runs offered at their newest checkpoint")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (0.0.0.0 exposes it to the network)")
     parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()

@@ -115,13 +115,16 @@
   <div id="warnings"><p class="hint">Load a map to start.</p></div>
 
   <h2>Evaluate (all actors on the policy)</h2>
-  <label class="checkbox"><input type="checkbox" id="useMppi" checked> MPPI safety filter (+ light/sign rules)</label>
-  <label class="checkbox"><input type="checkbox" id="usePrediction" checked> 10 s predicted trajectory overlay</label>
+  <label>Policy <select id="policySelect" style="width:100%"></select></label>
+  <button id="refreshPolicies" style="width:100%">Refresh policy list</button>
+  <p class="hint">A training run is evaluated at its newest checkpoint, copied into weights/ first.</p>
+  <label class="checkbox"><input type="checkbox" id="useMppi"> MPPI safety filter (+ light/sign rules)</label>
+  <label class="checkbox"><input type="checkbox" id="usePrediction"> 10 s predicted trajectory overlay</label>
   <label class="checkbox"><input type="checkbox" id="useGoalInference"> Infer each actor's goal from its motion (goals in the vehicle's color, size and opacity by belief, B in replay)</label>
   <label class="checkbox"><input type="checkbox" id="useJointPrediction"> Joint prediction: ego on its goals, other actors on their inferred goals (J in replay)</label>
   <label class="checkbox"><input type="checkbox" id="useRobustPrediction"> Robust prediction: ego against every likely route of each other actor at once (U in replay)</label>
   <label class="checkbox"><input type="checkbox" id="useRobustControl"> Ego drives the robust plan's first action (instead of MPPI; needs an ego actor)</label>
-  <label class="checkbox"><input type="checkbox" id="captureObs" checked> Capture policy observations</label>
+  <label class="checkbox"><input type="checkbox" id="captureObs"> Capture policy observations</label>
   <label>Goal radius (m) <input type="number" id="goalRadius" value="2" min="0.5" max="20" step="0.5"></label>
   <label>Inferred goal spacing (m) <input type="number" id="inferredGoalSpacing" value="20" min="2" max="50" step="1"></label>
   <button id="evaluate" class="primary" style="width:100%;margin-top:6px">Save &amp; evaluate</button>
@@ -703,7 +706,7 @@ const METRIC_LABELS = [["active_agent_count", "actors driven by policy", 0], ["c
   ["num_goals_reached", "goals reached / actor", 1], ["dnf_rate", "did not finish", 3], ["avg_speed_per_agent", "avg speed m/s", 1],
   ["total_distance_travelled", "total distance m", 0], ["multi_lane_time", "time straddling lanes s", 1],
   ["comfort_violation_count", "comfort violations", 2], ["speed_limit_compliance", "speed-limit compliance", 3]];
-const SETTING_LABELS = [["map", "map"], ["duration_s", "duration s"], ["actor_count", "actors"], ["obstacle_count", "obstacles"],
+const SETTING_LABELS = [["policy", "policy"], ["map", "map"], ["duration_s", "duration s"], ["actor_count", "actors"], ["obstacle_count", "obstacles"],
   ["mppi", "MPPI"], ["ego_actor", "ego"], ["goal_inference", "goal inference"], ["joint_prediction", "joint prediction"], ["robust_prediction", "robust prediction"], ["robust_control", "ego follows robust plan"], ["inferred_goal_spacing_m", "inferred goal spacing m"], ["prediction", "prediction overlay"], ["capture_observations", "observations"], ["goal_radius", "goal radius m"]];
 let runs = [];
 let selectedRun = null;
@@ -713,6 +716,15 @@ let shownReplayUrl = null;
 
 function escapeHtml(text) { return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }
 function formatElapsed(seconds) { const m = Math.floor(seconds / 60), s = Math.floor(seconds % 60); return `${m}:${String(s).padStart(2, "0")}`; }
+function policyName(policyPath) { return policyPath ? policyPath.split("/").slice(-2, -1)[0] || policyPath : "policy not recorded"; }
+const POLICY_STORAGE_KEY = "scenarioEditorPolicy";
+async function loadPolicies() {
+  const {policies, default: defaultPolicy} = await api("/api/policies");
+  let wanted = $("policySelect").value;
+  if (!wanted) { try { wanted = localStorage.getItem(POLICY_STORAGE_KEY); } catch (e) { /* storage unavailable */ } }
+  $("policySelect").innerHTML = policies.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`).join("");
+  $("policySelect").value = policies.some(p => p.id === wanted) ? wanted : defaultPolicy;
+}
 function formatMetric(value, digits) { return value === null || value === undefined ? "–" : Number(value).toFixed(digits); }
 
 function setTab(name) {
@@ -736,7 +748,8 @@ async function loadRuns() {
     const mode = r.settings.mppi === undefined ? "" : (r.settings.mppi ? "RL+MPPI" : r.settings.robust_control ? "RL+robust" : "RL only");
     return `<div class="run ${selectedRun === r.label ? "selected" : ""}" data-label="${escapeHtml(r.label)}">
       <div class="top"><b>${escapeHtml(r.scenario)}</b><span class="badge ${r.status}">${r.status}</span></div>
-      <div class="meta">${escapeHtml(r.started)} ${mode ? "· " + mode : ""}</div><div class="meta">${facts}</div></div>`;
+      <div class="meta">${escapeHtml(r.started)} ${mode ? "· " + mode : ""}</div>
+      <div class="meta">${escapeHtml(policyName(r.settings.policy))}</div><div class="meta">${facts}</div></div>`;
   }).join("") || '<p class="hint">No runs yet. Use Save &amp; evaluate in the Editor tab.</p>';
   document.querySelectorAll(".run").forEach(el => el.addEventListener("click", () => showRun(el.dataset.label)));
   if (runningCount || !$("resultsPane").classList.contains("hidden")) runsTimer = setTimeout(loadRuns, runningCount ? 3000 : 15000);
@@ -803,7 +816,7 @@ $("evaluate").addEventListener("click", async () => {
   try {
     await saveScenario();
     const {label} = await api("/api/evaluate", {
-      name: $("scenarioName").value.trim(), mppi: $("useMppi").checked,
+      name: $("scenarioName").value.trim(), policy: $("policySelect").value, mppi: $("useMppi").checked,
       prediction: $("usePrediction").checked, goal_inference: $("useGoalInference").checked,
       joint_prediction: $("useJointPrediction").checked,
       robust_prediction: $("useRobustPrediction").checked,
@@ -832,6 +845,10 @@ $("useGoalInference").addEventListener("change", () => {
 $("tabEditor").addEventListener("click", () => setTab("editor"));
 $("tabResults").addEventListener("click", () => setTab("results"));
 $("refreshRuns").addEventListener("click", loadRuns);
+$("refreshPolicies").addEventListener("click", () => loadPolicies().catch(e => alert(e.message)));
+$("policySelect").addEventListener("change", () => {
+  try { localStorage.setItem(POLICY_STORAGE_KEY, $("policySelect").value); } catch (e) { /* storage unavailable */ }
+});
 $("goalRadius").addEventListener("change", draw);
 $("applySizeAll").addEventListener("click", () => {
   const size = newActorSize();
@@ -868,6 +885,7 @@ window.addEventListener("message", async event => {
   } catch (e) { alert(e.message); }
 });
 refreshSavedList().catch(() => {});
+loadPolicies().catch(e => alert(e.message));
 loadRuns();
 </script>
 </body>

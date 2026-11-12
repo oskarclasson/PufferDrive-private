@@ -133,6 +133,28 @@ static int test_collision_check_filters(void) {
     return 0;
 }
 
+static int test_collision_check_blind_ghosting(void) {
+    Drive env = {0};
+    Agent agents[3] = {0};
+    int active_agent_indices[3] = {0, 1, 2};
+    agents[0] = drive_test_agent(0.0f, 0.0f, 0.0f);
+    agents[1] = drive_test_agent(3.9f, 0.0f, 0.0f);
+    agents[2] = drive_test_agent(-3.9f, 0.0f, 0.0f);
+    agents[0].is_blind_partner = 1;
+    agents[1].is_blind_partner = 1;
+    env.agents = agents;
+    env.num_agents = 3;
+    env.active_agent_count = 3;
+    env.active_agent_indices = active_agent_indices;
+
+    EXPECT_EQ_INT(collision_check(&env, 1), 0);
+    env.partner_blindness_ghosting = 1;
+    EXPECT_EQ_INT(collision_check(&env, 1), -1);
+    EXPECT_EQ_INT(collision_check(&env, 0), 2);
+    EXPECT_EQ_INT(collision_check(&env, 2), 0);
+    return 0;
+}
+
 static int test_segment_aabb_cases(void) {
     float through_a[2] = {-3.0f, 0.0f};
     float through_b[2] = {3.0f, 0.0f};
@@ -277,6 +299,7 @@ int main(void) {
     RUN_TEST(test_moving_obb_collision_cases);
     RUN_TEST(test_moving_obb_collision_dimensions);
     RUN_TEST(test_collision_check_filters);
+    RUN_TEST(test_collision_check_blind_ghosting);
     RUN_TEST(test_segment_aabb_cases);
     RUN_TEST(test_swept_line_box_cases);
     RUN_TEST(test_swept_line_box_stationary_collinear_segment);

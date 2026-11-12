@@ -178,6 +178,24 @@ env:
   reward_center_bias: 0.0
   reward_velocity: 0.0025
   reward_reverse: 0.005
+  # Reverse penalty per second added on top of the (randomized, conditioned) reward_reverse coefficient
+  reward_reverse_fixed_per_second: 0.0
+  # One-off penalty each time the agent stays farther than off_route_distance_m from its route for off_route_seconds (goal_source=route only)
+  reward_off_route: 0.0
+  off_route_distance_m: 5.0
+  off_route_seconds: 3.0
+  # Penalty per (m/s^2 * s) of braking above induced_braking_threshold_mps2 that ego forces on moving cars whose heading differs by more than induced_braking_min_heading_deg
+  reward_induced_braking: 0.0
+  induced_braking_min_heading_deg: 50.0
+  induced_braking_threshold_mps2: 1.0
+  induced_braking_horizon_seconds: 3.0
+  # Induced-braking multipliers when ego should yield (it turns, or turns across an oncoming turner) / has right of way
+  induced_braking_must_yield_scale: 1.0
+  induced_braking_has_priority_scale: 1.0
+  # Extra collision penalty when moving ego hits a crossing or oncoming car it should have yielded to (goal_source=route only)
+  reward_collision_must_yield: 0.0
+  # Penalty per second, scaled by the shortfall, for driving below min(4 m/s, half the lane limit / speed cap / cornering speed) while the way is clear (goal_source=route only)
+  reward_hesitation: 0.0
   reward_timestep: 2.5e-05
   reward_overspeed: 0.005
   # m/s above the lane limit before the overspeed penalty fires
@@ -244,6 +262,10 @@ env:
   partner_blindness_duration_seconds: 3.0
   # Blind agents keep the partners in their forward corridor (false: they see no partners at all, pre-2026-10-12 rule)
   partner_blindness_corridor: false
+  # Blind agents keep only partners ahead of them that drive away from them (exclusive with partner_blindness_corridor)
+  partner_blindness_facing_away: false
+  # Blind agents drive through each other; collisions involving a non-blind agent still count
+  partner_blindness_ghosting: false
   # 0 disables; else each blind agent draws its share of time spent blind uniformly from [share set by trigger prob and duration, this]; 1.0 = blind every step
   partner_blindness_time_fraction_max: 0.0
   # Upper bound of the per-episode phantom-braker rate; each episode draws its rate uniformly from [0, this]
